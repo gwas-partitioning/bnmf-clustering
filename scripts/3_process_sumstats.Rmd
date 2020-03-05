@@ -1,0 +1,230 @@
+---
+output: 
+  # pdf_document:
+  #   latex_engine: pdflatex
+  html_document
+title: "Processing of BMI-related variant summary statistics for clustering"
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=F, message=F, fig.path="../output/figures/",
+                      cache.path="../cache/")
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "tidyverse", "pheatmap"), 
+  library, character.only=T))
+```
+
+```{r trait-descriptions}
+trait_summary <- readxl::read_excel("../doc/sources_of_sum_stats.xlsx", sheet=1) %>%
+  replace_na(list(Notes=""))
+
+kable(trait_summary, booktabs=T,
+      caption="Sources of summary statistics for BMI variant clustering") %>%
+  footnote(general="N = GWAS sample size, rounded to the nearest 100") %>%
+  kable_styling()
+
+# Full list of traits
+anthropometric_traits <- c("whr_adjBMI", "lbm", "hip_bone_area")
+physiological_traits <- c("leg_fat_pct", "bmr")
+behavioral_traits <- c("act_moderate", "act_overall",
+                       "carbohydrate", "fat", "protein",
+                       "neale_energy", "neale_portion_size", "neale_fiber",
+                       "sleep_duration", "sleep_eff", "sleep_midpoint",
+                       "alcohol_drinks_per_wk", "ever_smoke")
+psychosocial_traits <- c("edu_attainment", "cognitive_performance", 
+                         "depressive_symptoms", "anxiety")
+all_traits <- c("bmi", anthropometric_traits, physiological_traits, 
+                behavioral_traits, psychosocial_traits)
+```
+
+```{r set-inputs}
+# To be defined in this chunk:
+# index_ss: Data frame containing index variant summary stats (needs rsid, A1, and A2)
+# ss_sets: Set of .RData file prefixes containing summary statistics
+# ss_dir: Directory containing the files named in ss_sets
+# potential_proxies: Data frame containing potential proxy IDs and LD information (from 1_proxy_prep.R)
+# base_trait: Trait whose variants are being clustered
+
+yengo_top941_ss <- read_tsv(  # Read in initial set of 941 COJO variants from Yengo 2018
+  paste0("../data/raw/sum_stats/yengo2018/",
+         "Meta-analysis_Locke_et_al+UKBiobank_2018_top_941_from_COJO_analysis_UPDATED.txt")
+) %>%
+  rename(rsid=SNP, A1=Tested_Allele, A2=Other_Allele)
+index_ss <- yengo_top941_ss
+ss_sets <- c(  
+  "yengo_bmi", "pulit_whr", "yang_variability", "lbm", "ba",
+  "neale", "doherty", "macros", "ukb_dietary",
+  "sleep", "ssgac", "anxiety"
+)
+ss_dir <- "../data/processed/cleaned_sum_stats"
+potential_proxies <- read_tsv("../data/processed/yengo_potential_proxies.txt",
+                              col_types="ccccd")
+base_trait <- "bmi"
+```
+
+```{r load-sum-stats}
+for (set in ss_sets) load(paste0(ss_dir, "/", set, ".RData"))
+all_ss_list <- do.call(c, unname(mget(paste0(ss_sets, "_ss"))))  # List of all sum stat data frames (incl. unused)
+ss_df_initial <- bind_rows(all_ss_list, .id="trait") %>%
+  filter(trait %in% all_traits)  # Filter out unused traits
+stopifnot(all(all_traits %in% ss_df_initial$trait))
+```
+
+```{r initial-missingness}
+variant_counts <- ss_df_initial %>%
+  distinct(trait, rsid) %>%  # Remove the few duplicated rsID/trait pairs -- deal with them later
+  group_by(rsid) %>%
+  summarise(n_nonmissing=n(),
+            frac_nonmissing=n() / length(all_traits))
+index_variant_counts <- filter(variant_counts, rsid %in% index_ss$rsid)
+
+trait_counts <- ss_df_initial %>%
+  filter(rsid %in% index_ss$rsid) %>%
+  distinct(trait, rsid) %>%  # Remove the few duplicated rsID/trait pairs -- deal with them later
+  group_by(trait) %>%
+  summarise(n_nonmissing=n(),
+            frac_nonmissing=n() / length(index_ss$rsid))
+```
+
+```{r assign-proxies}
+high_missing <- with(index_variant_counts, rsid[frac_nonmissing < 0.8])  # Variants missing for >20% of traits
+strand_ambig <- with(index_ss, rsid[(
+  paste0(A1, A2) %in% c("AT", "TA", "CG", "GC") # Strand-ambiguous variants (A/T or C/G)
+)])
+proxy_needed <- unique(c(high_missing, strand_ambig))
+
+proxy_spec_df <- tibble(proxied_rsid=proxy_needed) %>%
+  inner_join(potential_proxies, by=c("proxied_rsid"="rsid")) %>%  # Adds potential proxies and LD info
+  inner_join(variant_counts, by=c("proxy_rsid"="rsid")) %>%  # Adds variant missingness for this set of traits
+  group_by(proxied_rsid) %>%
+  filter(frac_nonmissing > 0.8,  # Don't want proxies w/ >20% missingness
+         proxy_rsid %in% all_ss_list[[base_trait]]$rsid) %>%  # Don't want proxies not available for the base trait
+  arrange(proxy_ld, frac_nonmissing) %>%  # Care about LD w/ index variant and missingness, in that order
+  dplyr::slice(1) %>%  # For each variant, take the highest-"ranked" proxy (based on LD and missingness)
+  ungroup()
+write_tsv(proxy_spec_df, paste0("../data/processed/", base_trait, "_variant_proxies.txt"))
+
+proxy_spec_df %>%
+  head(3) %>%
+  select(proxied_rsid, proxy_rsid, proxy_snpid, proxy_ld, frac_nonmissing) %>%
+  setNames(c("Proxied rsID", "Proxy rsID", "Proxy SNP ID", "Proxy LD", 
+             "Fraction non-missing")) %>%
+  kable(booktabs=T,
+        caption="Example set of proxy variants assigned.") %>%
+  kable_styling()
+
+snps_to_cluster <- c(setdiff(index_ss$rsid, proxy_needed),  # Set of variants that don't need a proxy
+                     proxy_spec_df$proxy_rsid)  # Set of viable proxies (none available for some variants!)
+
+ss_df <- filter(ss_df_initial, rsid %in% snps_to_cluster)  # Only desired index variants and proxies
+```
+
+```{r prune-traits}
+ss_df %>%
+  filter(trait %in% all_traits) %>%  # Only include desired traits
+  group_by(trait) %>%
+  summarise(min_p=2 * pnorm(max(abs(z)), lower.tail=F)) %>%
+  mutate(min_p=format(min_p, digits=2, scientific=T)) %>%
+  arrange(min_p) %>%
+  setNames(c("Trait", "Minimum p-value")) %>%
+  kable(booktabs=T,
+        caption="Minimum p-value over the variant set for each input trait") %>%
+  kable_styling()
+
+ss_df_pruned <- ss_df %>%
+  filter(trait %in% all_traits) %>%  # Only include desired traits
+  group_by(trait) %>%
+  filter(any(abs(z) > 1.96)) %>%  # Remove traits with no variants at p<0.05
+  ungroup()
+```
+
+```{r align-alleles}
+ss_df_pruned_aligned <- ss_df_pruned %>%
+  left_join(all_ss_list[[base_trait]], by="rsid", suffix=c("", ".base")) %>%  # Join with base trait summary statistics to orient betas
+  mutate(flipped=case_when(  # Are alleles flipped with respect to base trait alleles?
+    A1 == A1.base & A2 == A2.base ~ F,  # Alleles match -> not flipped
+    A1 == A2.base & A2 == A1.base ~ T,  # Alleles flipped
+    A1 == A1.base & is.na(A2) ~ F,  # Only have A1 and alleles match -> assume A2 also matches
+    A1 == A2.base & is.na(A2) ~ T,  # Only have A1 and appears flipped -> assume A2 is also flipped
+    TRUE ~ as.logical(NA)
+  )) %>%
+  filter(!is.na(flipped)) %>%  # TEMPORARY: UNTIL I KNOW WHAT TO DO ABOUT THESE
+  mutate(A1=ifelse(flipped, A2, A1),
+         A2=ifelse(flipped, A1, A2),
+         z=ifelse(flipped, -z, z))
+```
+
+```{r adjust-sample-size}
+N_dfs <- mget(paste0(ss_sets, "_N"))  # List of all sum stat data frames (incl. unused)
+sample_sizes <- bind_rows(N_dfs) %>%
+  rename(trait=pheno) %>%  # UNTIL gather_sumstats.R IS RE-RUN
+  filter(trait %in% all_traits)  # Filter out unused traits
+
+ss_df_pruned_aligned_ssAdj <- ss_df_pruned_aligned %>%
+  left_join(sample_sizes, by="trait") %>%
+  mutate(z_adj=z / sqrt(N))
+```
+
+```{r final-sum-stats}
+ss_df_wide <- ss_df_pruned_aligned_ssAdj %>%
+  distinct() %>%  # A few traits have duplicated rsIDs -- remove
+  select(rsid, trait, z_adj) %>%
+  spread(key=rsid, value=z_adj)   # SNPs to columns
+
+ss_mat <- as.matrix(ss_df_wide[-1])
+rownames(ss_mat) <- ss_df_wide$trait
+ss_mat[is.na(ss_mat)] <- 0   # Set missing summary statistics to zero
+
+# Create separate positive and negative association matrices
+ss_mat_pos <- ss_mat
+ss_mat_pos[ss_mat_pos < 0] <- 0
+rownames(ss_mat_pos) <- paste0(rownames(ss_mat_pos), "_pos")
+ss_mat_neg <- ss_mat
+ss_mat_neg[ss_mat_neg > 0] <- 0
+rownames(ss_mat_neg) <- paste0(rownames(ss_mat_neg), "_neg")
+ss_mat_full <- rbind(ss_mat_pos, -ss_mat_neg)  # Bind positive and negative matrices for final input
+```
+
+```{r plot-summary statistics, fig.pos="H"}
+# Visualize sample size-adjusted summary statistics matrix
+pheatmap(ss_mat, 
+         # treeheight_col=0,
+         show_colnames=F,
+         main="Sample size-corrected z-scores")
+
+# Visualize trait correlations (post-pruning and variant QC)
+trait_corrs <- cor(t(ss_mat))
+pheatmap(trait_corrs, treeheight_row=0, treeheight_col=0,
+         main="Trait-trait correlations (based on variant z-scores)")
+
+# Visualize final prepared input matrix
+pheatmap(ss_mat_full,
+         fontsize_row=8,
+         treeheight_row=0, treeheight_col=0,
+         show_colnames=F,
+         main="Final input matrix")
+```
+
+Index variants: 941 independent variants from COJO analysis in Yengo 2018 BMI GWAS meta-analysis (GIANT + UKB).
+
+* `r length(setdiff(index_ss$rsid, proxy_needed))` index variants used (<20% missingness, not strand-ambiguous)
+* `r nrow(proxy_spec_df)` proxy variants used (<20% missingness, LD > 0.6, not strand-ambiguous)
+* `r 941 - length(snps_to_cluster)` variants dropped (no good proxy available)
+
+Summary statistics processing:
+
+1) Prune out traits with no nominally-significant p-values (`r nrow(ss_df) - nrow(ss_df_pruned)` pruned)
+2) Align alleles and z-scores in the direction of increased BMI
+3) For each set of GWAS summary statistics, generate z-scores (beta / SE) corrected for sample size, i.e. $z_{adj}=z/\sqrt{N}$
+4) Set variant/trait combinations with remaining missing effects to zero
+5) Stack two matrices: one corresponding to positive z-scores (negative z-scores set to zero) and vice versa
+
+* Dimensions of final z-score matrix used as clustering input: (M x 2) phenotypes x N variants
+    - M = `r nrow(ss_mat)`
+    - N = `r ncol(ss_mat_full)` variants
+    
+```{r save}
+saveRDS(ss_mat, "../data/processed/ss_mat.rds")
+saveRDS(ss_mat_full, "../data/processed/ss_mat_full.rds")
+```
+

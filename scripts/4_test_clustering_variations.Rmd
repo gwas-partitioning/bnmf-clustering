@@ -1,0 +1,502 @@
+---
+output: 
+  pdf_document:
+    latex_engine: pdflatex
+title: "Comparison of clustering variations for BMI-related genetic variants"
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=F, message=F, fig.path="../output/figures/", 
+                      cache.path="../cache/")
+suppressMessages(silent <- lapply(
+  c("knitr", "kableExtra", "tidyverse", "pheatmap"), 
+  library, character.only=T))
+```
+
+```{r load-sum-stats}
+ss_mat <- readRDS("../data/processed/ss_mat.rds")
+ss_mat_full <- readRDS("../data/processed/ss_mat_full.rds")
+```
+
+```{r sum-stat-variations}
+final_traits <- rownames(ss_mat_full)
+final_traits_noBMI <- rownames(ss_mat_full)[!grepl("^bmi_", 
+                                                   rownames(ss_mat_full))]
+final_traits_noCorr <- rownames(ss_mat_full)[(
+  !grepl(paste(c("bmr_", "leg_fat_pct_", "act_moderate_", "sleep_eff_", 
+                 "cognitive_performance_","carbohydrate_"), collapse="|"),
+         rownames(ss_mat_full)))]
+
+ss_basic <- ss_mat_full[final_traits, ]
+ss_noBMI <- ss_mat_full[final_traits_noBMI, ]
+ss_noCorr <- ss_mat_full[final_traits_noCorr, ]
+
+ss_splitSNPs <- ss_mat_full
+splitSNPs <- colnames(ss_splitSNPs)[colSums(ss_splitSNPs) > 0.2]
+for (snp in splitSNPs) {
+  new_col <- ss_splitSNPs[, snp] / 2
+  bind_mat <- cbind(new_col, new_col)
+  colnames(bind_mat) <- paste0(snp, "_", 1:2)
+  ss_splitSNPs <- cbind(ss_splitSNPs, bind_mat)
+}
+ss_splitSNPs <- ss_splitSNPs[, -which(colnames(ss_splitSNPs) %in% splitSNPs)]
+
+ss_weightTraits <- ss_mat_full
+trait_weights <- rowMeans(abs(ss_mat)) / sum(rowMeans(abs(ss_mat)))
+for (trait in names(trait_weights)) {
+  trait_pos <- paste0(trait, "_pos")
+  ss_weightTraits[trait_pos, ] <- ss_weightTraits[trait_pos, ] / trait_weights[trait]
+  trait_neg <- paste0(trait, "_neg")
+  ss_weightTraits[trait_neg, ] <- ss_weightTraits[trait_neg, ] / trait_weights[trait]
+}
+
+ss_weightTraits_noBMI <- ss_weightTraits[final_traits_noBMI, ]
+```
+
+Clusterings to test:
+
+* Full set of traits, including BMI
+* Full set of traits without BMI
+* Include BMI but remove all highly-correlated traits (Pearson |r| > 0.5; removes BMR, leg fat %, protein (all due to BMI) moderate activity (due to overall activity), sleep efficiency (due to sleep duration), cognitive performance (due to educational attainment), carbohydrate (due to fat))
+* Split SNPs with adjusted z-score >0.2 into two pseudo-variants each contributing half of the signal (then merge post-clustering)
+* Normalize traits according to the inverse of their total weight (after already adjusting z-scores by sample size)
+* Same inverse weight normalization but without BMI
+
+```{r bnmf-functionality}
+############################################################################################
+############################################################################################
+#### Copyright (c) 2017, Broad Institute
+#### Redistribution and use in source and binary forms, with or without
+#### modification, are permitted provided that the following conditions are
+#### met:
+####     Redistributions of source code must retain the above copyright
+####     notice, this list of conditions and the following disclaimer.
+####     Redistributions in binary form must reproduce the above copyright
+####     notice, this list of conditions and the following disclaimer in
+####     the documentation and/or other materials provided with the
+####     distribution.
+####     Neither the name of the Broad Institute nor the names of its
+####     contributors may be used to endorse or promote products derived
+####     from this software without specific prior written permission.
+#### THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#### "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#### LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+#### A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+#### HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#### SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+#### LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+#### DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+#### THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+#### (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#### OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+############################################################################################
+############################################################################################
+
+######################################################################################################
+####### Bayesian NMF algorithms for clustering
+######################################################################################################
+####### For implementation details see the ppaer 
+####### Udler MS, Kim J, von Grotthuss M,
+####### Bonàs-Guarch S, Cole JB, Chiou J, et al. (2018)
+####### Type 2 diabetes genetic loci informed by multi-trait
+####### associations point to disease mechanisms and
+####### subtypes: A soft clustering analysis. PLoS Med 15
+####### (9): e1002654.
+#################################
+####### For details on the original algorithms 
+####### see Tan, V.Y. & Févotte, C. Automatic relevance determination in nonnegative matrix factorization with the beta-divergence.
+####### IEEE Trans. Pattern Anal. Mach. Intell. 35, 1592–1605 (2013).
+######################################################################################################
+
+###########################
+###########################
+##### Bayesian NMF with half-normal priors for W and H
+BayesNMF.L2EU <- function(V0,n.iter,a0,tol,K,K0,phi) {
+  eps <- 1.e-50
+  del <- 1.0
+  active_nodes <- colSums(V0) != 0
+  V0 <- V0[,active_nodes]
+  V <- V0-min(V0)
+  Vmin <- min(V)
+  Vmax <- max(V)
+  N <- dim(V)[1]
+  M <- dim(V)[2]
+  
+  W <- matrix(runif(N * K)*Vmax,ncol=K)
+  H <- matrix(runif(M * K)*Vmax,ncol=M)
+  I <- array(1,dim=c(N,M))
+  V.ap <- W%*%H+eps
+  
+  phi <- sd(V)^2*phi
+  C <- (N+M)/2+a0+1
+  b0 <- 3.14*(a0-1)*mean(V)/(2*K0)
+  lambda.bound <- b0/C
+  lambda <- (0.5*colSums(W^2)+0.5*rowSums(H^2)+b0)/C
+  lambda.cut <- lambda.bound*1.5
+  
+  n.like <- list()
+  n.evid <- list()
+  n.error <- list()
+  n.lambda <- list()
+  n.lambda[[1]] <- lambda
+  iter <- 2
+  count <- 1
+  while (del >= tol & iter < n.iter) {
+    H <- H*(t(W)%*%V)/(t(W)%*%V.ap+phi*H*matrix(rep(1/lambda,M),ncol=M)+eps)
+    V.ap <- W %*% H + eps
+    W <- W*(V%*%t(H))/(V.ap%*%t(H)+phi*W*t(matrix(rep(1/lambda,N),ncol=N))+eps)
+    V.ap <- W %*% H + eps
+    lambda <- (0.5*colSums(W^2)+0.5*rowSums(H^2)+b0)/C
+    del <- max(abs(lambda-n.lambda[[iter-1]])/n.lambda[[iter-1]])
+    like <- sum((V-V.ap)^2)/2
+    n.like[[iter]] <- like
+    n.evid[[iter]] <- like + phi*sum((0.5*colSums(W^2)+0.5*rowSums(H^2)+b0)/lambda+C*log(lambda))
+    n.lambda[[iter]] <- lambda
+    n.error[[iter]] <- sum((V-V.ap)^2)
+    if (iter %% 100 == 0) {
+      cat(iter,n.evid[[iter]],n.like[[iter]],n.error[[iter]],del,sum(colSums(W)!=0),sum(lambda>=lambda.cut),'\n')
+    }
+    iter <- iter+1
+  }
+  return(list(W,H,n.like,n.evid,n.lambda,n.error))
+}
+```
+
+```{r set-parameters, cache=TRUE}
+n.iter <- 100000  # number of independent simulations (per run)
+a0 <- 10  # hyper-parameter
+tol <- 1.e-07  # tolerance for convergence
+K <- 10
+K0 <- 10
+phi <- 1.0  # ??
+n.rep <- 10  # number of runs
+```
+
+```{r run-basic, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_basic <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_mat_full[final_traits, ], n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_basic, "../data/processed/tmp/res.L2EU.Bayes.basic.rds")
+```
+
+```{r run-noBMI, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_noBMI <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_noBMI, n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_noBMI, "../data/processed/tmp/res.L2EU.Bayes.noBMI.rds")
+```
+
+```{r run-noCorr, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_noCorr <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_noCorr, n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_noCorr, "../data/processed/tmp/res.L2EU.Bayes.noCorr.rds")
+```
+
+```{r run-splitSNPs, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_splitSNPs <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_splitSNPs, n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_splitSNPs, "../data/processed/tmp/res.L2EU.Bayes.splitSNPs.rds")
+```
+
+```{r run-weightTraits, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_weightTraits <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_weightTraits, n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_weightTraits, "../data/processed/tmp/res.L2EU.Bayes.weightTraits.rds")
+```
+
+```{r run-weightTraits_noBMI, include=F, cache=1, dependson="set-parameters"}
+set.seed(1)
+bnmf_weightTraits_noBMI <- lapply(1:n.rep, function(rep) {
+  res <- BayesNMF.L2EU(ss_weightTraits_noBMI, n.iter=n.iter, a0=a0, tol=tol, K=K, K0=K0, phi=phi)
+  names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+  res
+})
+saveRDS(bnmf_weightTraits_noBMI, "../data/processed/tmp/res.L2EU.Bayes.weightTraits_noBMI.rds")
+```
+
+```{r run-locally, eval=F}
+bnmf_basic <- readRDS("../data/processed/tmp/res.L2EU.Bayes.basic.rds")
+bnmf_noBMI <- readRDS("../data/processed/tmp/res.L2EU.Bayes.noBMI.rds")
+bnmf_noCorr <- readRDS("../data/processed/tmp/res.L2EU.Bayes.noCorr.rds")
+bnmf_splitSNPs <- readRDS("../data/processed/tmp/res.L2EU.Bayes.splitSNPs.rds")
+bnmf_weightTraits <- readRDS("../data/processed/tmp/res.L2EU.Bayes.weightTraits.rds")
+bnmf_weightTraits_noBMI <- readRDS("../data/processed/tmp/res.L2EU.Bayes.weightTraits_noBMI.rds")
+```
+
+```{r run-summaries}
+make_run_summary <- function(reps) {
+  run_summary <- map_dfr(1:length(reps), function(i) {
+    res <- reps[[i]]
+    final_lambdas <- res$n.lambda[[length(res$n.lambda)]]
+    tibble(
+      run=i,
+      K=sum(final_lambdas > min(final_lambdas)),  # Assume that lambdas equal to the minimum lambda are ~ 0
+      evid=res$n.evid[[length(res$n.evid)]]  # Evidence = -log_likelihood
+    )
+  }) %>%
+    arrange(evid)
+  
+  unique.K <- table(run_summary$K)
+  n.K <- length(unique.K)  # Number of distinct K
+  MAP.K.run <- sapply(names(unique.K), function(k) {  # bNMF run index with the maximum posterior for given K
+    tmp <- run_summary[run_summary$K == k, ]
+    tmp$run[which.min(tmp$evid)]
+  })
+  
+  list(run_summary=run_summary, unique.K=unique.K, MAP.K.run=MAP.K.run)
+}
+
+clusterings <- c("basic", "noBMI", "noCorr", "splitSNPs", "weightTraits",
+                 "weightTraits_noBMI")
+bnmf_results <- list(basic=bnmf_basic, noBMI=bnmf_noBMI, noCorr=bnmf_noCorr, 
+                     splitSNPs=bnmf_splitSNPs, weightTraits=bnmf_weightTraits,
+                     weightTraits_noBMI=bnmf_weightTraits_noBMI)
+run_summaries <- lapply(bnmf_results, make_run_summary)
+
+run_summary_tbl <- map_dfr(run_summaries, "run_summary", .id="variation") %>%
+  group_by(K, variation) %>%
+  summarise(n=n()) %>%
+  pivot_wider(names_from="variation", values_from=n, values_fill=list(n=0))
+kable(run_summary_tbl,
+      caption="Frequency of each K across runs for each trait set")
+```
+
+```{r MAPs}
+#### Below we will generate outputs of the maximum posterior solutions at different K
+MAP.K.runs <- lapply(run_summaries, function(summ) {
+  Ks <- unique(summ$run_summary$K)
+  lapply(setNames(Ks, Ks), function(k) {
+    tmp <- summ$run_summary[summ$run_summary$K == k, ]
+    tmp$run[which.min(tmp$evid)]
+  })
+})
+```
+
+```{r extract-funcs}
+get_W <- function(clustering) {
+  W_raw <- clustering$W
+  W_raw[, colSums(W_raw > 1e-10) > 0]
+}
+
+get_H <- function(clustering) {
+  H_raw <- clustering$H
+  H_raw[rowSums(H_raw > 1e-10) > 0, ]
+}
+```
+
+To compare the clustering variations, we can perform another clustering based on the discovered activation matrices (W; trait contributions to clusters) or dictionary matrices (H; variant contributions to clusters).
+
+```{r compare-clusterings}
+best_Ks <- lapply(run_summaries, function(summ) {  # Find most frequent K for each clustering variation
+  names(summ$unique.K)[which.max(summ$unique.K)]
+})
+
+merge_split_H <- function(H_mat) {
+  # If variants have been split (to reduce the dominance of large effect-size variants),
+  # re-combine through simple addition across columns
+  to_merge <- colnames(H_mat)[grepl("_[0-9]*$", colnames(H_mat))]  # Find columns that were part of a split
+  if (length(to_merge) == 0) return(H_mat)
+  base_snps <- unique(gsub("_[0-9]*$", "", to_merge))  # Variants that were split
+  merged_mat <- sapply(base_snps, function(snp) {  # For each variant, sum across splits to get single column
+    merge_cols <- grep(paste0(snp, "_"), to_merge, value=T)
+    rowSums(H_mat[, merge_cols])
+  })
+  cbind(H_mat[, setdiff(colnames(H_mat), to_merge)], merged_mat)
+}
+
+compare_clusterings <- function(c1, c2) {
+  Ks <- unlist(best_Ks[c(c1, c2)])  # Vector of best Ks for pair of clusterings
+  
+  # Collect H matrices (variant weights)
+  H1 <- get_H(bnmf_results[[c1]][[MAP.K.runs[[c1]][[Ks[1]]]]])  # Retrieve H matrix from clustering result
+  H1 <- merge_split_H(H1)  # Merge variant weights if any were split prior to clustering
+  rownames(H1) <- paste0(c1, "_", 1:nrow(H1))  # Identifiable names to distinguish from 
+  H2 <- get_H(bnmf_results[[c2]][[MAP.K.runs[[c2]][[Ks[2]]]]])
+  H2 <- merge_split_H(H2)
+  rownames(H2) <- paste0(c2, "_", 1:nrow(H2))
+  snp_union <- union(colnames(H1), colnames(H2))
+  H_concat <- rbind(H1[, snp_union], H2[, snp_union])
+  ## add clustering distance comparison here
+  
+  W1 <- get_W(bnmf_results[[c1]][[MAP.K.runs[[c1]][[Ks[1]]]]])
+  colnames(W1) <- paste0(c1, "_", 1:ncol(W1))
+  W2 <- get_W(bnmf_results[[c2]][[MAP.K.runs[[c2]][[Ks[2]]]]])
+  colnames(W2) <- paste0(c2, "_", 1:ncol(W2))
+  trait_union <- union(rownames(W1), rownames(W2))
+  missing_W1_rows <- setdiff(trait_union, rownames(W1))
+  if (length(missing_W1_rows) > 0) {  # If first clustering is missing traits, fill weights matrix with zeros
+    augment_W1 <- matrix(0, nrow=length(missing_W1_rows), ncol=ncol(W1), 
+                         dimnames=list(missing_W1_rows))
+    W1 <- rbind(W1, augment_W1)
+  }
+  missing_W2_rows <- setdiff(trait_union, rownames(W2))
+  if (length(missing_W2_rows) > 0) {
+    augment_W2 <- matrix(0, nrow=length(missing_W2_rows), ncol=ncol(W2), 
+                         dimnames=list(missing_W2_rows))
+    W2 <- rbind(W2, augment_W2)
+  }
+  W_concat <- cbind(W1[trait_union, ], W2[trait_union, ])
+  
+  H_annot_df <- data.frame(Clustering=rep(c(c1, c2),  # For plotting
+                                          times=c(nrow(H1), nrow(H2))))
+  rownames(H_annot_df) <- rownames(H_concat)
+  pheatmap(H_concat,  # Heatmap of variant weights across both clusterings
+           treeheight_col=0,
+           show_colnames=F, show_rownames=F, 
+           annotation_row=H_annot_df, annotation_names_row=F,
+           main="Comparison of clusterings (variant-based)")
+  
+  W_annot_df <- data.frame(Clustering=rep(c(c1, c2),
+                                          times=c(ncol(W1), ncol(W2))))
+  rownames(W_annot_df) <- colnames(W_concat)
+  pheatmap(W_concat,  # Heatmap of trait weights across both clusterings
+           treeheight_row=0,
+           fontsize_row=8,
+           show_rownames=T, show_colnames=F,
+           annotation_col=W_annot_df, annotation_names_col=F,
+           main="Comparison of clusterings (trait-based)")
+}
+
+clustering_combos <- crossing(c1=clusterings, c2=clusterings) %>%
+  filter(c1 != c2) %>%
+  filter(c1 == "basic" | 
+           (grepl("weightTraits", c1) & grepl("weightTraits", c2)))
+silent <- map2(clustering_combos$c1, clustering_combos$c2, compare_clusterings)
+```
+
+```{r check-cns-variants, warning=F}
+locke_cns_df <- readxl::read_excel(
+  "../data/processed/locke2015/lock2015_variants_fmt.xlsx", sheet=1, 
+  col_names="snp"
+)
+locke_cns <- locke_cns_df$snp
+locke_all_df <- readxl::read_excel(
+  "../data/processed/locke2015/lock2015_variants_fmt.xlsx", sheet=2,
+  col_names="snp"
+)
+locke_all <- locke_all_df$snp
+locke_noncns <- setdiff(locke_all, locke_cns)
+
+test_cns_enrichment <- function(clustering) {
+  K <- best_Ks[[clustering]]
+  H <- get_H(bnmf_results[[clustering]][[MAP.K.runs[[clustering]][[K]]]])  # Retrieve H matrix from clustering result
+  H <- merge_split_H(H)  # Merge variant weights if any were split prior to clustering
+  shared_snps <- intersect(locke_all, colnames(H))
+  map_dfr(1:K, function(i) {
+    characteristic_snps <- colnames(H)[order(H[i, ], decreasing=T)[1:100]]  # Top 100 variants contributing to the cluster (could alternatively base on a coefficient threshold)
+    q=length(intersect(characteristic_snps, locke_cns))  # Number of Locke CNS variants in this cluster
+    m=length(intersect(shared_snps, locke_cns))  # Number of clustered Locke CNS variants
+    n=length(intersect(shared_snps, locke_noncns))  # Number of clustered Locke non-CNS variants 
+    k=length(intersect(characteristic_snps, shared_snps))  # Number of variants in both Locke and this cluster
+    tibble(frac_CNS=paste0(q, " / ", k, " "),  # Fraction of all Locke-intersecting variants that are CNS-associated
+           p_enr=phyper(q, m, n, k, lower.tail=F),  # Compute hypergeometric test p-value for both enrichment and depletion
+           p_dep=phyper(q, m, n, k, lower.tail=T))
+  }, .id="Cluster")
+}
+
+map_dfr(setNames(clusterings, clusterings), test_cns_enrichment, .id="Clustering") %>%
+  mutate(p=round(pmin(p_enr, p_dep), 3),
+         Type=ifelse(p_enr < p_dep, "Enrichment", "Depletion")) %>%
+  select(Clustering, Cluster, frac_CNS, p, Type) %>%
+  kable(caption="Enrichment/depletion of clusters for Locke CNS-associated variants in top 100 contributing variants for each cluster")
+```
+
+```{r plot-specific-clusters, warning=F}
+res <- bnmf_results$weightTraits[[MAP.K.runs$weightTraits[[best_Ks$weightTraits]]]]
+W <- get_W(res)
+H <- get_H(res)
+
+variants_to_genes_df <- read_table2(
+  "../data/processed/annovar/yengo_941_variants.variant_function",
+  col_names=c("type", "gene", "chr", "start", "end", "ref", "alt", "rsid", 
+              "beta", "se", "p")
+) %>%
+  mutate(gene=gsub("\\(.*\\)", "", gene))
+variants_to_genes <- setNames(variants_to_genes_df$gene,
+                              variants_to_genes_df$rsid)
+
+imp_features <- apply(W, 2, function(x) list(rownames(W)[order(x, decreasing=T)[1:5]]))
+names(imp_features) <- paste0("Cluster", 1:length(imp_features))
+imp_variants <- apply(H, 1, function(x) list(variants_to_genes[colnames(H)[order(x, decreasing=T)[1:10]]]))
+names(imp_variants) <- paste0("Cluster", 1:length(imp_variants))
+
+feature_df <- map_dfr(1:length(imp_features), function(idx) {
+  data.frame(cluster=paste0("Cluster", idx),
+             feature=imp_features[[idx]][[1]])
+}) %>%
+  group_by(cluster) %>%
+  summarise(features=paste(feature, collapse=", "))
+variant_df <- map_dfr(1:length(imp_variants), function(idx) {
+  data.frame(cluster=paste0("Cluster", idx),
+             variant=imp_variants[[idx]][[1]][!is.na(imp_variants[[idx]][[1]])])
+}) %>%
+  group_by(cluster) %>%
+  summarise(variants=paste(variant, collapse=", "))
+
+inner_join(feature_df, variant_df, by="cluster") %>%
+  kable(booktabs=T,
+        caption="Key features and variants for the 'weightTraits' clusters") %>%
+  kable_styling(latex_options="scale_down")
+
+
+##############
+
+
+res <- bnmf_results$noBMI[[MAP.K.runs$noBMI[[best_Ks$noBMI]]]]
+W <- get_W(res)
+H <- get_H(res)
+
+variants_to_genes_df <- read_table2(
+  "../data/processed/annovar/yengo_941_variants.variant_function",
+  col_names=c("type", "gene", "chr", "start", "end", "ref", "alt", "rsid", 
+              "beta", "se", "p")
+) %>%
+  mutate(gene=gsub("\\(.*\\)", "", gene))
+variants_to_genes <- setNames(variants_to_genes_df$gene,
+                              variants_to_genes_df$rsid)
+
+imp_features <- apply(W, 2, function(x) list(rownames(W)[order(x, decreasing=T)[1:5]]))
+names(imp_features) <- paste0("Cluster", 1:length(imp_features))
+imp_variants <- apply(H, 1, function(x) list(variants_to_genes[colnames(H)[order(x, decreasing=T)[1:10]]]))
+names(imp_variants) <- paste0("Cluster", 1:length(imp_variants))
+
+feature_df <- map_dfr(1:length(imp_features), function(idx) {
+  data.frame(cluster=paste0("Cluster", idx),
+             feature=imp_features[[idx]][[1]])
+}) %>%
+  group_by(cluster) %>%
+  summarise(features=paste(feature, collapse=", "))
+variant_df <- map_dfr(1:length(imp_variants), function(idx) {
+  data.frame(cluster=paste0("Cluster", idx),
+             variant=imp_variants[[idx]][[1]][!is.na(imp_variants[[idx]][[1]])])
+}) %>%
+  group_by(cluster) %>%
+  summarise(variants=paste(variant, collapse=", "))
+
+inner_join(feature_df, variant_df, by="cluster") %>%
+  kable(booktabs=T,
+        caption="Key features and variants for the 'noBMI' clusters") %>%
+  kable_styling(latex_options="scale_down")
+```
+
+* Using the discovery of *any* clusters enriched or depleted for Locke CNS-associated variants as a proxy for cluster quality, the inverse-total weight normalization of traits performs best, finding one cluster with enrichment p < 0.05 (hypergeometric test). However, this p-value is still not very strong, and the difference compared to other approaches is not huge.
+* Cluster weights for traits are much higher when using trait normalization, i.e. more distinct clusters are resolved.
+* Any other variations to test or evaluation strategies to use before testing some of these cluster scores in the Choose Well 365 dataset?
