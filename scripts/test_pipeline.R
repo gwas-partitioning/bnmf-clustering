@@ -2,40 +2,103 @@
 # on summary statistics and test its agreement with scripts that are
 # currently in place.
 
+# NOTE: to run on UGER, must start with "ssh gsa4; use .zlib-1.2.6"
+
+source("choose_variants.R")  # fld_pruning, count_traits_per_variant, fina_variants_needing_proxies, & choose_potential_proxies
 source("prep_bNMF.R")  # fetch_summary_stats & prep_z_matrix
+source("run_bNMF.R")  # run_bNMF & summarize_bNMF
 
 gwas_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="gwas_traits")
-ukbb_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="ukbb_traits")
-trait_paths <- setNames(c(gwas_traits$full_path, ukbb_traits$full_path),
-                        c(gwas_traits$trait_name, ukbb_traits$trait_name))
+# ukbb_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="ukbb_traits")
+# trait_paths <- setNames(c(gwas_traits$full_path, ukbb_traits$full_path),
+#                         c(gwas_traits$trait_name, ukbb_traits$trait_name))
+trait_paths <- setNames(gwas_traits$full_path, gwas_traits$trait_name)
+trait_paths <- trait_paths[!grepl("MAGIC", names(trait_paths))]
 
-t2d_snps <- read_tsv("../data/T2D_290snps_v16_ALLELES_BETA.txt") %>%
-  separate(VAR_ID_hg19, into=c("CHR", "POS", "REF", "ALT"), 
-           sep="_", remove=F) %>%
-  select(VAR_ID=VAR_ID_hg19, REF, ALT, BETA=BETA_ALT)
+initial_t2d_snps <- read_tsv("../data/T2D_initial_vars_pval.txt")
+set.seed(1)
+# initial_t2d_snps <- sample_n(initial_t2d_snps, size=10000) %>%
+initial_t2d_snps <- sample_n(initial_t2d_snps, size=1000) %>%
+  select(VAR_ID=VAR_ID_hg19, PVALUE)
 
-# Run fetch_summary_stats function
-initial_trait_matrices <- fetch_summary_stats(trait_paths, t2d_snps)
-saveRDS(initial_trait_matrices, "../data/test_fetch_summary_stats_t2d_results.rds")
+# final_t2d_snps <- read_tsv("../data/T2D_290snps_v16_ALLELES_BETA.txt") %>%
+#   separate(VAR_ID_hg19, into=c("CHR", "POS", "REF", "ALT"), 
+#            sep="_", remove=F) %>%
+#   select(VAR_ID=VAR_ID_hg19, REF, ALT, BETA=BETA_ALT)
 
-# Run prep_z_matrix function
-colnames(initial_trait_matrices$z_mat) <- make.names(colnames(initial_trait_matrices$z_mat))
-rownames(initial_trait_matrices$z_mat) <- gsub("^GWAS_", "", rownames(initial_trait_matrices$z_mat))
-colnames(initial_trait_matrices$z_mat) <- gsub("^GWAS_", "", colnames(initial_trait_matrices$z_mat))
-names(t2d_minP_vec) <- gsub("^GWAS_", "", names(t2d_minP_vec))
-rownames(initial_trait_matrices$N_mat) <- gsub("^GWAS_", "", rownames(initial_trait_matrices$N_mat))
-colnames(initial_trait_matrices$N_mat) <- gsub("^GWAS_", "", colnames(initial_trait_matrices$N_mat))
-colnames(initial_trait_matrices$N_mat) <- make.names(colnames(initial_trait_matrices$N_mat))
-base_t2d_p_df <- read_tsv("../data/T2D_v16_traits_pval.txt")
-t2d_minP_vec <- setNames(c(base_t2d_p_df$pval), base_t2d_p_df$trait)
-t2d_minP_vec["Lipoprotein A (quantile)_irnt_both"] <- 0  # Zeros were removed from LpA in Claire's pipeline
-names(t2d_minP_vec) <- gsub("-|\\,|\\(|\\)|\\ ", ".", names(t2d_minP_vec))
-names(t2d_minP_vec) <- gsub("(dv.)\\.", "\\1_", names(t2d_minP_vec))
-t2d_minP_vec <- t2d_minP_vec[!grepl("Creatinine|ystatin", names(t2d_minP_vec))]
-initial_trait_matrices$minP_vec <- t2d_minP_vec[colnames(initial_trait_matrices$z_mat)]
-bnmf_input_mat <- prep_z_matrix(initial_trait_matrices$z_mat,
-                                initial_trait_matrices$N_mat,
-                                initial_trait_matrices$minP_vec)
+rsID_map_file <- "/humgen/diabetes2/users/clairekim/list_VARID_rsID_updated.txt"  # From dbSNP v1.38 -- maps positional IDs to rsIDs
+
+
+# Variant choice steps
+
+pruned_variants <- ld_pruning(initial_t2d_snps, rsID_map_file)
+
+var_nonmissingness <- count_traits_per_variant(pruned_variants$VAR_ID, trait_paths)
+
+proxies_needed_df <- find_variants_needing_proxies(pruned_variants, var_nonmissingness,
+                                                   rsID_map_file)
+
+tabix_path <- "/humgen/diabetes2/users/mvg/VariantClustering/tabix-0.2.6/tabix"
+ld_file <- "/humgen/diabetes2/users/mvg/VariantClustering/LD_EUR.tsv.bgz"
+final_variant_set <- choose_proxies(
+  proxies_needed_df,
+  tabix_path,
+  ld_file,
+  rsID_map_file,
+  trait_paths,
+  pruned_variants
+)
+
+# Prep bNMF steps
+
+t2d_ss_filepath <- "/humgen/diabetes2/users/clairekim/Mahajan.NatGenet2018b.T2D.European_formatted.txt"
+variant_vec <- final_variant_set
+gwas_ss_file <- t2d_ss_filepath
+trait_ss_files <- trait_paths
+print("Retrieving z-scores and sample sizes for each trait...")
+trait_df_long <- lapply(names(trait_ss_files), read_single_trait, variant_df) %>%
+  bind_rows(.id="trait")  
+
+
+initial_zscore_matrices <- fetch_summary_stats(
+  final_variant_set,
+  t2d_ss_filepath,
+  trait_paths
+)
+
+final_zscore_matrix <- prep_z_matrix(initial_zscore_matrices$z_mat,
+                                     initial_zscore_matrices$N_mat)
+
+# Run bNMF steps
+
+bnmf_reps <- run_bNMF(final_zscore_matrix, n_reps=10)
+
+summarize_bNMF(bnmf_reps)
+
+
+
+# # Run fetch_summary_stats function
+# initial_trait_matrices <- fetch_summary_stats(trait_paths, t2d_snps)
+# saveRDS(initial_trait_matrices, "../data/test_fetch_summary_stats_t2d_results.rds")
+# 
+# # Run prep_z_matrix function
+# colnames(initial_trait_matrices$z_mat) <- make.names(colnames(initial_trait_matrices$z_mat))
+# rownames(initial_trait_matrices$z_mat) <- gsub("^GWAS_", "", rownames(initial_trait_matrices$z_mat))
+# colnames(initial_trait_matrices$z_mat) <- gsub("^GWAS_", "", colnames(initial_trait_matrices$z_mat))
+# names(t2d_minP_vec) <- gsub("^GWAS_", "", names(t2d_minP_vec))
+# rownames(initial_trait_matrices$N_mat) <- gsub("^GWAS_", "", rownames(initial_trait_matrices$N_mat))
+# colnames(initial_trait_matrices$N_mat) <- gsub("^GWAS_", "", colnames(initial_trait_matrices$N_mat))
+# colnames(initial_trait_matrices$N_mat) <- make.names(colnames(initial_trait_matrices$N_mat))
+# base_t2d_p_df <- read_tsv("../data/T2D_v16_traits_pval.txt")
+# t2d_minP_vec <- setNames(c(base_t2d_p_df$pval), base_t2d_p_df$trait)
+# t2d_minP_vec["Lipoprotein A (quantile)_irnt_both"] <- 0  # Zeros were removed from LpA in Claire's pipeline
+# names(t2d_minP_vec) <- gsub("-|\\,|\\(|\\)|\\ ", ".", names(t2d_minP_vec))
+# names(t2d_minP_vec) <- gsub("(dv.)\\.", "\\1_", names(t2d_minP_vec))
+# t2d_minP_vec <- t2d_minP_vec[!grepl("Creatinine|ystatin", names(t2d_minP_vec))]
+# initial_trait_matrices$minP_vec <- t2d_minP_vec[colnames(initial_trait_matrices$z_mat)]
+# bnmf_input_mat <- prep_z_matrix(initial_trait_matrices$z_mat,
+#                                 initial_trait_matrices$N_mat,
+#                                 initial_trait_matrices$minP_vec)
 
 
 # ##### TEST IMMEDIATE PRE-PROCESSING AND bNMF PROCEDuRE #####

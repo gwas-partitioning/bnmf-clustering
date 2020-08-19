@@ -47,7 +47,7 @@ library(tidyverse)
 ######################################################################################################
 
 BayesNMF.L2EU <- function(
-  V0, n.iter=10000, a0=10, tol=1e-7, K=10, K0=10, phi=1.0
+  V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=10, phi=1.0
 ) {
   
   # Bayesian NMF with half-normal priors for W and H
@@ -117,4 +117,146 @@ BayesNMF.L2EU <- function(
     n.lambda,  # List of lambda vectors (shared weights for each of K clusters, some ~0) per iteration
     n.error  # List of reconstruction errors (sum of squared errors) per iteration
   ))
+}
+
+
+run_bNMF <- function(z_mat, n_reps=10, random_seed=1, ...) {
+  
+  # Given an input matrix as created by prep_z_matrix(), run the bNMF procedure
+  # a series of times to generate results and evaluate cluster stability
+  
+  print(paste0("Running bNMF clustering procedure (", n_reps, " iterations)..."))
+  set.seed(random_seed)
+  bnmf_reps <- lapply(1:n_reps, function(r) {
+    res <- BayesNMF.L2EU(z_mat, ...)
+    names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
+    res
+  })
+  bnmf_reps
+}
+
+
+summarize_bNMF <- function(bnmf_reps) {
+  
+  # Given output from bNMF (list of length N_iterations),
+  # generate summary tables and plots
+
+  make_run_summary <- function(reps) {
+    
+    # Given a list of bNMF iteration outputs, summarize the K choices and associated likelihoods across runs
+    
+    run_summary <- map_dfr(1:length(reps), function(i) {
+      res <- reps[[i]]
+      final_lambdas <- res$n.lambda[[length(res$n.lambda)]]
+      tibble(
+        run=i,
+        K=sum(final_lambdas > min(final_lambdas)),  # Assume that lambdas equal to the minimum lambda are ~ 0
+        evid=res$n.evid[[length(res$n.evid)]]  # Evidence = -log_likelihood
+      )
+    }) %>%
+      arrange(evid)
+    
+    unique.K <- table(run_summary$K)
+    n.K <- length(unique.K)  # Number of distinct K
+    MAP.K.run <- sapply(names(unique.K), function(k) {  # bNMF run index with the maximum posterior for given K
+      tmp <- run_summary[run_summary$K == k, ]
+      tmp$run[which.min(tmp$evid)]
+    })
+    
+    list(run_tbl=run_summary, unique.K=unique.K, MAP.K.run=MAP.K.run)
+  }
+  
+  print("Summarizing bNMF results...")
+  
+  print("Writing table of chosen K across iterations...")
+  run_summary <- make_run_summary(bnmf_reps)
+  write_tsv(run_summary$run_tbl, "run_summary.txt")
+
+  n.K <- length(run_summary$unique.K)  # Number of distinct K
+  
+  get_W <- function(clustering) {
+    W_raw <- clustering$W
+    W_raw[, colSums(W_raw > 1e-10) > 0]
+  }
+  
+  get_H <- function(clustering) {
+    H_raw <- clustering$H
+    H_raw[rowSums(H_raw > 1e-10) > 0, ]
+  }
+  
+  print("Plotting variant and trait contributions...")
+  silent <- sapply(names(run_summary$unique.K), function(k) {  # Create heatmaps for MAP iteration for each K
+    res <- bnmf_reps[[run_summary$MAP.K.run[as.character(k)]]]
+    W <- res$W[, colSums(res$W) != 0]  # feature-cluster association matrix
+    H <- res$H[rowSums(res$H) != 0, ]  # cluster-gene association matrix
+    W[W < 1.e-10] <- 0
+    H[H < 1.e-10] <- 0
+    
+    W0 <- data.frame(W)
+    W0[, "variant"] <- rownames(W)
+    H0 <- data.frame(H)
+    H0[, "cluster"] <- rownames(H)
+    
+    write_tsv(W0, paste0("L2EU.W.mat.K", k))
+    write_tsv(H0, paste0("L2EU.H.mat.K", k))
+    
+    mat.reconstructed <- W %*% H   # reconstructed matrix == approximation for the input matrix 
+    
+    # Setup for plotting
+    scale0 <- 0.8
+    scale <- 1
+    g.ordering <- paste("G", seq(1:ncol(W)), sep="")
+    color.axis <- "black"
+    .theme_ss <- theme_bw(base_size=12) +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size=8 * scale, 
+                                       family="mono", face='bold', color=color.axis),
+            axis.text.y = element_text(hjust = 0.5,size=12 * scale, family="mono",face='bold',color=color.axis),
+            axis.text = element_text(size = 12 * scale, family = "mono",color=color.axis),
+            axis.title=element_text(face="bold", size=12 * scale,color="black"),
+            plot.title=element_text(face="bold", size=12 * scale))
+    
+    # Plot W matrix (feature activities)
+    W_hc <- hclust(dist(W, method="euclidean"), method="ward.D")
+    W_variant.ordering <- W_hc$labels[W_hc$order]
+    W_plt_df <- W %>%
+      as.data.frame() %>%
+      rownames_to_column(var="variant") %>%
+      gather(key="cluster", value="activity", -variant) %>%
+      mutate(variant=factor(variant, levels=W_variant.ordering),
+             cluster=factor(cluster, 
+                            levels=paste0("V", 1:ncol(W))))
+    W_plt <- ggplot(W_plt_df, aes(x=variant, y=cluster, fill=activity)) + 
+      geom_tile() +
+      scale_fill_gradient2(low="white", high ="black", name=paste("Activity", sep="")) +
+      #p = p + scale_fill_gradientn(values=c(0,0.1,0.2,0.5,0.7,1.0),colours=c("yellow","green","black","red","magenta"),limit=c(0,1.0))
+      .theme_ss +
+      ggtitle(paste0("Variant Association to Clusters (k=", k, ")")) +
+      ylab("Cluster") + xlab("Variant") +
+      theme(axis.title.x = element_text(face="bold",colour="black", size=12 * scale0)) +
+      theme(axis.title.y = element_text(face="bold",colour="black", size=12 * scale0)) +
+      theme(legend.position="right") +
+      theme(legend.key.size = unit(0.5, "cm"))
+    ggsave(paste0("W_plot_K", k, ".pdf"), plot=W_plt)
+    
+    H_hc <- hclust(dist(t(H), method="euclidean"), method="ward.D")
+    H_trait.ordering <- H_hc$labels[H_hc$order]
+    H_plt_df <- t(H) %>%
+      as.data.frame() %>%
+      rownames_to_column(var="trait") %>%
+      gather(key="cluster", value="activity", -trait) %>%
+      mutate(cluster=factor(cluster, levels=paste0("V", 1:nrow(H))),
+             trait=factor(trait, levels=H_trait.ordering))
+    H_plt <- ggplot(H_plt_df, aes(x=trait, y=cluster, fill=activity)) + 
+      geom_tile() +
+      scale_fill_gradient2(low="white", high ="black", name=paste("Activity", sep="")) +
+      #p = p + scale_fill_gradientn(values=c(0,0.1,0.2,0.5,0.7,1.0),colours=c("yellow","green","black","red","magenta"),limit=c(0,1.0))
+      .theme_ss +
+      ggtitle(paste0("Variant Association to Clusters (k=", k, ")")) +
+      ylab("Cluster") + xlab("Trait") +
+      theme(axis.title.x=element_text(face="bold", colour="black", size=12 * scale0)) +
+      theme(axis.title.y=element_text(face="bold", colour="black", size=12 * scale0)) +
+      theme(legend.position="right") +
+      theme(legend.key.size = unit(0.5, "cm"))
+    ggsave(paste0("H_plot_K", k, ".pdf"), plot=H_plt)
+  })
 }
