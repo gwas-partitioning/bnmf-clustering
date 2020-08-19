@@ -2,32 +2,22 @@
 # on summary statistics and test its agreement with scripts that are
 # currently in place.
 
-# NOTE: to run on UGER, must start with "ssh gsa4; use .zlib-1.2.6"
+# NOTE: to run Tabix on UGER, must start with "ssh gsa4; use .zlib-1.2.6"
 
 source("choose_variants.R")  # fld_pruning, count_traits_per_variant, fina_variants_needing_proxies, & choose_potential_proxies
 source("prep_bNMF.R")  # fetch_summary_stats & prep_z_matrix
 source("run_bNMF.R")  # run_bNMF & summarize_bNMF
 
 gwas_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="gwas_traits")
-# ukbb_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="ukbb_traits")
-# trait_paths <- setNames(c(gwas_traits$full_path, ukbb_traits$full_path),
-#                         c(gwas_traits$trait_name, ukbb_traits$trait_name))
 trait_paths <- setNames(gwas_traits$full_path, gwas_traits$trait_name)
-trait_paths <- trait_paths[!grepl("MAGIC", names(trait_paths))]
+trait_paths <- trait_paths[!grepl("MAGIC", names(trait_paths))]  # Some MAGIC GWAS files don't have N_PH field
 
 initial_t2d_snps <- read_tsv("../data/T2D_initial_vars_pval.txt")
 set.seed(1)
-# initial_t2d_snps <- sample_n(initial_t2d_snps, size=10000) %>%
 initial_t2d_snps <- sample_n(initial_t2d_snps, size=1000) %>%
   select(VAR_ID=VAR_ID_hg19, PVALUE)
 
-# final_t2d_snps <- read_tsv("../data/T2D_290snps_v16_ALLELES_BETA.txt") %>%
-#   separate(VAR_ID_hg19, into=c("CHR", "POS", "REF", "ALT"), 
-#            sep="_", remove=F) %>%
-#   select(VAR_ID=VAR_ID_hg19, REF, ALT, BETA=BETA_ALT)
-
 rsID_map_file <- "/humgen/diabetes2/users/clairekim/list_VARID_rsID_updated.txt"  # From dbSNP v1.38 -- maps positional IDs to rsIDs
-
 
 # Variant choice steps
 

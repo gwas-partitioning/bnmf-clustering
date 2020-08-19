@@ -1,17 +1,18 @@
-1_proxy_prep.R: Prepare dictionary of possible proxies for primary index variants.
-* Collect index variants
-* Retrieve all potential proxies for each index variant (to be run remotely on HPC)
-* Filter out potential proxies in low LD with associated index variant (<0.6) and strand-ambigouous variants.
+## Pipeline for GWAS clustering using Bayesian NMF
 
-2_gather_sumstats.R: Collect and preprocess summary statistics for all traits of interest.
-* Collect rsID, A1, A2, z-score, and GWAS samples size.
-* Include index variants and all potential proxies.
+### Choose the set of variants to be clustered (choose_variants.R)
+**ld_pruning**: LD-based pruning of the input variant set  
+**count_traits_per_variant**: Assess the fraction of traits missing each variant of interest  
+**find_variants_needing_proxies**: Determine which variants need proxies (allele considerations, missingness, etc.) 
+**choose_proxies**: Select proxies for the necessary variants and output the final variant set for clustering
 
-3_process_sumstats.Rmd: Prepare summary statistics for clustering.
-* Assign proxies to variants that are strand-ambiguous or missing for >20% of traits (prioritize variants in order of LD with index variant).
-* Prune away traits with no nominally-significant (p < 0.05) variants.
-* Flip z-score signs as necessary to align to the trait-increasing alleles.
-* Adjust z-scores for GWAS samples size: z_adj = z / sqrt(N).
-* Replace remaining missing z-scores with zero.
-* Augment the summary statistic matrix (traits x variants) to include separate positively- and negatively-associated rows for each trait (with the remaining set of variants set to zero).
-* Visualize the input matrix in various ways (basic heatmap, trait correlation heatmap, etc.).
+### Prepare the final z-score matrix (prep_bNMF.R)
+**fetch_summary_stats**: Retrieve z-scores and sample sizes across all traits for the final variant set  
+**prep_z_matrix**: Final trait filters, sample size adjustment, and creation of non-negative input matrix
+
+### Run bNMF and summarize the results (run_bNMF.R)
+**run_bNMF**: Run the bNMF procedure (over multiple iterations)  
+**summarize_bNMF**: Summarize the results and create heatmaps for visualization
+
+## To-do:
+* Allele alignment issues
