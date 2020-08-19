@@ -5,7 +5,7 @@ library(data.table)
 # CURRENT ASSUMPTIONS ABOUT FORMATTING:
 # - Genome build is hg19/GrCh37
 # - Summary statistic datasets are whitespace-delimited with columns: VAR_ID, BETA, SE, N_PH
-# - Variant IDs are all of the format: CHR_POS_REF_ALT ***ok for REF/ALT correct ordering to be assumed?***
+# - Variant IDs are all of the format: CHR_POS_REF_ALT 
 
 
 ld_pruning <- function(gwas_variants, rsID_map_file, r2=0.1) {

@@ -92,7 +92,7 @@ prep_z_matrix <- function(z_mat, N_mat) {
   # 1) perform final pre-processing steps before bNMF clustering:
   # trait filtering by p-value, trait pruning based on correlation,
   # and z-score scaling based on sample size
-  # 2) expand N x M matrix into 2N x M non-negative matrix
+  # 2) expand N x M matrix into N x 2M non-negative matrix
   
   # Filter traits by p-value (min. p-value < 0.05/N_variants)
   minP_vec <- apply(z, 2, function(x) min(2 * pnorm(abs(x), lower.tail=F), na.rm=T))
@@ -121,18 +121,20 @@ prep_z_matrix <- function(z_mat, N_mat) {
   z_mat <- z_mat[, keep_traits]
   print(dim(z_mat))
   
-  # Adjust z-scores by sample size for each variant-trait combo (z = z / sqrt(N))
-  # z_mat <- t(t(z_mat) / sqrt(N_vec[match(pruned_traits, colnames(z_mat))]))
-  # Multiply full matrix by mean(sqrt(median(N))) (a single number for the whole matrix)
+  # Adjust z-scores by sample size for each variant-trait combo
+  # i.e. (z = z / sqrt(medN) * mean(sqrt(medN_all_traits)))
+  print("Performing sample size adjustment...")
   medN_vec <- apply(N_mat[, colnames(z_mat)], 2, median, na.rm=T)
   z_mat <- z_mat / sqrt(N_mat[, colnames(z_mat)]) * mean(sqrt(medN_vec))
-  # print(paste0("Multiplying sample size-adjusted z-score matrix by ", 
-  #              round(mean(sqrt(medN_vec[pruned_traits]))), " (i.e. mean(sqrt(median(N))))"))
+
   
   # Replace missing values with zero
+  print("Replacing remaining missing values with zero...")
+  print(paste0(sum(is.na(z_mat)), " missing values were replaced."))
   z_mat[is.na(z_mat)] <- 0
   
-  # Expand into 2N x M non-negative matrix
+  # Expand into N x 2M non-negative matrix
+  print("Expanding z-score matrix into non-negative matrix (N-variants x 2M-traits)...")
   z_mat_pos <- z_mat
   z_mat_pos[z_mat_pos < 0] <- 0
   colnames(z_mat_pos) <- paste0(colnames(z_mat), "_pos")

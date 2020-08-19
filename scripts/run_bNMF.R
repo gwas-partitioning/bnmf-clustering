@@ -51,19 +51,19 @@ BayesNMF.L2EU <- function(
 ) {
   
   # Bayesian NMF with half-normal priors for W and H
-  # V0: input z-score matrix (variants x traits) *****
+  # V0: input z-score matrix (variants x traits)
   # n.iter: Number of iterations for parameter optimization
-  # a0: *****
+  # a0: Hyper-parameter for inverse gamma prior on ARD relevance weights
   # tol: Tolerance for convergence of fitting procedure
   # K: Number of clusters to be initialized (algorithm may drive some to zero)
-  # K0: *****
-  # phi: *****
+  # K0: Used for setting b0 (lambda prior hyper-parameter) -- should be equal to K
+  # phi: Scaling parameter
   
   eps <- 1.e-50
   del <- 1.0
   active_nodes <- colSums(V0) != 0
   V0 <- V0[, active_nodes]
-  V <- V0-min(V0)
+  V <- V0 - min(V0)
   Vmin <- min(V)
   Vmax <- max(V)
   N <- dim(V)[1]
@@ -112,7 +112,7 @@ BayesNMF.L2EU <- function(
   return(list(
     W,  # Variant weight matrix (N x K)
     H,  # Trait weight matrix (K x M)
-    n.like,  # List of reconstruction errors (sum of squared errors / 2) per iteration *****
+    n.like,  # List of reconstruction errors (sum of squared errors / 2) per iteration
     n.evid,  # List of negative log-likelihoods per iteration
     n.lambda,  # List of lambda vectors (shared weights for each of K clusters, some ~0) per iteration
     n.error  # List of reconstruction errors (sum of squared errors) per iteration
