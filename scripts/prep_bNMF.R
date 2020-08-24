@@ -95,12 +95,11 @@ prep_z_matrix <- function(z_mat, N_mat) {
   # 2) expand N x M matrix into N x 2M non-negative matrix
   
   # Filter traits by p-value (min. p-value < 0.05/N_variants)
-  minP_vec <- apply(z, 2, function(x) min(2 * pnorm(abs(x), lower.tail=F), na.rm=T))
+  minP_vec <- apply(z_mat, 2, function(x) min(2 * pnorm(abs(x), lower.tail=F), na.rm=T))
   print(paste0("Removing traits with no variant having p < 0.05 / # variants: ",
                paste(colnames(z_mat)[minP_vec >= 0.05 / nrow(z_mat)], 
                      collapse=", ")))
   z_mat <- z_mat[, minP_vec < 0.05 / nrow(z_mat)]
-  print(dim(z_mat))
   
   # Prune traits by correlation (remove traits with Pearson |r| > 0.85)
   trait_cor_mat <- cor(z_mat, use="pairwise.complete.obs")  # Trait-trait correlation matrix
@@ -119,7 +118,6 @@ prep_z_matrix <- function(z_mat, N_mat) {
   print(paste("Traits removed in pruning process:", 
               paste(pruned_traits, collapse=", ")))
   z_mat <- z_mat[, keep_traits]
-  print(dim(z_mat))
   
   # Adjust z-scores by sample size for each variant-trait combo
   # i.e. (z = z / sqrt(medN) * mean(sqrt(medN_all_traits)))

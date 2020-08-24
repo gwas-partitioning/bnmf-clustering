@@ -42,13 +42,6 @@ final_variant_set <- choose_proxies(
 # Prep bNMF steps
 
 t2d_ss_filepath <- "/humgen/diabetes2/users/clairekim/Mahajan.NatGenet2018b.T2D.European_formatted.txt"
-variant_vec <- final_variant_set
-gwas_ss_file <- t2d_ss_filepath
-trait_ss_files <- trait_paths
-print("Retrieving z-scores and sample sizes for each trait...")
-trait_df_long <- lapply(names(trait_ss_files), read_single_trait, variant_df) %>%
-  bind_rows(.id="trait")  
-
 
 initial_zscore_matrices <- fetch_summary_stats(
   final_variant_set,

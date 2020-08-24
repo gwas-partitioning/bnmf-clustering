@@ -45,8 +45,8 @@ ld_pruning <- function(gwas_variants, rsID_map_file, r2=0.1) {
     rownames(ld_mat) <- ld_mat$RS_number
     ld_mat$RS_number <- NULL
     ld_mat <- as.matrix(ld_mat)
-    ld_mat <- ld_mat[rowSums(ld_mat) != ncol(ld_mat),
-                     colSums(ld_mat) != nrow(ld_mat)]
+    ld_mat <- ld_mat[rowSums(is.na(ld_mat)) != ncol(ld_mat),
+                     colSums(is.na(ld_mat)) != nrow(ld_mat)]
 
     remaining_snps <- var_df$rsID
     
@@ -204,6 +204,9 @@ choose_proxies <- function(need_proxies,
   
   proxies_found <- final_proxy_df$rsID
   no_proxies_found <- setdiff(need_proxies$rsID, proxies_found)
+  print("No proxies needed for ", 
+        length(setdiff(pruned_variants$VAR_ID, need_proxies$VAR_ID)), 
+        " variants.")
   print(paste0("Proxies found for ", length(proxies_found), " variants."))
   print(paste0("No adequate proxies found for ", length(no_proxies_found), 
                " variants."))
