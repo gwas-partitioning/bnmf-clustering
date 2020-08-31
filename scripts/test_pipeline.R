@@ -9,8 +9,8 @@ source("prep_bNMF.R")  # fetch_summary_stats & prep_z_matrix
 source("run_bNMF.R")  # run_bNMF & summarize_bNMF
 
 gwas_traits <- readxl::read_excel("../data/clustering_data_source.xlsx", sheet="gwas_traits")
-trait_paths <- setNames(gwas_traits$full_path, gwas_traits$trait_name)
-trait_paths <- trait_paths[!grepl("MAGIC", names(trait_paths))]  # Some MAGIC GWAS files don't have N_PH field
+trait_ss_files <- setNames(gwas_traits$full_path, gwas_traits$trait_name)
+trait_ss_files <- trait_ss_files[!grepl("MAGIC", names(trait_ss_files))]  # Some MAGIC GWAS files don't have N_PH field
 
 initial_t2d_snps <- read_tsv("../data/T2D_initial_vars_pval.txt")
 set.seed(1)
@@ -35,7 +35,7 @@ final_variant_set <- choose_proxies(
   tabix_path,
   ld_file,
   rsID_map_file,
-  trait_paths,
+  trait_ss_files,
   pruned_variants
 )
 

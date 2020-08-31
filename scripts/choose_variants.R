@@ -146,7 +146,7 @@ find_variants_needing_proxies <- function(gwas_variant_df, var_nonmissingness,
 
 choose_proxies <- function(need_proxies, 
                            tabix_path, ld_file, 
-                           rsID_map_file, ss_files,
+                           rsID_map_file, trait_ss_files,
                            pruned_variants) {
   
   # Given a vector of variants (rsIDs) needing proxies
@@ -178,7 +178,7 @@ choose_proxies <- function(need_proxies,
   
   proxy_missingness <- count_traits_per_variant(
     potential_proxies_map$proxy_VAR_ID,
-    ss_files
+    trait_ss_files
   )
   proxy_missingness_df <- tibble(
     proxy_VAR_ID=names(proxy_missingness),
@@ -198,15 +198,16 @@ choose_proxies <- function(need_proxies,
     ) %>%
     group_by(rsID) %>%
     arrange(desc(frac_nonmissing),
-            desc(r2)) %>%
+            desc(r2),
+            CHR) %>%  # Arbitrary sort for reproducibility in case of missingness + r2 ties
     dplyr::slice(1) %>%
     ungroup()
   
   proxies_found <- final_proxy_df$rsID
   no_proxies_found <- setdiff(need_proxies$rsID, proxies_found)
-  print("No proxies needed for ", 
-        length(setdiff(pruned_variants$VAR_ID, need_proxies$VAR_ID)), 
-        " variants.")
+  print(paste0("No proxies needed for ", 
+               length(setdiff(pruned_variants$VAR_ID, need_proxies$VAR_ID)), 
+               " variants."))
   print(paste0("Proxies found for ", length(proxies_found), " variants."))
   print(paste0("No adequate proxies found for ", length(no_proxies_found), 
                " variants."))
