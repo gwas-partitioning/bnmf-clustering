@@ -1,50 +1,48 @@
 library(tidyverse)
 
 
-############################################################################################
-############################################################################################
-#### Copyright (c) 2017, Broad Institute
-#### Redistribution and use in source and binary forms, with or without
-#### modification, are permitted provided that the following conditions are
-#### met:
-####     Redistributions of source code must retain the above copyright
-####     notice, this list of conditions and the following disclaimer.
-####     Redistributions in binary form must reproduce the above copyright
-####     notice, this list of conditions and the following disclaimer in
-####     the documentation and/or other materials provided with the
-####     distribution.
-####     Neither the name of the Broad Institute nor the names of its
-####     contributors may be used to endorse or promote products derived
-####     from this software without specific prior written permission.
-#### THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-#### "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-#### LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-#### A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-#### HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-#### SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-#### LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-#### DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-#### THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-#### (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-#### OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-############################################################################################
-############################################################################################
+##########################################################################
+# Copyright (c) 2017, Broad Institute
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#     Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#     Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in
+#     the documentation and/or other materials provided with the
+#     distribution.
+#     Neither the name of the Broad Institute nor the names of its
+#     contributors may be used to endorse or promote products derived
+#     from this software without specific prior written permission.
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#########################################################################
 
-######################################################################################################
-####### Bayesian NMF algorithms for clustering
-######################################################################################################
-####### For implementation details see the ppaer 
-####### Udler MS, Kim J, von Grotthuss M,
-####### Bonàs-Guarch S, Cole JB, Chiou J, et al. (2018)
-####### Type 2 diabetes genetic loci informed by multi-trait
-####### associations point to disease mechanisms and
-####### subtypes: A soft clustering analysis. PLoS Med 15
-####### (9): e1002654.
-#################################
-####### For details on the original algorithms 
-####### see Tan, V.Y. & Févotte, C. Automatic relevance determination in nonnegative matrix factorization with the beta-divergence.
-####### IEEE Trans. Pattern Anal. Mach. Intell. 35, 1592–1605 (2013).
-######################################################################################################
+######################################################################
+# Bayesian NMF algorithms for clustering
+######################################################################
+# For implementation details see the ppaer 
+# Udler MS, Kim J, von Grotthuss M,
+# Bonàs-Guarch S, Cole JB, Chiou J, et al. (2018)
+# Type 2 diabetes genetic loci informed by multi-trait
+# associations point to disease mechanisms and
+# subtypes: A soft clustering analysis. PLoS Med 15
+# (9): e1002654.
+###########################
+# For details on the original algorithms 
+# see Tan, V.Y. & Févotte, C. Automatic relevance determination in nonnegative matrix factorization with the beta-divergence.
+# IEEE Trans. Pattern Anal. Mach. Intell. 35, 1592–1605 (2013).
+######################################################################
 
 BayesNMF.L2EU <- function(
   V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=10, phi=1.0
@@ -197,8 +195,8 @@ summarize_bNMF <- function(bnmf_reps) {
     H0 <- data.frame(H)
     H0[, "cluster"] <- rownames(H)
     
-    write_tsv(W0, paste0("L2EU.W.mat.K", k))
-    write_tsv(H0, paste0("L2EU.H.mat.K", k))
+    write_tsv(paste0("L2EU.W.mat.K", k, ".txt"))
+    write_tsv(paste0("L2EU.H.mat.K", k, ".txt"))
     
     mat.reconstructed <- W %*% H   # reconstructed matrix == approximation for the input matrix 
     

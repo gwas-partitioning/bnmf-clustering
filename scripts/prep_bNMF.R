@@ -141,5 +141,9 @@ prep_z_matrix <- function(z_mat, N_mat) {
   colnames(z_mat_neg) <- paste0(colnames(z_mat), "_neg")
   final_z_mat <- cbind(z_mat_pos, z_mat_neg)
   
+  # Write N x M and N x 2M matrices
+  saveRDS(z_mat, "z_score_mat.rds")
+  saveRDS(final_z_mat, "z_score_mat_nonnegative.rds")
+  
   final_z_mat
 }

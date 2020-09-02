@@ -23,7 +23,7 @@ rsID_map_file <- "/humgen/diabetes2/users/clairekim/list_VARID_rsID_updated.txt"
 
 pruned_variants <- ld_pruning(initial_t2d_snps, rsID_map_file)
 
-var_nonmissingness <- count_traits_per_variant(pruned_variants$VAR_ID, trait_paths)
+var_nonmissingness <- count_traits_per_variant(pruned_variants$VAR_ID, trait_ss_files)
 
 proxies_needed_df <- find_variants_needing_proxies(pruned_variants, var_nonmissingness,
                                                    rsID_map_file)
@@ -46,7 +46,7 @@ t2d_ss_filepath <- "/humgen/diabetes2/users/clairekim/Mahajan.NatGenet2018b.T2D.
 initial_zscore_matrices <- fetch_summary_stats(
   final_variant_set,
   t2d_ss_filepath,
-  trait_paths
+  trait_ss_files
 )
 
 final_zscore_matrix <- prep_z_matrix(initial_zscore_matrices$z_mat,
