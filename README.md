@@ -4,7 +4,7 @@ The bNMF procedure, as applied here, is used to detect clusters of GWAS variants
 
 **Important:** The current pipeline makes certain assumptions and uses some hard-coded filenames, including:
 * "VAR_ID"s for GWAS and trait-specific summary statistics are in a specific format (CHR_POS_REF_ALT), with alleles aligned in a consistent way across traits (i.e. variant matching is performed using a simple string match).
-* The variant reference file linking VAR_IDs to rsIDs is based on the VAR_ID format above, and points to a file available on the Broad Institute compute cluster.
+* The variant reference file linking VAR_IDs to rsIDs is based on the VAR_ID format above, and points to a file available on the Broad Institute compute cluster. VAR_ID to rsID pairs can be retrieved by downloading a vcf file from this link: http://ftp.ensembl.org/pub/grch37/current/variation/vcf/homo_sapiens/
 * The LD reference file uses rsIDs, is based on a European-ancestry population, and points to a file available on the Broad Institute compute cluster. This file can be downloaded from HaploReg v4.1 (https://pubs.broadinstitute.org/mammals/haploreg/haploreg.php).
 
 ### 1. Choose the set of variants to be clustered (choose_variants.R)
