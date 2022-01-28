@@ -31,3 +31,11 @@ Most steps of the pipeline will print messages with details of the procedure. In
 * L2EU.H.mat.K[]: The matrix of variant contributions to clusters for the K in question.
 * W_plot_K[].pdf: A heatmap displaying feature contributions to clusters for the K in question.
 * H_plot_K[].pdf: A heatmap displaying variant contributions to clusters for the K in question.
+
+### Contributors
+* Claire Kim (design and code)
+* Kenny Westerman (design and code)
+* Kirk Smith (code)
+* Jaegil Kim (code)
+* Marcin von Grotthuss (code)
+* Miriam Udler (design and supervision)
