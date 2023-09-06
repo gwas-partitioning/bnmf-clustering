@@ -1,0 +1,998 @@
+---
+author: "Kirk Smith"
+date: "`r format(Sys.time(), '%A %B %d, %Y at %I:%M %p %Z',tz='US/Eastern')`"
+output: html_document
+params:
+  main_dir: NULL
+  k: NULL
+  loci_file: "ChrPos"
+  GTEx: FALSE
+  my_traits: NULL
+---
+<style>
+.main-container {
+    width: 1200px;
+    max-width:1200px;
+    margin-left: auto;
+    margin-right: auto;
+}
+  #header { 
+    background: #2274cc; /* Old browsers */
+    background: -moz-linear-gradient(left, #2274cc 0%, #26c5d3 36%, #61bf61 100%); /* FF3.6-15 */
+    background: -webkit-linear-gradient(left, #2274cc 0%,#26c5d3 36%,#61bf61 100%); /* Chrome10-25,Safari5.1-6 */
+    background: linear-gradient(to right, #2274cc 0%,#26c5d3 36%,#61bf61 100%); /* W3C, IE10+, FF16+, Chrome26+,  Opera12+, Safari7+ */
+    filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#2274cc', endColorstr='#61bf61',GradientType=1 ); /* IE6-9 */
+    color: white;
+    height: 100px;
+    display:flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  h1.title {
+    margin: auto;
+  }
+.col2 {
+    columns: 2 300px;         /* number of columns and width in pixels*/
+    -webkit-columns: 2 300px; /* chrome, safari */
+    -moz-columns: 2 300px;    /* firefox */
+  }
+.col3 {
+    columns: 3 100px;
+    -webkit-columns: 3 100px;
+    -moz-columns: 3 100px;
+  }
+  
+.left {
+  text-align: left;
+  float: left;
+  width: 50%;
+  padding-right: 25px;
+  padding-left: 50px;
+}
+
+.right {
+  float: right;
+  text-align: left;
+  width: 50%;
+  padding-right: 50px;
+  padding-left: 25px;
+}
+
+.row {display: flex;}
+.column {flex: 50%;}
+
+</style>
+
+
+```{r setup, include=FALSE}
+# library(knitr)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r load}
+library(dplyr)
+library(data.table)
+library(DT)
+library(kableExtra)
+library(ggplot2)
+library(tidyr)
+library(rstudioapi)
+library(strex)
+library(scales)
+# setwd(dirname(getActiveDocumentContext()$path))
+main_dir <- params$main_dir
+k <- params$k
+loci_file <- params$loci_file
+eval_GTEx <- params$GTEx 
+gwas_traits <- params$my_traits
+
+# find majority K from run summary
+df_run_summary <- fread(file.path(main_dir,"run_summary.txt"),
+                        stringsAsFactors = F, data.table = F)
+
+k_counts <- df_run_summary %>% dplyr::count(K) %>%
+  mutate(perc = n/nrow(df_run_summary))
+  # knitr::kable(caption="Frequency of each K converged to...") %>%
+  # kable_styling(full_width = F)
+
+if (is.null(k)){
+  k <- k_counts$K[which.max(k_counts$n)]
+}
+
+w <- fread(sprintf("%s/L2EU.W.mat.%i.txt",main_dir, k),
+           stringsAsFactors = FALSE, data.table = F)
+n_variants <- nrow(w)
+
+h <- fread(sprintf("%s/L2EU.H.mat.%i.txt",main_dir,k),
+           stringsAsFactors = FALSE, data.table = F) %>%
+  rename_at(
+  vars(starts_with("X2hr")), function(x) {gsub("X","",x) })
+
+df_gwas <- fread(sprintf("%s/alignment_GWAS_summStats.csv",main_dir),
+                 stringsAsFactors = F, data.table=F)
+
+orig_traits <- colnames(h)
+traits_short <- str_before_last(names(h), "[_]")
+df_traits <- data.frame(Trait=unique(traits_short))
+
+```
+
+---
+title: "Initial downstream analyses for the bNMF clustering, version k=`r k`"
+---
+
+### Trait summary 
+<div class = "row">
+<div class = "column">
+```{r trait_summary, echo = FALSE}
+
+trait_results <- fread(file.path(main_dir, "df_traits.csv"))
+
+trait_results %>%
+  dplyr::count(result) %>%
+  ggplot(aes(x = result, y = n, fill = as.factor(result))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual("legend",
+                    values = c("trait kept" = "#00AFBB",
+                               "removed (correlation)" = "#FC4E07",
+                               "removed (low N)" = "#7C7C7C",
+                               "removed (p-value)" = "#E7B800"))+
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  geom_text(aes(label = n), vjust = -0.5) +
+  coord_cartesian(clip = "off") +
+  labs(title="Trait filtering results")
+```
+</div>
+
+<div class = "column">
+```{r trait_table, echo = FALSE}
+trait_results %>% data.table() %>%
+  # column_to_rownames('trait') %>%
+  DT::datatable(selection = 'none', filter = 'none',extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = T,
+                               scrollX = F, pageLength=10,
+                               fixedColumns = list(leftColumns = 1)),
+    caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Trait filtering results')) %>%
+    formatStyle('trait','result', backgroundColor = styleEqual(c('trait kept'), c('lightgreen'))) %>%
+    formatStyle(c(0),backgroundColor='lightgray')
+
+```
+</div>
+</div>
+
+
+### Determining the optimal K from the bNMF run summary
+
+```{r showRunSummary, out.width=c('50%', '50%'), fig.show='hold'}
+run_sum_max <- df_run_summary %>%
+  group_by(K) %>%
+  summarise(convergence = min(evid, na.rm=TRUE)) %>%
+  mutate(K=as.factor(K))
+
+ggplot(data=run_sum_max, aes(x=K, y=convergence, fill=K)) +
+  geom_bar(stat="identity") +
+  scale_fill_brewer(palette = "Spectral") +
+  labs(y="Convergence") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 18),
+        axis.title = element_text(size = 20),
+        plot.title = element_text(size = 24, face = "bold"))+
+    ggtitle("Convergence Scores by K")
+
+library(ggrepel)
+
+df <- k_counts %>%
+    mutate(value=n,
+           group=paste("K",K,sep="=")) %>%
+  arrange(desc(value))
+
+df2 <- df %>% 
+  mutate(csum = rev(cumsum(rev(value))), 
+         pos = value/2 + lead(csum, 1),
+         pos = if_else(is.na(pos), value/2, pos))
+  
+ggplot(df, aes(x = "", y = value, fill = forcats::fct_inorder(group))) +
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  # geom_text(aes(label = value),
+  #           position = position_stack(vjust = 0.5),
+  #           size = 3) +
+  scale_fill_brewer(palette = "Spectral")+
+  geom_label_repel(data = df2,
+                   aes(y = pos, label = sprintf("K=%i\n(%i%%)",K,round(perc*100))),
+                   size = 8,
+                   nudge_x = 1,
+                   show.legend = FALSE) +
+  # guides(fill = guide_legend(title = "Group")) +
+  theme_void()+
+  scale_y_continuous(breaks = df2$pos, labels = df$group) +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        legend.position = "none") +
+  ggtitle(sprintf("Distribution of K convergences\n%i iterations", sum(df2$n)))
+  
+```
+
+<br>
+
+### Determining the optimal cutoff for clustering weights (parameters: N, M)
+#### 1) Fit a 1st line to the top N% of weights
+#### 2) Fit a 2nd line to the M% of tail weight
+#### 3) Using the remaining weights from top N% to last M%, check if they have shorter distance to 1st or 2nd line
+#### 4) The first weight that has a shorter distance to 2nd line (defined by long tail) is selected as the cutoff.
+
+```{r weightCutoff}
+library(magrittr)
+# change input data file
+# w_mat: genes as column names, clusters as rows
+
+w_mat <- data.frame(t(w)) %>%
+  set_colnames(.["variant", ]) %>%
+  subset(!rownames(.) %in% "variant")
+# w_mat <- fread("./L2EU.H.mat.8.txt",stringsAsFactors = FALSE,data.table = F)
+
+dist_point_line <- function(a, slope, intercept) {
+  b = c(1, intercept+slope)
+  c = c(0, intercept)       
+  v1 <- b - c
+  v2 <- a - b
+  m <- cbind(v1,v2)
+  return(abs(det(m))/sqrt(sum(v1*v1)))
+}
+
+# w_mat$cluster = NULL
+# names(w_mat) = NULL
+# weight = unlist(w_mat)
+w_list <- as.list(w_mat)
+weight = unlist(w_list)
+
+weights = as.data.frame(weight)
+weights$weight = as.numeric(as.character(weights$weight))
+weights = as.data.frame(weights[order(weights$weight,decreasing = T),])
+names(weights)[1] = "weight"
+
+numWeights <- dim(weights)[1]
+weights$x = c(1:numWeights)
+weights$x_scale = weights$x/numWeights
+weights$w_scale = weights$weight/max(weights$weight)
+
+cutoff_test <- quantile(weights$weight, prob=1-1/100)
+n = ifelse(sum(weights$weight > cutoff_test)>3, 1, 5)
+m = 80
+top1 = as.data.frame(weights[weights$weight > quantile(weights$weight, prob=1-n/100),])
+low80 = as.data.frame(weights[weights$weight <= quantile(weights$weight, prob=m/100),])
+weights$group = ifelse(weights$x %in% top1$x,paste0("top",n),
+                       ifelse(weights$x %in% low80$x,paste0("bottom",m),"other"))
+
+top1line <- lm(w_scale ~ x_scale, data=top1)
+bottom80line <- lm(w_scale ~ x_scale, data=low80)
+
+weights$dist_top1 = rep(0,numWeights)
+for(i in 1:numWeights){
+  x = weights$x_scale[i]
+  y = weights$w_scale[i]
+  weights$dist_top1[i] = dist_point_line(c(x,y),top1line$coefficients[2],top1line$coefficients[1])
+}
+
+weights$dist_low80 = rep(0,numWeights)
+for(i in 1:numWeights){
+  x = weights$x_scale[i]
+  y = weights$w_scale[i]
+  weights$dist_low80[i] = dist_point_line(c(x,y),bottom80line$coefficients[2],bottom80line$coefficients[1])
+}
+
+weights$diff = weights$dist_top1 - weights$dist_low80
+cut = weights[weights$diff > 0,]
+cutoff = cut$weight[1]
+cutoff_num = cut$x[1]
+
+highlight <- weights %>% filter(x == cutoff_num)
+         
+ggplot(weights, aes(x=x_scale, y=w_scale, color=group)) +
+  geom_point() + 
+  geom_abline(intercept = top1line$coefficients[1], slope = top1line$coefficients[2], color='blue') + 
+  geom_abline(intercept = bottom80line$coefficients[1], slope = bottom80line$coefficients[2], color='red') +
+  geom_point(data=highlight, aes(x=x_scale,y=w_scale), color='red',size=5)
+
+cutoff_f = format(cutoff, digits = 5)
+cutoff_num_f = format(100*cutoff_num/numWeights, digits=2)
+
+```
+
+<p style="font-size:14pt; font-weight:bold; color:blue;">
+    Optimal weight cutoff: `r cutoff_f` (includes top `r cutoff_num_f`% of variants)
+</p><br>
+
+
+### Cluster Weights
+#### Weights above cutoff are highlighted
+
+```{r tbl_snps, fig.show='hold'}
+
+df_rsIDs <- fread(file.path(main_dir,"rsID_map.txt"),
+                  # select = c(1:2),
+                  # header=F,
+                  # col.names=c("VAR_ID", "rsID"),
+                  data.table=F, stringsAsFactors=F) %>%
+  mutate(variant = gsub("_",":",str_before_nth(VAR_ID, "_", 2))) %>%
+  filter(!duplicated(variant)) %>%
+  dplyr::select(VAR_ID, rsID, variant)
+
+if (loci_file=="query"){
+  # print("Querying for locus names...")
+  library(GenomicRanges)
+  library(Homo.sapiens)
+
+  geneRanges <- function(db, column="ENTREZID"){
+      g <- genes(db, columns=column)
+      col <- mcols(g)[[column]]
+      genes <- granges(g)[rep(seq_along(g), elementNROWS(col))]
+      mcols(genes)[[column]] <- as.character(unlist(col))
+      genes
+  }
+  
+  gns = geneRanges(Homo.sapiens, column="SYMBOL")
+  # need chr | start | end, with gene names for row names
+  df_gns <- data.frame(gns)
+  gtf.gene <- df_gns %>%
+    mutate(chr = gsub("chr","",seqnames)) %>%
+    dplyr::select(chr, start, end, SYMBOL)
+  
+    # need chr | start | end, with gene names for row names
+  df_entrez <- geneRanges(Homo.sapiens, column="ENTREZID") %>%
+    data.frame() %>%
+    mutate(chr = gsub("chr","",seqnames)) %>%
+    mutate(ChrPos = paste(chr,start,sep=":")) %>% 
+    dplyr::select(ChrPos, ENTREZID)
+  
+  #' Convert from string to range
+  #' 
+  #' @param pos A vector of strings ex. chr1 2938302 2938329
+  #' @param delim Delimiter for string splitting
+  #' @param region Boolean of whether region or just one position
+  #'
+  #' @returns Dataframe of ranges
+  #' 
+  string2range <- function(pos, delim=' ', region=TRUE) {
+      posp <- as.data.frame(do.call(rbind, strsplit(pos, delim)))
+      posp[,1] <- posp[,1]
+  	posp[,2] <- as.numeric(as.character(posp[,2]))
+  	if(region) {
+          posp[,3] <- as.numeric(as.character(posp[,3]))
+  	} else {
+  	    posp[,3] <- posp[,2]
+  	}
+      return(posp)
+  }
+  
+  #' Convert from ranges to GRanges
+  #' 
+  #' @param df Dataframe with columns as sequence name, start, and end
+  #' 
+  #' @returns GRanges version 
+  #' 
+  range2GRanges <- function(df) {
+      require(GenomicRanges)
+      require(IRanges)
+  	gr <- GenomicRanges::GRanges(
+          seqnames = df[,1],
+          ranges=IRanges(start = df[,2], end = df[,3])
+          )
+      return(gr)
+  }
+  
+  # convert SNPs to GRanges
+  snps <- w$variant
+  snps.ranges <- string2range(snps, delim=":", region=FALSE)
+  snps.granges <- range2GRanges(snps.ranges)
+  names(snps.granges) <- snps
+  
+  # convert genes to GRanges
+  gtf.granges <- range2GRanges(gtf.gene)
+  names(gtf.granges) <-  gtf.gene$SYMBOL  #gene.names
+  
+  hits <- GenomicRanges::nearest(snps.granges, gtf.granges)
+  # make vector of SNPs to gene
+  
+  df_gns <- df_gns %>% 
+    mutate(chr = gsub("chr","",seqnames)) %>%
+    mutate(ChrPos = paste(chr,start,sep=":")) %>%
+    dplyr::select(chr, start, end, ChrPos, SYMBOL) %>%
+    merge(df_entrez, by="ChrPos")
+  
+  df_hits <- data.frame(gene=names(gtf.granges)[hits]) %>%
+    mutate(variant = names(snps.granges)) %>%
+    merge(df_gns[,c("SYMBOL","ENTREZID")], by.x="gene", by.y="SYMBOL") %>%
+    filter(!duplicated(variant))
+
+  w <- w %>%
+    left_join(df_hits, by="variant") %>%
+    mutate(gene = dplyr::coalesce(gene, variant)) # coalese fills in empty genes w/ variant
+  
+  } else if (is.character(loci_file) & !loci_file %in% c("query","ChrPos")) {
+    
+    # print("Mapping manually curated locus names to SNPs...")
+    locus_map <- read.csv(loci_file, header = T, stringsAsFactors = F) %>%
+      mutate(variant = paste(CHR,POS,sep=":"))
+    
+    w <- w %>%
+      merge(locus_map[c("variant","Locus")], by="variant") %>%
+      dplyr::rename(gene=Locus) %>%
+      mutate(gene=make.unique(gene))
+} else {
+    # print("Using Chr:Pos for locus names...")
+    w <- w %>%
+      mutate(gene=variant)
+}
+
+w <- w %>%
+  left_join(df_rsIDs, by = "variant")
+
+cluster_names <- names(w)[names(w) %like% "X"]
+
+w %>% #set_rownames(make.unique(.[,'gene'])) %>% # set_rownames(.[,"variant"])
+  relocate(VAR_ID, gene, rsID) %>%
+  dplyr::select(-c(variant,ENTREZID)) %>%
+  DT::datatable(selection = 'none', filter = 'none', extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = TRUE,
+                               scrollX = F, pageLength=10,
+                               fixedColumns = list(leftColumns = 3)),
+    caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Variant Weights')) %>%
+    DT::formatSignif(columns = cluster_names, digits=4) %>%
+    formatStyle(cluster_names, backgroundColor=styleInterval(c(cutoff), c('white', 'springgreen'))) %>%
+  formatStyle(c(0),backgroundColor='lightgray')
+
+```
+
+<br>
+```{r tbl_traits, echo = FALSE}
+# unloadNamespace("biomaRt")
+
+h %>%
+  t() %>%
+  set_rownames(gsub("_"," ",rownames(.))) %>%
+  set_colnames(cluster_names) %>%
+  DT::datatable(selection = 'none', filter = 'none',extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = T,
+                               scrollX = F, pageLength=10,
+                               fixedColumns = list(leftColumns = 1)),
+    caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Phenotype Weights')) %>%
+    DT::formatSignif(columns = cluster_names, digits=4) %>%
+    formatStyle(cluster_names, backgroundColor=styleInterval(c(cutoff), c('white', 'springgreen'))) %>%
+    formatStyle(c(0),backgroundColor='lightgray')
+
+```
+<br>
+
+### Manhattan plot
+
+```{r manhattan, fig.height=5, fig.width=12, fig.align="center"}
+
+max_w <- dplyr::mutate(w,
+                          max_weight =  apply(w[cluster_names], 1, max ),
+                          type = colnames(w[cluster_names])[max.col(w[cluster_names])] )
+df_chr_len <- data.frame(CHR=as.numeric(1:22),
+                      chr_len_mil=c(248, 243, 200, 192, 181, 171, 159, 147, 141, 136,
+                                135, 133, 115, 107, 101, 89, 79, 77, 64, 63, 47, 50))
+
+gwasResults <- df_gwas %>%
+  separate(SNP, into=c("CHR","BP"),sep = ":",remove = F) %>%
+  inner_join(max_w[,c("variant","gene","max_weight","type")], by=c("SNP"="variant")) %>%
+  mutate_at(c("CHR", "BP"), as.numeric) %>%
+  mutate(P=-log10(P_VALUE)) %>%
+  right_join(df_chr_len, by="CHR") %>%
+  # mutate(chr_len_mil=chr_len_mil*1e6) %>%
+  mutate(above_cutoff = max_weight>cutoff) %>%
+  mutate(BP = ifelse(is.na(BP), chr_len_mil*1e6, BP)) %>%
+  mutate(quantile_rank = ntile(P, 10))
+  
+defining_snps <- gwasResults %>%
+  drop_na(SNP) %>%
+  group_by(type) %>%
+  filter(max_weight == max(max_weight, na.rm=TRUE)) %>%
+  data.frame()
+
+don <- gwasResults %>% 
+  
+  # Compute chromosome size
+  group_by(CHR) %>% 
+  summarise(chr_len = max(BP)) %>%
+  
+  # Calculate cumulative position of each chromosome
+  mutate(tot=cumsum(chr_len)-chr_len) %>%
+  dplyr::select(-chr_len) %>%
+  
+  # Add this info to the initial dataset
+  left_join(gwasResults, ., by=c("CHR"="CHR")) %>%
+  
+  # Add a cumulative position of each SNP
+  arrange(CHR, BP) %>%
+  mutate(BPcum=BP+tot) %>%
+  mutate(cluster_defining = SNP %in% defining_snps$SNP)
+
+
+axisdf <- don %>%
+  group_by(CHR) %>%
+  summarize(center=( max(BPcum) + min(BPcum) ) / 2 )
+
+
+ggplot(don, aes(x=BPcum, y=P)) +
+  
+  geom_point(data=subset(don, above_cutoff==F), color="black", size=1) +
+
+  geom_point(data=subset(don, above_cutoff==T),
+             aes(fill=as.factor(type), size=max_weight,  shape=cluster_defining),
+            alpha=1) +
+  scale_shape_manual(values = c(21, 23),guide = "none") +
+  # scale_fill_brewer(palette = "Accent") + 
+
+  # custom X axis:
+    scale_x_continuous( label = axisdf$CHR, breaks= axisdf$center ) +
+    scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+
+  # add GWAS-significant p-value line
+  geom_hline(yintercept = -log10(5e-8),linetype = 'dashed', col = 'black') +
+
+    # Add label using ggrepel to avoid overlapping
+    geom_label_repel(data=subset(don, quantile_rank==10 | cluster_defining==T),
+                     aes(label=gene), size=2) +
+
+    # Custom the theme:
+    theme_bw() +
+    theme(panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    ) +
+  labs(x='Chromosome', y='-log10(p)', fill='Cluster') +
+  guides(fill=guide_legend(override.aes=list(shape=21))) +
+  coord_cartesian(clip = "off")
+  
+
+
+```
+
+
+### Cluster Weight Heatmaps
+#### Column label color correspond to the cluster with the column's highest weight
+<br>
+
+#### Genes x Clusters
+
+```{r heatmaps1, fig.height=6, fig.width=12, fig.align="center"}
+# BiocManager::install("ComplexHeatmap",lib="/humgen/florezlab/users/ksmith/Rlibs_3_5")
+suppressPackageStartupMessages(library(ComplexHeatmap))
+library(magrittr)
+suppressPackageStartupMessages(library(circlize))
+# library(gridtext)
+
+# assign column label colors based on which cluster they have their maximum weight
+palette1_named = setNames(object = scales::hue_pal()(length(cluster_names)),
+                          nm = cluster_names)
+ix=sapply(w_mat, which.max)
+label_colors=palette1_named[ix]
+
+hm_colors = colorRamp2(c(0, max(weights$weight)), c("white", "black"))
+
+w %>%
+  set_rownames(make.unique(.[,'gene'])) %>%
+  dplyr::select(starts_with("X")) %>% #-c(variant, gene, rsID)
+  t() %>%
+  as.matrix() %>%
+  Heatmap(name = "Weight",
+          column_title="Loci x Clusters",
+        border_gp = gpar(col = "black"),
+        show_column_dend = F,
+        column_names_gp = grid::gpar(fontsize = 6),
+        col=hm_colors)
+ 
+# column_names_gp = grid::gpar(fontsize = 10,col=label_colors),
+# row_labels = gt_render(cluster_names,
+                               # padding = unit(c(5, 5, 5, 5), "pt")),
+# row_names_gp = grid::gpar(box_col=palette1_named, box_lwd=2, fontsize = 15))
+
+```
+
+#### Variants x Clusters
+
+```{r heatmaps2, fig.height=6, fig.width=12, fig.align="center"}
+
+# repeat for phenotypes
+ix=sapply(h, which.max)
+label_colors=palette1_named[ix]
+
+h %>%
+  set_rownames(cluster_names) %>%
+  as.matrix() %>%
+  Heatmap(name="Weight",
+        column_title="Phenotypes x Clusters",
+        border_gp = gpar(col = "black"),
+        show_column_dend = F,
+        column_names_gp = grid::gpar(fontsize = 8),
+        col=hm_colors
+)
+
+        # column_names_gp = grid::gpar(fontsize = 10,col=label_colors),
+        # row_labels = gt_render(cluster_names,
+                               # padding = unit(c(10, 10, 2, 10), "pt")),
+        # row_names_gp = grid::gpar(box_col=palette1_named, box_lwd = 2, fontsize = 20))
+
+```
+
+### Cluster Circle Plots
+#### Only includes variants and phenotypes with weights above cutoff
+<span style="color: blue;">Blue = negative trait</span><br>
+<span style="color: red;">Red = positive trait</span><br>
+<span style="color: green;">Green = variant</span><br>
+
+<div class="col2">
+```{r circlePlots, fig.align="center"}
+library(readr)
+loci = w[cluster_names]
+# colnames(loci) <- c(cluster_names, "name")
+loci$name <- make.unique(w$gene)
+loci$group <- as.factor("Variant")
+
+trait = data.frame(t(h))
+# colnames(trait) <- (c("name",cluster_names))
+# trait[cluster_names] <- sapply(trait[cluster_names],as.numeric)
+trait$name = gsub("_neg|_pos","",rownames(trait))
+trait$group <- as.factor(ifelse(grepl("_pos",rownames(trait)), "Pos_Trait",
+                      ifelse(grepl("_neg",rownames(trait)), "Neg_Trait","Misc. Trait")))
+
+for (i in 1:length(cluster_names)) { #1:length(cluster_names)
+  my_clust=cluster_names[i]
+  df_loci <- loci[loci[my_clust]>=cutoff, c(my_clust, "name","group")]
+  df_trait <- trait[trait[my_clust]>=cutoff, c(my_clust, "name","group")]
+  data <- rbind(df_loci, df_trait) %>% set_colnames(c("value","name","group"))
+  if (nrow(data)>30){
+    # data = data %>% group_by(group) %>% top_n(10,wt=value) %>%
+    #   arrange(group, desc(value))
+    data = data %>% top_n(30,wt=value) %>%
+      arrange(group, desc(value))
+  } else{
+      data = data %>% group_by(group) %>%
+        arrange(group, desc(value))
+      }
+  data$value = ifelse(data$group=="Neg_Trait",
+                      data$value*-1.5,
+                      data$value*1.5)
+
+  # set number of empty bars
+  empty_bar <- 1
+  # add lines to the initial dataset
+  to_add <- data.frame(matrix(NA, empty_bar*nlevels(data$group), ncol(data)) )
+  colnames(to_add) <- colnames(data)
+  to_add$group <- rep(levels(data$group), each=empty_bar)
+  data <- rbind(data, to_add)
+  data <- data %>% arrange(group)
+  data$id <- seq(1, nrow(data))
+  ymax=(max(data$value,na.rm=T))
+  ymin=(min(data$value,na.rm=T))
+
+  # get the name and the y position of each label
+  label_data <- data
+  number_of_bar <- nrow(label_data)
+  angle <- 90 - 360 * (label_data$id-0.5) /number_of_bar     # I substract 0.5 because the letter must have the angle of the center of the bars. Not extreme right(1) or extreme left (0)
+  label_data$hjust <- ifelse( angle < -90, 1, 0)
+  label_data$angle <- ifelse(angle < -90, angle+180, angle)
+  
+  # prepare a data frame for base lines
+  base_data <- data %>% 
+    group_by(group) %>% 
+    dplyr::summarize(start=min(id), end=max(id) - empty_bar) %>% 
+    rowwise() %>% 
+    mutate(title=mean(c(start, end)))
+  
+  # make the plot
+  p <- ggplot(data, aes(x=as.factor(id), y=value, fill=group)) +       # Note that id is a factor. If x is numeric, there is some space between the first bar
+    geom_bar(stat="identity", alpha=0.7,width=0.8) +
+    # scale_y_continuous(oob = rescale_none) +
+    ylim(-20, ymax+75) +  # ymax+100
+    theme_minimal() +
+    theme(legend.position = "none",
+      plot.title = element_text(hjust = 0.5,vjust = -10),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = unit(rep(-1,4), "cm")
+    ) +
+    scale_fill_manual("Legend",
+                      values =c("Variant" = "green3",
+                                "Neg_Trait" = "blue3",
+                                "Pos_Trait" = "red3"))+
+    coord_polar(clip = "off") + 
+    geom_text(data=label_data, aes(x=id, y=ifelse(value>0, value+5, 7),label=name, hjust=hjust),
+              color="black",
+              fontface="bold",
+              alpha=0.7,
+              size=4,
+              angle= label_data$angle,
+              inherit.aes = FALSE )
+  
+    #y=ifelse(value>=0,value+10,10)
+    # Add base line information
+    # geom_segment(data=base_data, aes(x = start-0.5, y = 0, xend = end+0.5, yend = 0), colour = "darkslategrey", alpha=0.8, size=0.2 , inherit.aes = FALSE )  +
+    # geom_text(data=base_data, aes(x = title, y = -22, label=group), colour = "black", alpha=0.8, size=3, fontface="bold", inherit.aes = FALSE) 
+  
+  ggsave(sprintf("/circlePlot_k%i_cluster%i.png", k, i),
+         plot=p, path = main_dir, width = 7, height = 7,
+         dpi = 300, units = "in", device='png')
+  print(p+ggtitle(sprintf("Cluster %s",i)))
+
+}
+
+```
+</div>
+
+
+```{r makeExcel}
+library(openxlsx)
+library(tidyverse)
+
+h.exc <- t(h) %>%
+  data.frame() %>%
+  mutate(trait = row.names(.)) %>%
+  relocate(trait)
+if (exists("locus_map")) {
+  w.exc <- w %>%
+    merge(locus_map[c("VAR_ID","rsID","variant")],by="variant") %>%
+    dplyr::select(-c(ENTREZID)) %>%
+    relocate(VAR_ID, rsID, gene) %>%
+    dplyr::rename(VAR_ID_hg19=VAR_ID) %>%
+    # column_to_rownames('VAR_ID') %>%
+    dplyr::select(-c(variant))
+  last_id_col <- ncol(w.exc)-length(cluster_names)
+} else {
+  w.exc <- w %>%
+    # set_rownames(w$variant) %>%
+    dplyr::select(-c(ENTREZID, variant)) %>%
+    relocate(VAR_ID, rsID, gene) 
+    # dplyr::select(-c(gene))
+  last_id_col <- ncol(w.exc)-length(cluster_names)
+}
+
+posStyle <- createStyle(fontColour = "#006100", bgFill = "#C6EFCE")
+
+# for (i in 1:length(colnames(w.exc)){
+wb <- openxlsx::createWorkbook()
+for (i in 1:length(cluster_names)){
+  w_temp <- w.exc %>%
+    dplyr::arrange(-!!as.symbol(cluster_names[i]))
+  h_temp <- h.exc %>%
+    arrange(-!!as.symbol(cluster_names[i]))
+  
+  cur_sheet = sprintf("cluster%i",i)
+  addWorksheet(wb, cur_sheet)
+  start_col1 <- 1
+  start_col2 <- ncol(w_temp)+3
+  # cutoff_col <- 2*(ncol(w_temp)+2)+1
+  
+  writeData(wb=wb, sheet=cur_sheet, x=w_temp, startCol = start_col1, startRow = 1,
+            rowNames=F,colNames = T)
+  writeData(wb=wb, sheet=cur_sheet, x=h_temp, startCol = start_col2, startRow = 1,
+            rowNames=F,colNames = T)
+  # writeData(wb=wb, sheet="Foo", x=data.frame(cutoff=cutoff), startCol = cutoff_col, startRow = 1)
+  conditionalFormatting(wb, cur_sheet,
+                        cols = last_id_col, rows = 2:(nrow(w_temp)+1),
+                        rule =sprintf("%s2>=%.7f",
+                                      int2col(last_id_col+i),cutoff),
+                        style = posStyle)
+  conditionalFormatting(wb, cur_sheet,
+                        cols = start_col2, rows = 2:(nrow(h_temp)+1),
+                        rule = sprintf("%s2>=%.7f",
+                                       int2col(start_col2+i),cutoff),
+                        style = posStyle)
+}
+fp <- file.path(main_dir, sprintf("sorted_cluster_weights_K%i_rev.xlsx",k))
+openxlsx::saveWorkbook(wb, fp, overwrite = T)
+
+```
+
+`r  if(eval_GTEx){"##GTEx analysing using LDlinkR:LDexpress"}`
+```{r LDlinkExp, eval=eval_GTEx, fig.height=6, fig.width=10, fig.align="center"}
+
+library(LDlinkR)
+
+df_LDexpress <- data.frame("RS_ID"=character(),
+                           "Gene_Symbol"=character(), "Tissue"=character(),
+                            "Effect_Size"=numeric(), "P_value"=numeric(),
+                            "Cluster"=character())
+
+for (my_clust in cluster_names){
+  df_loci <- w %>%
+    filter(!!sym(my_clust) >= cutoff) %>%
+    dplyr::select(all_of(c(my_clust, 'variant','gene','rsID'))) %>%
+    arrange(-!!sym(my_clust)) %>%
+    dplyr::slice(1:10)
+
+  if (nrow(df_loci)>1){
+    ld_res <- LDlinkR::LDexpress(snps = df_loci$rsID,
+                       pop = c("CEU"),
+                       tissue = c("ALL"),
+                       r2d = "r2",
+                       r2d_threshold = "1.0",
+                       p_threshold = "0.005",
+                       win_size = "500000",
+                       # genome_build = "grch37",
+                       token = "cb5457b210a6"
+                      )
+    res_filtered <- ld_res %>%
+      # filter(RS_ID %in% df_loci$rsID) %>%
+      arrange(P_value) %>%
+      mutate(Cluster = my_clust) %>%
+      mutate_at(c("P_value", "Effect_Size"), as.numeric) %>%
+      dplyr::select(RS_ID, Gene_Symbol, Tissue,
+             Effect_Size, P_value, Cluster) %>%
+      drop_na()
+  
+    df_LDexpress <- rbind(df_LDexpress, res_filtered)
+  }
+}
+
+# SNP vs gene expression heatmaps
+# version 1: minimum p-value per cluster per tissue
+
+df_geneExpr_hm <- df_LDexpress %>%
+  dplyr::select(Gene_Symbol, P_value, Tissue, Cluster)
+
+# find the minimum p-value per Cluster-Tissue combination
+# (warning about Inf appears because some combinations don't exist for given cluster)
+df_cast <- reshape2::dcast(setDT(df_geneExpr_hm),
+                           Cluster ~ Tissue,
+                           value.var = c("P_value"), fun.aggregate=mean) %>%
+  data.frame() %>%
+  column_to_rownames("Cluster") %>%
+  # -log10 transform p-values for heatmap readability
+  mutate_all(funs(-log10(.))) %>%
+  # replace Inf with NA
+  mutate_if(is.numeric, function(x) ifelse(is.infinite(x), NA, x)) %>%
+  # replace NA with 0
+  replace(is.na(.), 0) %>%
+  # heatmap requires matrix class for input
+  as.matrix()
+
+hm <- Heatmap(matrix = df_cast,
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 8),
+        heatmap_legend_param = list(title = "-log10(Pvalue)"),
+        col=colorRamp2(c(0, max(df_cast)), c("white", "red")),
+        # name = "Mean P-value per Cluster per Tissue",
+        column_title = "Mean P-value per Cluster per Tissue")
+print(hm)
+
+# version 2: how to make each row a SNP, but keep the Cluster column?
+df_geneExpr_hm <- df_LDexpress %>%
+  mutate(log10.pval=-log10(P_value)) %>%
+  dplyr::select(RS_ID, log10.pval, Tissue, Cluster) %>%
+  group_by(Cluster, RS_ID) %>%
+  arrange(desc(log10.pval), .by_group = T) %>%
+  filter(!duplicated(Tissue))
+
+df_wide <- df_geneExpr_hm %>%
+    # mutate(wall_type_logical = TRUE) %>%
+    pivot_wider(names_from = Tissue,
+                values_from = log10.pval) %>%
+  mutate(RS_ID = paste(RS_ID, Cluster,sep=".")) %>%
+  column_to_rownames("RS_ID") %>%
+  dplyr::select(-c(Cluster)) %>%
+  # mutate_all(funs(-log10(.))) %>%
+  replace(is.na(.), 0) %>%
+  as.matrix()
+
+my_splits <- str_after_last(rownames(df_wide),"\\.")
+
+library(RColorBrewer)
+# png(file.path(main_dir,"heatmap222.png"),width=6,height=5,units="in",res=1200)
+hm <- Heatmap(matrix = df_wide_max,
+        row_split = my_splits,
+        split = df_wide,
+        row_names_gp = gpar(fontsize = 10),
+        column_names_gp = gpar(fontsize = 8),
+        cluster_rows = T, show_row_dend = F,
+        cluster_columns = T,
+        show_row_names = F, gap = unit(2, "mm"),
+        col=colorRamp2(c(0, quantile(df_wide_max,probs=c(0.95))["95%"]),
+                       c("white", "red")),
+        heatmap_legend_param = list(title = "-log10(Pvalue)"),
+        column_title = "Smallest P-value per SNP per Cluster")
+# dev.off()
+print(hm)
+
+
+library(pheatmap)
+
+# Generte data (modified the mydf slightly)
+col1 <- brewer.pal(12, "Set3")
+mymat <- df_wide #matrix(rexp(600, rate=.1), ncol=12)
+# colnames(mymat) <- c(rep("treatment_1", 3), rep("treatment_2", 3), rep("treatment_3", 3), rep("treatment_4", 3))
+# rownames(mymat) <- paste("gene", 1:dim(mymat)[1], sep="_")
+df_annot <- data.frame(category=str_after_last(rownames(df_wide),"\\."),
+                       row.names = rownames(df_wide))
+
+# add row annotations
+save_pheatmap_png <- function(x, filename, width=1200, height=1000, res = 150) {
+  png(filename, width = width, height = height, res = res)
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+newCols <- colorRampPalette(grDevices::rainbow(length(unique(df_annot$category))))
+annoCol <- newCols(length(unique(df_annot$category)))
+names(annoCol) <- unique(df_annot$category)
+annoCol <- list(category = annoCol)
+
+pheatmap <- pheatmap(mymat,
+         cluster_cols = T,
+         cluster_rows = F,
+         show_rownames = F,
+         annotation_row = df_annot,
+         annotation_colors=annoCol,
+         # gaps_row = c(300, 600),
+         color = rev(hcl.colors(50, "Reds 2")))
+save_pheatmap_png(pheatmap, "my_heatmap.png")
+         
+match(cluster_names, df_annot$category)                                             
+```
+
+
+<!-- ### Over-representation analysis for the SNP-gene-disease network (DisGeNET) -->
+<!-- ```{r enrichment, out.width=c('50%', '50%'), fig.show='hold'} -->
+<!-- library(enrichplot) -->
+<!-- library(DOSE) -->
+<!-- # library(clusterProfiler) -->
+<!-- # library(ggnewscale) -->
+<!-- # library(ReactomePA) -->
+
+<!-- max_weight <- w %>% -->
+<!--   dplyr::select(starts_with("X")) %>% -->
+<!--   max() -->
+<!-- mid <- max_weight/2 -->
+
+<!-- for (i in 1:length(cluster_names)) { -->
+<!--   my_clust=cluster_names[i] -->
+<!--   df_loci <- w %>% -->
+<!--     filter(!!sym(my_clust) >= cutoff) %>% -->
+<!--     dplyr::select(all_of(c(my_clust, 'variant', 'gene', 'rsID','ENTREZID'))) %>% -->
+<!--     arrange(-!!sym(my_clust)) -->
+
+<!--   # edo <- enrichGO(df_loci$ENTREZID) -->
+<!--   if (nrow(df_loci)>1){ -->
+<!--     dgnv <- enrichDGNv(df_loci$rsID, -->
+<!--                        pvalueCutoff = 0.1, -->
+<!--                        minGSSize = 10) -->
+<!--     # edo <- enrichWP(df_loci$ENTREZID, -->
+<!--                     # organism = "Homo sapiens") -->
+<!--     cur_weights <- df_loci[,my_clust] -->
+<!--     names(cur_weights) <- df_loci$rsID -->
+
+<!--     # Gene-Concept Network -->
+<!--     # The cnetplot() depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network. GSEA result is also supported with only core enriched genes displayed. -->
+<!--     # edox <- setReadable(dgnv, 'org.Hs.eg.db', keyType = "auto") -->
+
+<!--     ## categorySize can be scaled by 'pvalue' or 'geneNum' -->
+<!--     x <- length(unique(dgnv$geneID)) -->
+<!--     if (!is.null(dgnv) & x>1) { -->
+<!--       plt <- cnetplot(dgnv, -->
+<!--        categorySize="pvalue", -->
+<!--        foldChange=cur_weights, -->
+<!--        shadowtext="gene", -->
+<!--        circular=F) + -->
+<!--         scale_color_gradient2(name='Cluster Weight', -->
+<!--                               midpoint = mid, low = "yellow",mid = "orange", -->
+<!--                               high = "red", space = "Lab" ) + -->
+<!--         # scale_colour_gradient(name='Cluster Weight', -->
+<!--                          # low = "yellow", high = "red", na.value = NA)+ -->
+<!--        ggtitle(sprintf("Cluster %s",my_clust)) + -->
+<!--        theme(panel.border = element_rect(color = "black", -->
+<!--                                     fill = NA, -->
+<!--                                     size = 5)) -->
+<!--       print(plt) -->
+<!--     } -->
+<!--   } -->
+<!-- } -->
+
+
+<!-- ``` -->

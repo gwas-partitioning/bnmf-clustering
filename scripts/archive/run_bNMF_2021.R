@@ -45,7 +45,7 @@ library(tidyverse)
 ######################################################################
 
 BayesNMF.L2EU <- function(
-  V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=15, phi=1.0 #20, 10
+  V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=10, phi=1.0
 ) {
   
   # Bayesian NMF with half-normal priors for W and H
@@ -69,7 +69,6 @@ BayesNMF.L2EU <- function(
   
   W <- matrix(runif(N * K) * Vmax, ncol=K)
   H <- matrix(runif(M * K) * Vmax, ncol=M)
-  
   I <- array(1, dim=c(N, M))
   V.ap <- W %*% H + eps
   
@@ -119,19 +118,15 @@ BayesNMF.L2EU <- function(
 }
 
 
-run_bNMF <- function(z_mat, n_reps=10, random_seed=1, K=20, K0=10, tolerance=1e-7) {
+run_bNMF <- function(z_mat, n_reps=10, random_seed=1, ...) {
   
   # Given an input matrix as created by prep_z_matrix(), run the bNMF procedure
   # a series of times to generate results and evaluate cluster stability
   
   print(paste0("Running bNMF clustering procedure (", n_reps, " iterations)..."))
-  print(sprintf("Using tolerance of %.2e!",tolerance))
-  
   set.seed(random_seed)
-  
   bnmf_reps <- lapply(1:n_reps, function(r) {
-    print(paste("ITERATION",r))
-    res <- BayesNMF.L2EU(V0 = z_mat, K=K, K0=K0, tol=tolerance)
+    res <- BayesNMF.L2EU(z_mat, ...)
     names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
     res
   })
@@ -139,7 +134,7 @@ run_bNMF <- function(z_mat, n_reps=10, random_seed=1, K=20, K0=10, tolerance=1e-
 }
 
 
-summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
+summarize_bNMF <- function(bnmf_reps) {
   
   # Given output from bNMF (list of length N_iterations),
   # generate summary tables and plots
@@ -168,16 +163,12 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
     
     list(run_tbl=run_summary, unique.K=unique.K, MAP.K.run=MAP.K.run)
   }
-  if (!is.null(dir_save)) {
-    dir.create(file.path(dir_save))
-    dir_save=paste0(dir_save,"/")
-  } else {dir_save="./"}
   
   print("Summarizing bNMF results...")
   
   print("Writing table of chosen K across iterations...")
   run_summary <- make_run_summary(bnmf_reps)
-  write_tsv(run_summary$run_tbl, paste0(dir_save,"run_summary.txt"))
+  write_tsv(run_summary$run_tbl, "run_summary.txt")
 
   n.K <- length(run_summary$unique.K)  # Number of distinct K
   
@@ -204,8 +195,8 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
     H0 <- data.frame(H)
     H0[, "cluster"] <- rownames(H)
     
-    write_tsv(W0, file=paste0(dir_save,"L2EU.W.mat.", k, ".txt"))
-    write_tsv(H0, file=paste0(dir_save,"L2EU.H.mat.", k, ".txt"))
+    write_tsv(paste0("L2EU.W.mat.K", k, ".txt"))
+    write_tsv(paste0("L2EU.H.mat.K", k, ".txt"))
     
     mat.reconstructed <- W %*% H   # reconstructed matrix == approximation for the input matrix 
     
@@ -243,7 +234,7 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
       theme(axis.title.y = element_text(face="bold",colour="black", size=12 * scale0)) +
       theme(legend.position="right") +
       theme(legend.key.size = unit(0.5, "cm"))
-    ggsave(paste0(dir_save,"W_plot_K", k, ".pdf"), plot=W_plt)
+    ggsave(paste0("W_plot_K", k, ".pdf"), plot=W_plt)
     
     H_hc <- hclust(dist(t(H), method="euclidean"), method="ward.D")
     H_trait.ordering <- H_hc$labels[H_hc$order]
@@ -264,6 +255,6 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
       theme(axis.title.y=element_text(face="bold", colour="black", size=12 * scale0)) +
       theme(legend.position="right") +
       theme(legend.key.size = unit(0.5, "cm"))
-    ggsave(paste0(dir_save,"H_plot_K", k, ".pdf"), plot=H_plt)
+    ggsave(paste0("H_plot_K", k, ".pdf"), plot=H_plt)
   })
 }

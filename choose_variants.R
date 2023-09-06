@@ -8,6 +8,216 @@ library(LDlinkR)
 # - Variant IDs are all of the format: CHR_POS_REF_ALT 
 
 
+prune <- function(var_df,
+                  my_token,
+                  population="CEU",
+                  r2=0.1){
+  pruned_vars <- c()
+  if (nrow(var_df) == 1) {
+    pruned_vars <- c(pruned_vars, var_df$rsID)
+  }
+  else if (nrow(var_df) > 1){
+
+    print("Generating LD matrix using LDlinkR...")
+    ld_mat <- LDlinkR::LDmatrix(snps=var_df$rsID,
+                                pop=population,
+                                r2d="r2",
+                                token=my_token)  ## This should be replaced by each user's own token (retrieve at: https://ldlink.nci.nih.gov/?tab=apiaccess)
+    if (!is.null(ld_mat$X.)) {
+      cat("Error within LDlinkR! Chromosome not pruned!")
+    }
+    
+    ld_mat <- ld_mat %>% column_to_rownames('RS_number')
+    ld_mat <- as.matrix(ld_mat)
+    ld_mat <- ld_mat[rowSums(is.na(ld_mat)) != ncol(ld_mat),
+                     colSums(is.na(ld_mat)) != nrow(ld_mat)]
+    remaining_snps <- var_df$rsID
+    while(length(remaining_snps) > 0) {
+      if (remaining_snps[1] %in% rownames(ld_mat)) {
+        # only add to pruned_vars if found in LD matrix
+        pruned_vars <- c(pruned_vars, remaining_snps[1])
+        
+        # remove current SNP and any other SNPs in LD with it
+        remaining_snps <- setdiff(
+          remaining_snps,
+          rownames(ld_mat)[ld_mat[, remaining_snps[1]] >= r2]
+        )
+      } 
+      else {
+        # if current SNP not found in LD matrix, move on to next SNP
+        remaining_snps <- setdiff(remaining_snps, remaining_snps[1])
+      }
+    }
+  }
+  pruning_output <- list(pruned_vars, ld_mat)
+  return(pruning_output)
+}
+
+ld_pruning <- function(gwas_variants, rsID_map_file, my_token,
+                       population="CEU", r2=0.1) {
+  
+  # Given a data frame of original GWAS variants (VAR_ID) and p-values (PVALUE), 
+  # prune to a set of independent variants based on some LD threshold
+  # Leverage the LDlinkR package to fetch LD relationships for a set of input SNPs
+  
+  write(gwas_variants$VAR_ID, "all_gwas_varid.tmp")
+  
+  print("Grepping for VAR_IDs in rsID map...")
+  all_var_df <- fread(cmd=paste0("grep -wFf all_gwas_varid.tmp ", rsID_map_file),
+                      header=F, col.names=c("VAR_ID", "rsID"),
+                      data.table=F, stringsAsFactors=F) %>%
+    separate(VAR_ID, into=c("CHR", "POS", "REF", "ALT"), sep="_", remove=F) %>%
+    inner_join(gwas_variants, by="VAR_ID") %>%
+    arrange(PVALUE)  # This ordering is important for the pruning steps below!
+  
+  print(paste("Num. SNPs mapped to rsID:",nrow(all_var_df)))
+  
+  pruned_vars <- c()
+  ld_mats <- c()
+  
+  for (i in 1:22) {
+    start=Sys.time()
+    
+    var_df_chr <- filter(all_var_df, CHR == i)
+    n_snps <- nrow(var_df_chr)
+    
+    n_split <- 1000  # LDlinkR has query size limit of 1000
+    mat_name <- as.character(i)
+    
+    # if n_snps above query size limit, break up the pruning 
+    if (between(n_snps, 1 ,n_split)) { 
+      
+      print(paste0("Pruning chromosome ", i, "..."))
+      var_df <- var_df_chr
+  
+      prune_output_chr <- prune(var_df=var_df,
+                         my_token=my_token,
+                         population=population,
+                         r2=r2)
+      
+      # store pruned vars and LD matrix
+      pruned_vars <- c(pruned_vars, prune_output_chr[[1]])
+      ld_mats[[mat_name]] <- prune_output_chr[[2]]
+      
+      print(sprintf("Chr%i pruned from %i to %i variants",
+                    i, n_snps, length(prune_output_chr[[1]])))
+    }
+    else if (n_snps > n_split) {
+      var_df_list <- split(var_df_chr, (seq(nrow(var_df_chr))-1) %/% n_split)
+      pruned_vars_list <- c()
+      for (j in 1:length(var_df_list)){
+        print(sprintf("Pruning subset %i for chromosome %i...", j, i))
+        var_df <- var_df_list[[j]]
+        
+        prune_output_chr_j <- prune(var_df=var_df,
+                                  my_token=my_token,
+                                  population=population,
+                                  r2=r2,
+                                  method=method)
+        
+        # store temp pruned vars and LD matrix
+        pruned_vars_list <- c(pruned_vars_list, prune_output_chr_j[[1]])
+        ld_mats[[paste(mat_name, j, sep="_")]] <- prune_output_chr_j[[2]]
+        
+      }
+      print(sprintf("Final pruning for chromosome %i...", i))
+      var_df <- filter(var_df_chr, rsID %in% pruned_vars_list)
+      
+      prune_output_chr <- prune(var_df=var_df,
+                               my_token=my_token,
+                               population=population,
+                               r2=r2,
+                               method=method)
+      
+      # store final pruned vars and LD matrix
+      pruned_vars <- c(pruned_vars, prune_output_chr[[1]])
+      ld_mats[[mat_name]] <- prune_output_chr[[2]]
+      
+      print(sprintf("Chr%i pruned from %i to %i variants",
+                    i, n_snps, length(prune_output_chr[[1]])))
+    }
+    else {
+      print(sprintf("No SNPs on Chr%i!", i))
+    }
+    end=Sys.time()
+    print(end-start)
+  }
+  print(paste0(length(pruned_vars), " VARIANTS REMAIN AFTER ALL PRUNING!"))
+  
+  # final outputs
+  df_pruned <- filter(all_var_df, rsID %in% pruned_vars)
+  return(list(df_pruned, ld_mats))
+}
+
+ld_pruning_topLD_api <-  function(gwas_variants, api_path, rsID_map_file, r2=0.1, population="EUR") {
+  write(gwas_variants$VAR_ID, "all_gwas_varid.tmp")
+
+  print("Grepping for VAR_IDs in rsID map...")
+  all_var_df <- fread(cmd=paste0("grep -wFf all_gwas_varid.tmp ", rsID_map_file),
+                      header=F, col.names=c("VAR_ID", "rsID"),
+                      data.table=F, stringsAsFactors=F) %>%
+    separate(VAR_ID, into=c("CHR", "POS", "REF", "ALT"), sep="_", remove=F) %>%
+    inner_join(gwas_variants, by="VAR_ID") %>%
+    arrange(PVALUE)
+
+  system("touch outputLD.txt")
+  system("touch outputInfo.txt")
+  pruned_vars <- c()
+  for (i in 1:22) {
+    tmp <- all_var_df %>%
+      filter(CHR==i)
+    if (nrow(tmp)>1) {
+      print(sprintf("Getting LD for CHR %i (%i variants)...", i, nrow(tmp)))
+      rsID_pairs <- combn(tmp$rsID, 2, FUN=paste, collapse=',')
+      cat(sprintf("%i rsID combinations...\n\n", length(rsID_pairs)))
+      write(rsID_pairs, "to_prune_rsIDs.tmp")
+      
+      system(sprintf("%s -thres 0.0 -pop %s -maf 0.01 -inFile to_prune_rsIDs.tmp -outputLD outputLD_temp.txt -outputInfo outputInfo_temp.txt", api_path, population))
+      system("awk 'FNR>1' outputLD_temp.txt >> outputLD.txt")
+      system("awk 'FNR>1' outputInfo_temp.txt >> outputInfo.txt")
+
+      ld_mat <- fread("outputLD.txt",
+                      stringsAsFactors = F, data.table = F) %>%
+        subset(rsID1 %like% "rs" & rsID1 != "rsID1")
+      
+      info_mat <- fread("outputInfo.txt",
+                        stringsAsFactors = F, data.table = F) %>%
+        subset(rsID %in% all_var_df$rsID) %>%
+        subset(!duplicated(rsID))
+      
+      remaining_snps <- tmp %>%
+        filter(rsID %in% info_mat$rsID) %>%
+        arrange(PVALUE) %>%
+        pull(rsID)
+    
+    pruned_vars_chr <- c()
+    all_snps <- unique(c(ld_mat$rsID2, ld_mat$rsID2))
+    while(length(remaining_snps) > 0) {
+      if (remaining_snps[1] %in% all_snps) {
+        # add to pruned_vars list
+        pruned_vars_chr <- c(pruned_vars_chr, remaining_snps[1])
+        # find rows where current SNP is present and R2>threshold
+        tmp_mat <- ld_mat %>%
+          subset(rsID1 %in% remaining_snps[1] | rsID2 %in% remaining_snps[1]) %>%
+          subset(R2>r2)
+        # remove any SNPs found in those rows from remaining_snps (this should also remove current SNP)
+        remaining_snps <- setdiff(remaining_snps, unique(c(tmp_mat$rsID1, tmp_mat$rsID2, remaining_snps[1])))
+      } else{
+        # do  keep SNPs that are not found
+        remaining_snps <- setdiff(remaining_snps, remaining_snps[1])
+        }
+      }
+  } else {
+    pruned_vars_chr <- tmp$rsID
+  }
+  print(sprintf("CHR %i pruned from %i to %i SNPs...",i, nrow(tmp), length(pruned_vars_chr)))
+  pruned_vars <- c(pruned_vars, pruned_vars_chr)
+  print(length(pruned_vars))
+  }
+    
+  pruned_variants <- all_var_df %>%
+    filter(rsID %in% pruned_vars)
+}
 
 snp_clump <- function(df_snps,
                       id="VAR_ID",
