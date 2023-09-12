@@ -3,5 +3,4 @@ data/*
 opt/*
 cache/*
 
-# Potentially-sensitive data
-doc/choosewell_variables.xlsx
+*.DS_store
