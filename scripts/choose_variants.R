@@ -1,6 +1,5 @@
-library(tidyverse)
-library(data.table)
-library(LDlinkR)
+packages = c('tidyverse', 'data.table', 'LDlinkR')
+invisible(lapply(packages, library, character.only = TRUE))
 
 # CURRENT ASSUMPTIONS ABOUT FORMATTING:
 # - Genome build is hg19/GrCh37
@@ -62,7 +61,7 @@ snp_clump <- function(df_snps,
   return(clumped_snps)
 }
 
-ld_pruning_SNP.clip <- function(df_snps,
+ld_prune <- function(df_snps,
                                 pop,
                                 my_token,
                                 r2=0.1,
@@ -411,66 +410,5 @@ choose_proxies <- function(need_proxies,
   
   return(final_proxy_df)
 
-}
-
-library(gwasrapidd)
-use_gwas_catalog <- function(trait, my_pvalue=5e-8, min_N=10000, ancestry=NULL, rsID_map_file=NULL){
-  # get all studies for breast cancer
-  my_studies <- get_studies(efo_trait = trait)
-  my_studies_big <- my_studies@studies %>% dplyr::filter(initial_sample_size>min_N)
-  print(paste("# studies with > 10k samples:", nrow(my_studies_big)))
-  
-  if (!is.null(ancestry)){
-    ancestry_studies <- my_studies@countries_of_recruitment %>%
-      dplyr::filter(grepl(ancestry, region)) %>%
-      pull(study_id)
-    my_studies_big <- my_studies_big %>%
-      dplyr::filter(study_id %in% ancestry_studies)
-  }
-  
-  # how many studies
-  # gwasrapidd::n(my_studies)
-  print(paste("# studies with > 10k samples and in region of interest:", nrow(my_studies_big)))
-  
-  # get all associations from above studies
-  # You could have also used get_associations(efo_trait = 'autoimmune disease')
-  # my_associations <- get_associations(study_id = my_studies@studies$study_id,)
-  my_associations_big <- get_associations(study_id = my_studies_big$study_id)
-  
-  # number of associations
-  # gwasrapidd::n(my_associations) 
-  print(paste("# associations:", gwasrapidd::n(my_associations_big)))
-  
-  # filter by p-value
-  # Get association ids for which pvalue is less than 5e-8
-  final_ids <- dplyr::filter(my_associations_big@associations, pvalue < my_pvalue) %>% # Filter by p-value
-    tidyr::drop_na(pvalue) %>%
-    dplyr::pull(association_id) 
-  
-  # Extract associations by association id
-  final_associations <- my_associations_big[final_ids]
-  # print(paste("# associations after pvalue filter:", gwasrapidd::n(final_associations)))
-  
-  # print var_IDs, risk alleles and risk_freq
-  print("Getting final associations...")
-  df_gwasRapidd <- final_associations@risk_alleles[c('association_id','variant_id', 'risk_allele')] %>%
-    merge(final_associations@associations[c('association_id','pvalue')],by='association_id') %>%
-    drop_na() %>%
-    dplyr::select(rsID=variant_id, RiskAllele=risk_allele, PVALUE=pvalue) %>%
-    filter(!duplicated(rsID))
-  print(head(df_gwasRapidd))
-  
-  
-  if (!is.null(rsID_map_file)){
-    print("Grepping for rsIDs in rsID-to-VAR_ID map...")
-    write(df_gwasRapidd$rsID,"gwas_rapidd.tmp")
-    df_gwasRapidd <- fread(cmd=paste0("grep -wFf gwas_rapidd.tmp ", rsID_map_file),
-                      header=F, col.names=c("VAR_ID", "rsID"),
-                      data.table=F, stringsAsFactors=F) %>%
-      merge(df_gwasRapidd, by="rsID") %>%
-      dplyr::select(VAR_ID, PVALUE)
-    print(head(df_gwasRapidd))
-    }
-  return(df_gwasRapidd)
 }
 

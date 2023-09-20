@@ -1,0 +1,25 @@
+RS_Number	Position	Alleles	Details
+rs438811	chr19:45416741	C=0.781, T=0.219	Variant kept.
+rs111234557	chr19:19436229	C=0.895, G=0.105	Variant kept.
+rs7250658	chr19:19571100	A=0.849, G=0.151	Variant in LD with rs111234557 (R2=0.6471), variant removed.
+rs35650950	chr19:46147712	A=0.845, C=0.155	Variant kept.
+rs5117	chr19:45418790	T=0.781, C=0.219	Variant in LD with rs438811 (R2=0.9884), variant removed.
+rs73001065	chr19:19460541	G=0.936, C=0.064	Variant in LD with rs111234557 (R2=0.5769), variant removed.
+rs71352238	chr19:45394336	T=0.867, C=0.133	Variant in LD with rs438811 (R2=0.287), variant removed.
+rs2916076	chr19:19545990	T=0.663, C=0.337	Variant in LD with rs111234557 (R2=0.2252), variant removed.
+rs4375772	chr19:46169826	C=0.876, G=0.124	Variant kept.
+rs34538000	chr19:19481379	G=0.326, T=0.674	Variant in LD with rs111234557 (R2=0.2367), variant removed.
+rs62136856	chr19:47573527	A=0.312, G=0.688	Variant kept.
+rs10422819	chr19:19643028	C=0.678, A=0.322	Variant in LD with rs111234557 (R2=0.2343), variant removed.
+rs2905426	chr19:19478022	G=0.331, T=0.669	Variant in LD with rs111234557 (R2=0.2314), variant removed.
+rs1005729	chr19:33910740	C=0.59, T=0.41	Variant kept.
+rs12609406	chr19:47611128	A=0.312, G=0.688	Variant in LD with rs62136856 (R2=0.9908), variant removed.
+rs2905425	chr19:19475717	G=0.324, C=0.676	Variant in LD with rs111234557 (R2=0.2457), variant removed.
+rs11883351	chr19:46304400	G=0.635, A=0.365	Variant in LD with rs35650950 (R2=0.0518), variant removed.
+rs4804101	chr19:7220745	G=0.564, T=0.436	Variant kept.
+rs12977689	chr19:1226004	C=0.774, A=0.226	Variant kept.
+rs35568293	chr19:46179110	T=0.788, C=0.212	Variant in LD with rs35650950 (R2=0.5268), variant removed.
+rs16996148	chr19:19658472	G=0.925, T=0.075	Variant in LD with rs111234557 (R2=0.5487), variant removed.
+rs72999033	chr19:19366632	C=0.94, T=0.06	Variant in LD with rs111234557 (R2=0.5385), variant removed.
+rs3794991	chr19:19610596	C=0.922, T=0.078	Variant in LD with rs111234557 (R2=0.5594), variant removed.
+rs17216525	chr19:19662220	C=0.927, T=0.073	Variant in LD with rs111234557 (R2=0.5479), variant removed.

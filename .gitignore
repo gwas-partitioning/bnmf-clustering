@@ -4,4 +4,4 @@ opt/*
 cache/*
 
 # Potentially-sensitive data
-doc/choosewell_variables.xlsx
+./scripts/bNMF_tutorial.Rmd

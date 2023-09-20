@@ -1,0 +1,65 @@
+RS_Number	Position	Alleles	Details
+rs35852805	chr17:3892563	C=0.816, T=0.184	Variant kept.
+rs2080090	chr17:65828371	T=0.795, A=0.205	Variant kept.
+rs12940450	chr17:4063734	A=0.824, G=0.176	Variant in LD with rs35852805 (R2=0.7376), variant removed.
+rs62084210	chr17:65828710	A=0.787, G=0.213	Variant in LD with rs2080090 (R2=0.9296), variant removed.
+rs62084251	chr17:65878736	G=0.785, A=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs62084248	chr17:65874541	C=0.785, T=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs12452511	chr17:65832576	A=0.784, G=0.216	Variant in LD with rs2080090 (R2=0.9132), variant removed.
+rs62084235	chr17:65853437	C=0.785, T=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs8071463	chr17:65938655	G=0.218, A=0.782	Variant in LD with rs2080090 (R2=0.9025), variant removed.
+rs7207283	chr17:46855048	G=0.728, A=0.272	Variant kept.
+rs8068429	chr17:4156160	G=0.618, A=0.382	Variant in LD with rs35852805 (R2=0.1714), variant removed.
+rs8081301	chr17:47039302	A=0.745, T=0.255	Variant in LD with rs7207283 (R2=0.7487), variant removed.
+rs9913489	chr17:4184641	C=0.315, A=0.685	Variant in LD with rs35852805 (R2=0.251), variant removed.
+rs7209449	chr17:46964758	A=0.273, G=0.727	Variant in LD with rs7207283 (R2=0.6925), variant removed.
+rs2411374	chr17:47022998	C=0.441, T=0.559	Variant in LD with rs7207283 (R2=0.3265), variant removed.
+rs4255820	chr17:46996583	T=0.443, A=0.557	Variant in LD with rs7207283 (R2=0.3234), variant removed.
+rs62075845	chr17:47002439	G=0.441, T=0.559	Variant in LD with rs7207283 (R2=0.3265), variant removed.
+rs16953866	chr17:4182859	C=0.685, T=0.315	Variant in LD with rs35852805 (R2=0.251), variant removed.
+rs781825	chr17:3966064	A=0.592, G=0.408	Variant in LD with rs35852805 (R2=0.2871), variant removed.
+rs781853	chr17:3953083	T=0.597, C=0.403	Variant in LD with rs35852805 (R2=0.2934), variant removed.
+rs12940060	chr17:66085703	C=0.284, G=0.716	Variant in LD with rs2080090 (R2=0.5715), variant removed.
+rs591939	chr17:40698075	A=0.764, G=0.236	Variant kept.
+rs59593290	chr17:65813326	G=0.901, A=0.099	Variant in LD with rs2080090 (R2=0.3276), variant removed.
+rs11651052	chr17:36102381	A=0.474, G=0.526	Variant kept.
+rs67763067	chr17:47036294	G=0.737, A=0.263	Variant in LD with rs7207283 (R2=0.608), variant removed.
+rs35239906	chr17:4025837	C=0.829, T=0.171	Variant in LD with rs35852805 (R2=0.7774), variant removed.
+rs62085991	chr17:65920508	G=0.786, A=0.214	Variant in LD with rs2080090 (R2=0.9126), variant removed.
+rs10521129	chr17:4008820	G=0.826, A=0.174	Variant in LD with rs35852805 (R2=0.7603), variant removed.
+rs12952723	chr17:17731651	T=0.412, C=0.588	Variant kept.
+rs8064454	chr17:36101586	A=0.474, C=0.526	Variant in LD with rs11651052 (R2=0.992), variant removed.
+rs55929017	chr17:46995304	T=0.835, A=0.165	Variant in LD with rs7207283 (R2=0.4362), variant removed.
+rs7213292	chr17:65880443	A=0.785, G=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs2128792	chr17:65857177	C=0.785, T=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs3895874	chr17:47047868	G=0.43, A=0.57	Variant in LD with rs7207283 (R2=0.3284), variant removed.
+rs34872586	chr17:65863466	T=0.785, C=0.215	Variant in LD with rs2080090 (R2=0.9186), variant removed.
+rs2727064	chr17:3934101	A=0.595, G=0.405	Variant in LD with rs35852805 (R2=0.3138), variant removed.
+rs8067892	chr17:65837983	A=0.783, G=0.217	Variant in LD with rs2080090 (R2=0.9078), variant removed.
+rs80135947	chr17:65836001	A=0.784, C=0.216	Variant in LD with rs2080090 (R2=0.9132), variant removed.
+rs11263763	chr17:36103565	G=0.475, A=0.525	Variant in LD with rs11651052 (R2=0.9802), variant removed.
+rs7501939	chr17:36101156	T=0.394, C=0.606	Variant in LD with rs11651052 (R2=0.7131), variant removed.
+rs9899580	chr17:47106878	T=0.714, G=0.286	Variant in LD with rs7207283 (R2=0.2467), variant removed.
+rs62064082	chr17:17625022	A=0.844, G=0.156	Variant in LD with rs12952723 (R2=0.1245), variant removed.
+rs68012338	chr17:46856405	G=0.728, A=0.272	Variant in LD with rs7207283 (R2=1.0), variant removed.
+rs7350943	chr17:29684553	C=0.381, T=0.619	Variant kept.
+rs11869536	chr17:17826528	T=0.564, A=0.436	Variant in LD with rs12952723 (R2=0.7908), variant removed.
+rs8071201	chr17:61606344	C=0.765, A=0.235	Variant kept.
+rs62086044	chr17:65970837	G=0.774, T=0.226	Variant in LD with rs2080090 (R2=0.8399), variant removed.
+rs146392775	chr17:40644569	A=0.923, C=0.077	Variant in LD with rs591939 (R2=0.2169), variant removed.
+rs7220372	chr17:40656043	T=0.922, G=0.078	Variant in LD with rs591939 (R2=0.2124), variant removed.
+rs4239217	chr17:36098987	G=0.386, A=0.614	Variant in LD with rs11651052 (R2=0.6827), variant removed.
+rs752579	chr17:17660347	C=0.426, T=0.574	Variant in LD with rs12952723 (R2=0.3529), variant removed.
+rs4794015	chr17:47067826	G=0.606, A=0.394	Variant in LD with rs7207283 (R2=0.1735), variant removed.
+rs4790600	chr17:4166022	A=0.383, C=0.617	Variant in LD with rs35852805 (R2=0.1704), variant removed.
+rs2525574	chr17:29705947	T=0.38, C=0.62	Variant in LD with rs7350943 (R2=0.9874), variant removed.
+rs8081541	chr17:61812483	C=0.735, T=0.265	Variant in LD with rs8071201 (R2=0.5482), variant removed.
+rs8078462	chr17:61857937	T=0.735, G=0.265	Variant in LD with rs8071201 (R2=0.5404), variant removed.
+rs67380712	chr17:65788157	A=0.903, G=0.097	Variant in LD with rs2080090 (R2=0.3185), variant removed.
+rs9907246	chr17:17770965	T=0.417, C=0.583	Variant in LD with rs12952723 (R2=0.8695), variant removed.
+rs6504170	chr17:61709168	C=0.731, T=0.269	Variant in LD with rs8071201 (R2=0.5514), variant removed.
+rs55973554	chr17:9793756	G=0.725, A=0.275	Variant kept.
+rs8182269	chr17:76789991	A=0.446, T=0.554	Variant kept.
+rs9302885	chr17:76799898	A=0.452, G=0.548	Variant in LD with rs8182269 (R2=0.9683), variant removed.
+rs4796652	chr17:40569947	G=0.396, C=0.604	Variant in LD with rs591939 (R2=0.4449), variant removed.
+rs950966	chr17:17783748	A=0.441, G=0.559	Variant in LD with rs12952723 (R2=0.7813), variant removed.

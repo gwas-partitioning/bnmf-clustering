@@ -1,5 +1,5 @@
 library(tidyverse)
-library(data.table)
+library(data.table) 
 
 fetch_summary_stats <- function(df_variants, gwas_ss_file, trait_ss_files, trait_ss_size=NULL, pval_cutoff=1) {
   
@@ -249,7 +249,6 @@ prep_z_matrix <- function(z_mat, N_mat,
       break
     }
     trait_cor_mat <- trait_cor_mat[remaining_traits, remaining_traits]
-    print(dim(trait_cor_mat))
     to_remove <- rownames(trait_cor_mat)[abs(trait_cor_mat[, remaining_traits[1]]) >= corr_cutoff]
 
     # track results in dataframe

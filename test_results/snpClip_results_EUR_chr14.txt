@@ -1,0 +1,12 @@
+RS_Number	Position	Alleles	Details
+rs17522122	chr14:33302882	G=0.511, T=0.489	Variant kept.
+rs12147298	chr14:79681303	A=0.811, G=0.189	Variant kept.
+rs7142718	chr14:33306123	G=0.502, C=0.498	Variant in LD with rs17522122 (R2=0.9493), variant removed.
+rs10143769	chr14:69595427	G=0.68, A=0.32	Variant kept.
+rs2370980	chr14:79865248	T=0.232, G=0.768	Variant in LD with rs12147298 (R2=0.3001), variant removed.
+rs10131077	chr14:69612951	T=0.68, C=0.32	Variant in LD with rs10143769 (R2=1.0), variant removed.
+rs7143394	chr14:91971265	T=0.525, C=0.475	Variant kept.
+rs8021408	chr14:79955415	C=0.693, T=0.307	Variant in LD with rs12147298 (R2=0.0938), variant removed.
+rs2064962	chr14:91931029	T=0.525, C=0.475	Variant in LD with rs7143394 (R2=1.0), variant removed.
+rs10146333	chr14:91946132	C=0.525, T=0.475	Variant in LD with rs7143394 (R2=1.0), variant removed.
+rs11158780	chr14:69502145	G=0.672, A=0.328	Variant in LD with rs10143769 (R2=0.9378), variant removed.

@@ -1,0 +1,2 @@
+RS_Number	Position_grch37	Alleles	Details
+rs11701361	chr21:47764477	T=0.765, C=0.235	Variant kept.

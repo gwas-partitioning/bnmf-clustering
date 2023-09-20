@@ -1,0 +1,60 @@
+RS_Number	Position	Alleles	Details
+rs2446770	chr12:66210621	T=0.878, C=0.122	Variant kept.
+rs2583940	chr12:66213258	C=0.882, T=0.118	Variant in LD with rs2446770 (R2=0.9448), variant removed.
+rs2612043	chr12:66183500	T=0.878, C=0.122	Variant in LD with rs2446770 (R2=0.8919), variant removed.
+rs2583941	chr12:66204598	G=0.883, A=0.117	Variant in LD with rs2446770 (R2=0.9356), variant removed.
+rs2583949	chr12:66194243	C=0.867, T=0.133	Variant in LD with rs2446770 (R2=0.8896), variant removed.
+rs11049127	chr12:27922074	T=0.756, C=0.244	Variant kept.
+rs11049129	chr12:27923119	A=0.767, T=0.233	Variant in LD with rs11049127 (R2=0.9415), variant removed.
+rs73131925	chr12:66167600	C=0.965, A=0.035	Variant in LD with rs2446770 (R2=0.1814), variant removed.
+rs3844206	chr12:71523941	C=0.601, T=0.399	Variant kept.
+rs11049107	chr12:27869702	C=0.826, T=0.174	Variant in LD with rs11049127 (R2=0.4466), variant removed.
+rs141397980	chr12:4134173	C=0.99, T=0.01	Variant kept.
+rs12820906	chr12:123493123	A=0.75, G=0.25	Variant kept.
+rs77276903	chr12:4244569	C=0.98, T=0.02	Variant kept.
+rs12299509	chr12:4406281	A=0.545, G=0.455	Variant kept.
+rs80019595	chr12:121417306	C=0.971, T=0.029	Variant kept.
+rs73119900	chr12:66262950	G=0.968, C=0.032	Variant in LD with rs2446770 (R2=0.2194), variant removed.
+rs12824685	chr12:123817569	G=0.777, T=0.223	Variant in LD with rs12820906 (R2=0.7201), variant removed.
+rs2270584	chr12:71532099	G=0.601, A=0.399	Variant in LD with rs3844206 (R2=1.0), variant removed.
+rs1615252	chr12:71527707	A=0.597, C=0.403	Variant in LD with rs3844206 (R2=0.4467), variant removed.
+rs12818936	chr12:71518009	T=0.585, C=0.415	Variant in LD with rs3844206 (R2=0.9282), variant removed.
+rs1790125	chr12:123665256	C=0.225, T=0.775	Variant in LD with rs12820906 (R2=0.7202), variant removed.
+rs10842999	chr12:27967385	A=0.751, T=0.249	Variant in LD with rs11049127 (R2=0.4862), variant removed.
+rs1510938	chr12:71568348	T=0.512, G=0.488	Variant in LD with rs3844206 (R2=0.4476), variant removed.
+rs12310357	chr12:133720563	C=0.415, A=0.585	Variant kept.
+rs12827504	chr12:27883181	A=0.827, G=0.173	Variant in LD with rs11049127 (R2=0.4506), variant removed.
+rs10878339	chr12:66239874	A=0.917, G=0.083	Variant in LD with rs2446770 (R2=0.086), variant removed.
+rs11048454	chr12:26460045	C=0.763, A=0.237	Variant kept.
+rs28690326	chr12:123887687	C=0.33, T=0.67	Variant in LD with rs12820906 (R2=0.3951), variant removed.
+rs17464196	chr12:26298577	C=0.718, T=0.282	Variant kept.
+rs10842994	chr12:27965150	C=0.792, T=0.208	Variant in LD with rs11049127 (R2=0.6861), variant removed.
+rs2261181	chr12:66212318	C=0.883, T=0.117	Variant in LD with rs2446770 (R2=0.9539), variant removed.
+rs7399309	chr12:33370705	C=0.855, T=0.145	Variant kept.
+rs1727316	chr12:123618603	C=0.232, T=0.768	Variant in LD with rs12820906 (R2=0.7442), variant removed.
+rs2612035	chr12:66192667	A=0.875, G=0.125	Variant in LD with rs2446770 (R2=0.9549), variant removed.
+rs1716168	chr12:123651966	G=0.231, C=0.769	Variant in LD with rs12820906 (R2=0.7394), variant removed.
+rs2077105	chr12:21839933	A=0.723, G=0.277	Variant kept.
+rs10735962	chr12:71562306	T=0.511, C=0.489	Variant in LD with rs3844206 (R2=0.4552), variant removed.
+rs1495376	chr12:71577582	T=0.515, C=0.485	Variant in LD with rs3844206 (R2=0.4467), variant removed.
+rs12426294	chr12:133688126	A=0.704, C=0.296	Variant in LD with rs12310357 (R2=0.279), variant removed.
+rs7138300	chr12:71439589	C=0.442, T=0.558	Variant in LD with rs3844206 (R2=0.6793), variant removed.
+rs7955901	chr12:71433293	C=0.442, T=0.558	Variant in LD with rs3844206 (R2=0.6725), variant removed.
+rs7962912	chr12:132536057	G=0.873, T=0.127	Variant kept.
+rs1790087	chr12:123672634	T=0.225, C=0.775	Variant in LD with rs12820906 (R2=0.7202), variant removed.
+rs12817892	chr12:123728702	G=0.778, A=0.222	Variant in LD with rs12820906 (R2=0.7154), variant removed.
+rs2634680	chr12:48734564	T=0.675, C=0.325	Variant kept.
+rs2732481	chr12:48736985	T=0.675, G=0.325	Variant in LD with rs2634680 (R2=1.0), variant removed.
+rs4964656	chr12:108594069	G=0.691, C=0.309	Variant kept.
+rs7953249	chr12:121403724	G=0.443, A=0.557	Variant kept.
+rs7315548	chr12:132514490	C=0.873, T=0.127	Variant in LD with rs7962912 (R2=1.0), variant removed.
+rs116861488	chr12:118401849	G=0.874, A=0.126	Variant kept.
+rs12298042	chr12:132473372	C=0.871, G=0.129	Variant in LD with rs7962912 (R2=0.9824), variant removed.
+rs12828309	chr12:48641160	C=0.666, T=0.334	Variant in LD with rs2634680 (R2=0.934), variant removed.
+rs2583921	chr12:66170481	A=0.889, C=0.111	Variant in LD with rs2446770 (R2=0.7758), variant removed.
+rs4031	chr12:133781605	A=0.345, G=0.655	Variant in LD with rs12310357 (R2=0.3728), variant removed.
+rs1727319	chr12:123701353	T=0.277, C=0.723	Variant in LD with rs12820906 (R2=0.5606), variant removed.
+rs10771263	chr12:26299270	C=0.315, G=0.685	Variant in LD with rs11048454 (R2=0.0536), variant removed.
+rs10878350	chr12:66347870	A=0.8, C=0.2	Variant kept.
+rs7960190	chr12:27946919	T=0.764, C=0.236	Variant in LD with rs11049127 (R2=0.8738), variant removed.
+rs10875763	chr12:48580859	G=0.618, A=0.382	Variant in LD with rs2634680 (R2=0.7571), variant removed.

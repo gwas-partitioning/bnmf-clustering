@@ -1,0 +1,17 @@
+RS_Number	Position	Alleles	Details
+rs1457489	chr18:57861961	G=0.732, A=0.268	Variant kept.
+rs17175713	chr18:57909799	T=0.733, C=0.267	Variant in LD with rs1457489 (R2=0.9849), variant removed.
+rs1652375	chr18:21109269	T=0.347, C=0.653	Variant kept.
+rs7227739	chr18:57901950	T=0.657, G=0.343	Variant in LD with rs1457489 (R2=0.695), variant removed.
+rs151289957	chr18:53035312	T=0.966, A=0.034	Variant kept.
+rs145274204	chr18:53035825	T=0.966, C=0.034	Variant in LD with rs151289957 (R2=1.0), variant removed.
+rs78394996	chr18:58064823	T=0.994, C=0.006	Variant kept.
+rs77220503	chr18:58082579	G=0.994, A=0.006	Variant in LD with rs78394996 (R2=1.0), variant removed.
+rs1942880	chr18:57793209	C=0.662, T=0.338	Variant in LD with rs1457489 (R2=0.4455), variant removed.
+rs9957264	chr18:56881633	C=0.825, A=0.175	Variant kept.
+rs11664167	chr18:57776391	T=0.664, A=0.336	Variant in LD with rs1457489 (R2=0.4761), variant removed.
+rs12970134	chr18:57884750	G=0.733, A=0.267	Variant in LD with rs1457489 (R2=0.9949), variant removed.
+rs17835713	chr18:56878091	G=0.828, A=0.172	Variant in LD with rs9957264 (R2=0.9794), variant removed.
+rs12969709	chr18:57859563	C=0.731, A=0.269	Variant in LD with rs1457489 (R2=0.995), variant removed.
+rs17684074	chr18:54675384	G=0.748, C=0.252	Variant kept.
+rs16976254	chr18:40083853	G=0.778, A=0.222	Variant kept.

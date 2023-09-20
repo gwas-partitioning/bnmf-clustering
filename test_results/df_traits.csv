@@ -1,0 +1,33 @@
+trait,result,note
+Neutrophil_count,removed (correlation),correlated w/ WBC
+BFP,removed (correlation),correlated w/ BMI
+GGT,removed (correlation),correlated w/ C_reactive_protein
+RBC,removed (correlation),correlated w/ Haemoglobin_concentration
+Adiponectin,trait kept,NA
+Albumin,trait kept,NA
+ALP,trait kept,NA
+ALT,trait kept,NA
+AST,trait kept,NA
+BMI,trait kept,NA
+C_reactive_protein,trait kept,NA
+Cholesterol,trait kept,NA
+FGadjBMI,trait kept,NA
+FIadjBMI,trait kept,NA
+Glucose,trait kept,NA
+Haemoglobin_concentration,trait kept,NA
+HbA1c.adjBMI,trait kept,NA
+HDL,trait kept,NA
+HOMAB,trait kept,NA
+HOMAIR,trait kept,NA
+LipoproteinA,trait kept,NA
+Lymphocyte_count,trait kept,NA
+Monocyte_count,trait kept,NA
+Proins,trait kept,NA
+SHBG,trait kept,NA
+TG,trait kept,NA
+Urate,trait kept,NA
+Urea,trait kept,NA
+VitaminD,trait kept,NA
+WBC,trait kept,NA
+WHR_female,trait kept,NA
+WHR_male,trait kept,NA

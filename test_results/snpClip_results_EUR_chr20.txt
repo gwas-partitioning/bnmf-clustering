@@ -1,0 +1,16 @@
+RS_Number	Position	Alleles	Details
+rs2206448	chr20:32709525	G=0.304, A=0.696	Variant kept.
+rs6059580	chr20:32527873	T=0.372, C=0.628	Variant in LD with rs2206448 (R2=0.6422), variant removed.
+rs11697876	chr20:62444662	T=0.634, C=0.366	Variant kept.
+rs13039865	chr20:51036404	C=0.738, T=0.262	Variant kept.
+rs6068146	chr20:50967120	G=0.717, C=0.283	Variant in LD with rs13039865 (R2=0.2999), variant removed.
+rs55650227	chr20:50916512	G=0.818, C=0.182	Variant in LD with rs13039865 (R2=0.5795), variant removed.
+rs6021869	chr20:50955607	G=0.721, T=0.279	Variant in LD with rs13039865 (R2=0.2863), variant removed.
+rs856414	chr20:51256226	G=0.344, A=0.656	Variant in LD with rs13039865 (R2=0.4259), variant removed.
+rs3787230	chr20:32640272	A=0.292, G=0.708	Variant in LD with rs2206448 (R2=0.9446), variant removed.
+rs6059651	chr20:32645052	T=0.292, C=0.708	Variant in LD with rs2206448 (R2=0.9446), variant removed.
+rs4911374	chr20:32516001	T=0.307, C=0.693	Variant in LD with rs2206448 (R2=0.8688), variant removed.
+rs6059596	chr20:32557119	C=0.293, T=0.707	Variant in LD with rs2206448 (R2=0.9399), variant removed.
+rs6059583	chr20:32532114	T=0.302, G=0.698	Variant in LD with rs2206448 (R2=0.8992), variant removed.
+rs6141437	chr20:32558855	C=0.361, T=0.639	Variant in LD with rs2206448 (R2=0.6897), variant removed.
+rs4810390	chr20:42252325	G=0.221, T=0.779	Variant kept.

@@ -65,7 +65,7 @@ params:
 </style>
 
 
-```{r setup, include=FALSE}
+```{r format_setup, include=FALSE}
 # library(knitr)
 knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
 ```
@@ -80,6 +80,11 @@ library(tidyr)
 library(rstudioapi)
 library(strex)
 library(scales)
+library(GenomicRanges)
+library(Homo.sapiens)
+library(DT)
+library(kableExtra)
+
 # setwd(dirname(getActiveDocumentContext()$path))
 main_dir <- params$main_dir
 k <- params$k
@@ -125,7 +130,7 @@ title: "Initial downstream analyses for the bNMF clustering, version k=`r k`"
 ### Trait summary 
 <div class = "row">
 <div class = "column">
-```{r trait_summary, echo = FALSE}
+```{r format_trait_summary, echo = FALSE}
 
 trait_results <- fread(file.path(main_dir, "df_traits.csv"))
 
@@ -146,7 +151,7 @@ trait_results %>%
 </div>
 
 <div class = "column">
-```{r trait_table, echo = FALSE}
+```{r format_trait_table, echo = FALSE}
 trait_results %>% data.table() %>%
   # column_to_rownames('trait') %>%
   DT::datatable(selection = 'none', filter = 'none',extensions = "FixedColumns",
@@ -165,7 +170,7 @@ trait_results %>% data.table() %>%
 
 ### Determining the optimal K from the bNMF run summary
 
-```{r showRunSummary, out.width=c('50%', '50%'), fig.show='hold'}
+```{r format_showRunSummary, out.width=c('50%', '50%'), fig.show='hold'}
 run_sum_max <- df_run_summary %>%
   group_by(K) %>%
   summarise(convergence = min(evid, na.rm=TRUE)) %>%
@@ -222,7 +227,7 @@ ggplot(df, aes(x = "", y = value, fill = forcats::fct_inorder(group))) +
 #### 3) Using the remaining weights from top N% to last M%, check if they have shorter distance to 1st or 2nd line
 #### 4) The first weight that has a shorter distance to 2nd line (defined by long tail) is selected as the cutoff.
 
-```{r weightCutoff}
+```{r format_weightCutoff}
 library(magrittr)
 # change input data file
 # w_mat: genes as column names, clusters as rows
@@ -308,7 +313,7 @@ cutoff_num_f = format(100*cutoff_num/numWeights, digits=2)
 ### Cluster Weights
 #### Weights above cutoff are highlighted
 
-```{r tbl_snps, fig.show='hold'}
+```{r format_tbl_snps, fig.show='hold'}
 
 df_rsIDs <- fread(file.path(main_dir,"rsID_map.txt"),
                   # select = c(1:2),
@@ -321,8 +326,7 @@ df_rsIDs <- fread(file.path(main_dir,"rsID_map.txt"),
 
 if (loci_file=="query"){
   # print("Querying for locus names...")
-  library(GenomicRanges)
-  library(Homo.sapiens)
+
 
   geneRanges <- function(db, column="ENTREZID"){
       g <- genes(db, columns=column)
@@ -447,7 +451,7 @@ w %>% #set_rownames(make.unique(.[,'gene'])) %>% # set_rownames(.[,"variant"])
 ```
 
 <br>
-```{r tbl_traits, echo = FALSE}
+```{r format_tbl_traits, echo = FALSE}
 # unloadNamespace("biomaRt")
 
 h %>%
@@ -469,7 +473,7 @@ h %>%
 
 ### Manhattan plot
 
-```{r manhattan, fig.height=5, fig.width=12, fig.align="center"}
+```{r format_manhattan, fig.height=5, fig.width=12, fig.align="center"}
 
 max_w <- dplyr::mutate(w,
                           max_weight =  apply(w[cluster_names], 1, max ),
@@ -561,7 +565,7 @@ ggplot(don, aes(x=BPcum, y=P)) +
 
 #### Genes x Clusters
 
-```{r heatmaps1, fig.height=6, fig.width=12, fig.align="center"}
+```{r format_heatmaps1, fig.height=6, fig.width=12, fig.align="center"}
 # BiocManager::install("ComplexHeatmap",lib="/humgen/florezlab/users/ksmith/Rlibs_3_5")
 suppressPackageStartupMessages(library(ComplexHeatmap))
 library(magrittr)
@@ -597,7 +601,7 @@ w %>%
 
 #### Variants x Clusters
 
-```{r heatmaps2, fig.height=6, fig.width=12, fig.align="center"}
+```{r format_heatmaps2, fig.height=6, fig.width=12, fig.align="center"}
 
 # repeat for phenotypes
 ix=sapply(h, which.max)
@@ -628,7 +632,7 @@ h %>%
 <span style="color: green;">Green = variant</span><br>
 
 <div class="col2">
-```{r circlePlots, fig.align="center"}
+```{r format_circlePlots, fig.align="center"}
 library(readr)
 loci = w[cluster_names]
 # colnames(loci) <- c(cluster_names, "name")
@@ -728,7 +732,7 @@ for (i in 1:length(cluster_names)) { #1:length(cluster_names)
 </div>
 
 
-```{r makeExcel}
+```{r format_makeExcel}
 library(openxlsx)
 library(tidyverse)
 
@@ -790,209 +794,3 @@ fp <- file.path(main_dir, sprintf("sorted_cluster_weights_K%i_rev.xlsx",k))
 openxlsx::saveWorkbook(wb, fp, overwrite = T)
 
 ```
-
-`r  if(eval_GTEx){"##GTEx analysing using LDlinkR:LDexpress"}`
-```{r LDlinkExp, eval=eval_GTEx, fig.height=6, fig.width=10, fig.align="center"}
-
-library(LDlinkR)
-
-df_LDexpress <- data.frame("RS_ID"=character(),
-                           "Gene_Symbol"=character(), "Tissue"=character(),
-                            "Effect_Size"=numeric(), "P_value"=numeric(),
-                            "Cluster"=character())
-
-for (my_clust in cluster_names){
-  df_loci <- w %>%
-    filter(!!sym(my_clust) >= cutoff) %>%
-    dplyr::select(all_of(c(my_clust, 'variant','gene','rsID'))) %>%
-    arrange(-!!sym(my_clust)) %>%
-    dplyr::slice(1:10)
-
-  if (nrow(df_loci)>1){
-    ld_res <- LDlinkR::LDexpress(snps = df_loci$rsID,
-                       pop = c("CEU"),
-                       tissue = c("ALL"),
-                       r2d = "r2",
-                       r2d_threshold = "1.0",
-                       p_threshold = "0.005",
-                       win_size = "500000",
-                       # genome_build = "grch37",
-                       token = "cb5457b210a6"
-                      )
-    res_filtered <- ld_res %>%
-      # filter(RS_ID %in% df_loci$rsID) %>%
-      arrange(P_value) %>%
-      mutate(Cluster = my_clust) %>%
-      mutate_at(c("P_value", "Effect_Size"), as.numeric) %>%
-      dplyr::select(RS_ID, Gene_Symbol, Tissue,
-             Effect_Size, P_value, Cluster) %>%
-      drop_na()
-  
-    df_LDexpress <- rbind(df_LDexpress, res_filtered)
-  }
-}
-
-# SNP vs gene expression heatmaps
-# version 1: minimum p-value per cluster per tissue
-
-df_geneExpr_hm <- df_LDexpress %>%
-  dplyr::select(Gene_Symbol, P_value, Tissue, Cluster)
-
-# find the minimum p-value per Cluster-Tissue combination
-# (warning about Inf appears because some combinations don't exist for given cluster)
-df_cast <- reshape2::dcast(setDT(df_geneExpr_hm),
-                           Cluster ~ Tissue,
-                           value.var = c("P_value"), fun.aggregate=mean) %>%
-  data.frame() %>%
-  column_to_rownames("Cluster") %>%
-  # -log10 transform p-values for heatmap readability
-  mutate_all(funs(-log10(.))) %>%
-  # replace Inf with NA
-  mutate_if(is.numeric, function(x) ifelse(is.infinite(x), NA, x)) %>%
-  # replace NA with 0
-  replace(is.na(.), 0) %>%
-  # heatmap requires matrix class for input
-  as.matrix()
-
-hm <- Heatmap(matrix = df_cast,
-        row_names_gp = gpar(fontsize = 10),
-        column_names_gp = gpar(fontsize = 8),
-        heatmap_legend_param = list(title = "-log10(Pvalue)"),
-        col=colorRamp2(c(0, max(df_cast)), c("white", "red")),
-        # name = "Mean P-value per Cluster per Tissue",
-        column_title = "Mean P-value per Cluster per Tissue")
-print(hm)
-
-# version 2: how to make each row a SNP, but keep the Cluster column?
-df_geneExpr_hm <- df_LDexpress %>%
-  mutate(log10.pval=-log10(P_value)) %>%
-  dplyr::select(RS_ID, log10.pval, Tissue, Cluster) %>%
-  group_by(Cluster, RS_ID) %>%
-  arrange(desc(log10.pval), .by_group = T) %>%
-  filter(!duplicated(Tissue))
-
-df_wide <- df_geneExpr_hm %>%
-    # mutate(wall_type_logical = TRUE) %>%
-    pivot_wider(names_from = Tissue,
-                values_from = log10.pval) %>%
-  mutate(RS_ID = paste(RS_ID, Cluster,sep=".")) %>%
-  column_to_rownames("RS_ID") %>%
-  dplyr::select(-c(Cluster)) %>%
-  # mutate_all(funs(-log10(.))) %>%
-  replace(is.na(.), 0) %>%
-  as.matrix()
-
-my_splits <- str_after_last(rownames(df_wide),"\\.")
-
-library(RColorBrewer)
-# png(file.path(main_dir,"heatmap222.png"),width=6,height=5,units="in",res=1200)
-hm <- Heatmap(matrix = df_wide_max,
-        row_split = my_splits,
-        split = df_wide,
-        row_names_gp = gpar(fontsize = 10),
-        column_names_gp = gpar(fontsize = 8),
-        cluster_rows = T, show_row_dend = F,
-        cluster_columns = T,
-        show_row_names = F, gap = unit(2, "mm"),
-        col=colorRamp2(c(0, quantile(df_wide_max,probs=c(0.95))["95%"]),
-                       c("white", "red")),
-        heatmap_legend_param = list(title = "-log10(Pvalue)"),
-        column_title = "Smallest P-value per SNP per Cluster")
-# dev.off()
-print(hm)
-
-
-library(pheatmap)
-
-# Generte data (modified the mydf slightly)
-col1 <- brewer.pal(12, "Set3")
-mymat <- df_wide #matrix(rexp(600, rate=.1), ncol=12)
-# colnames(mymat) <- c(rep("treatment_1", 3), rep("treatment_2", 3), rep("treatment_3", 3), rep("treatment_4", 3))
-# rownames(mymat) <- paste("gene", 1:dim(mymat)[1], sep="_")
-df_annot <- data.frame(category=str_after_last(rownames(df_wide),"\\."),
-                       row.names = rownames(df_wide))
-
-# add row annotations
-save_pheatmap_png <- function(x, filename, width=1200, height=1000, res = 150) {
-  png(filename, width = width, height = height, res = res)
-  grid::grid.newpage()
-  grid::grid.draw(x$gtable)
-  dev.off()
-}
-newCols <- colorRampPalette(grDevices::rainbow(length(unique(df_annot$category))))
-annoCol <- newCols(length(unique(df_annot$category)))
-names(annoCol) <- unique(df_annot$category)
-annoCol <- list(category = annoCol)
-
-pheatmap <- pheatmap(mymat,
-         cluster_cols = T,
-         cluster_rows = F,
-         show_rownames = F,
-         annotation_row = df_annot,
-         annotation_colors=annoCol,
-         # gaps_row = c(300, 600),
-         color = rev(hcl.colors(50, "Reds 2")))
-save_pheatmap_png(pheatmap, "my_heatmap.png")
-         
-match(cluster_names, df_annot$category)                                             
-```
-
-
-<!-- ### Over-representation analysis for the SNP-gene-disease network (DisGeNET) -->
-<!-- ```{r enrichment, out.width=c('50%', '50%'), fig.show='hold'} -->
-<!-- library(enrichplot) -->
-<!-- library(DOSE) -->
-<!-- # library(clusterProfiler) -->
-<!-- # library(ggnewscale) -->
-<!-- # library(ReactomePA) -->
-
-<!-- max_weight <- w %>% -->
-<!--   dplyr::select(starts_with("X")) %>% -->
-<!--   max() -->
-<!-- mid <- max_weight/2 -->
-
-<!-- for (i in 1:length(cluster_names)) { -->
-<!--   my_clust=cluster_names[i] -->
-<!--   df_loci <- w %>% -->
-<!--     filter(!!sym(my_clust) >= cutoff) %>% -->
-<!--     dplyr::select(all_of(c(my_clust, 'variant', 'gene', 'rsID','ENTREZID'))) %>% -->
-<!--     arrange(-!!sym(my_clust)) -->
-
-<!--   # edo <- enrichGO(df_loci$ENTREZID) -->
-<!--   if (nrow(df_loci)>1){ -->
-<!--     dgnv <- enrichDGNv(df_loci$rsID, -->
-<!--                        pvalueCutoff = 0.1, -->
-<!--                        minGSSize = 10) -->
-<!--     # edo <- enrichWP(df_loci$ENTREZID, -->
-<!--                     # organism = "Homo sapiens") -->
-<!--     cur_weights <- df_loci[,my_clust] -->
-<!--     names(cur_weights) <- df_loci$rsID -->
-
-<!--     # Gene-Concept Network -->
-<!--     # The cnetplot() depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network. GSEA result is also supported with only core enriched genes displayed. -->
-<!--     # edox <- setReadable(dgnv, 'org.Hs.eg.db', keyType = "auto") -->
-
-<!--     ## categorySize can be scaled by 'pvalue' or 'geneNum' -->
-<!--     x <- length(unique(dgnv$geneID)) -->
-<!--     if (!is.null(dgnv) & x>1) { -->
-<!--       plt <- cnetplot(dgnv, -->
-<!--        categorySize="pvalue", -->
-<!--        foldChange=cur_weights, -->
-<!--        shadowtext="gene", -->
-<!--        circular=F) + -->
-<!--         scale_color_gradient2(name='Cluster Weight', -->
-<!--                               midpoint = mid, low = "yellow",mid = "orange", -->
-<!--                               high = "red", space = "Lab" ) + -->
-<!--         # scale_colour_gradient(name='Cluster Weight', -->
-<!--                          # low = "yellow", high = "red", na.value = NA)+ -->
-<!--        ggtitle(sprintf("Cluster %s",my_clust)) + -->
-<!--        theme(panel.border = element_rect(color = "black", -->
-<!--                                     fill = NA, -->
-<!--                                     size = 5)) -->
-<!--       print(plt) -->
-<!--     } -->
-<!--   } -->
-<!-- } -->
-
-
-<!-- ``` -->

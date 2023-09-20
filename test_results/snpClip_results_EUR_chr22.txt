@@ -1,0 +1,11 @@
+RS_Number	Position	Alleles	Details
+rs6519805	chr22:30525549	C=0.936, T=0.064	Variant kept.
+rs5771069	chr22:50435480	A=0.479, G=0.521	Variant kept.
+rs4482600	chr22:30579886	T=0.063, A=0.937	Variant in LD with rs6519805 (R2=0.9833), variant removed.
+rs1010022	chr22:44336310	A=0.802, G=0.198	Variant kept.
+rs112915006	chr22:50604696	A=0.958, G=0.042	Variant kept.
+rs28691713	chr22:50356302	C=0.514, T=0.486	Variant in LD with rs5771069 (R2=0.9337), variant removed.
+rs713669	chr22:50451771	C=0.477, T=0.523	Variant in LD with rs5771069 (R2=0.8324), variant removed.
+rs141216971	chr22:50422420	C=0.506, G=0.494	Variant in LD with rs5771069 (R2=0.9343), variant removed.
+rs4838881	chr22:50425779	C=0.506, T=0.494	Variant in LD with rs5771069 (R2=0.9343), variant removed.
+rs738320	chr22:38568715	G=0.534, T=0.466	Variant kept.

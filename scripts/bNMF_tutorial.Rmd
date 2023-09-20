@@ -1,0 +1,507 @@
+---
+title: "bNMF Clustering Pipeline Walkthrough"
+author: "Kirk Smith"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+<style>
+.main-container {
+    width: 1200px;
+    max-width:1200px;
+    margin-left: auto;
+    margin-right: auto;
+}
+  #header { 
+    background: #2274cc; /* Old browsers */
+    background: -moz-linear-gradient(left, #2274cc 0%, #26c5d3 36%, #61bf61 100%); /* FF3.6-15 */
+    background: -webkit-linear-gradient(left, #2274cc 0%,#26c5d3 36%,#61bf61 100%); /* Chrome10-25,Safari5.1-6 */
+    background: linear-gradient(to right, #2274cc 0%,#26c5d3 36%,#61bf61 100%); /* W3C, IE10+, FF16+, Chrome26+,  Opera12+, Safari7+ */
+    filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#2274cc', endColorstr='#61bf61',GradientType=1 ); /* IE6-9 */
+    color: white;
+    height: 100px;
+    display:flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  h1.title {
+    margin: auto;
+  }
+
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## bNMF tutorial
+
+This document serves as a tutorial for running the bNMF clustering pipeline. The code here mirrors the bNMF_example_pipeline.R document, but with additional text outlining the pipeline steps.
+
+### 1.) Install and load required packages
+```{r install, results='hide', message=FALSE, warning=FALSE}
+
+# load requires packages
+
+packages <- c("tidyverse", "data.table", "readxl", "magrittr", "dplyr", "strex", "rstudioapi")
+invisible(lapply(packages, library, character.only = TRUE))
+
+
+# load project scripts containing bNMF functions
+source("../scripts/choose_variants.R")  
+source("../scripts/prep_bNMF.R")  
+source("../scripts/run_bNMF.R")  
+
+# set directory to current 
+setwd(dirname(getActiveDocumentContext()$path))
+
+```
+
+### 2.) Supply user inputs 
+This includes:
+
+* the path to where you want output files saved
+* LDlinkR token (if using LDlinkR for LD-pruning and/or proxy search)
+* Path to topld_api (if using topld_api for proxy search)
+
+Notes on LDlinkR vs topld_api:
+
+* LDlinkR - documentation (including token request info): https://cran.r-project.org/web/packages/LDlinkR/vignettes/LDlinkR.html
+* topld documention: https://github.com/linnabrown/topld_api
+  * not supported on macOS!
+
+```
+# USER INPUTS!!!
+project_dir = '../test_results' # path to where you want results saved
+user_token = '[enter_LDlink_token]' # token for LDlinkR api
+topLD_path = NULL
+# create project folder 
+dir.create(project_dir)
+```
+
+```{r user_inputs, include=FALSE}
+# USER INPUTS!!!
+project_dir = '../test_results' # path to where you want results saved
+user_token = 'cb5457b210a6' # token for LDlinkR api
+topLD_path = NULL
+# create project folder 
+dir.create(project_dir)
+
+```
+
+### 3.) Read in paths to GWAS data and other files
+Toy datasets are provided in the "example_data" sub-directory.
+
+* clustering_data_sources_example.xlsx contains a sheet for paths to 1.) Summary stats for the outcome of interest (e.g. T2D) and 2.) Summary stats for the traits used in the clustering (e.g. BMI, HbA1c, etc.)
+* rsID_map_example.txt contains a map of rsIDs to VAR_ID_hg19. The full map (~80 million SNPs) can be generated using ./scripts/generate_varid_to_rsid_map_file.R, however this script requires access to remote server with larger CPU/memory resources. We are hoping to remove the requirement for this map in future updates to the pipeline. 
+
+Note that the sample_size column in gwas_traits should only be filled in for GWAS where the sample size column (N) is missing or contains incorrect values.
+```{r load_data}
+
+data_dir = "../example_data/"
+rsID_map_file <- file.path(data_dir, "rsID_map_example.txt")  # From dbSNP v1.38 -- maps positional IDs to rsIDs
+
+# GWAS for main trait
+gwas <- read_excel(file.path(data_dir, "clustering_data_sources_example.xlsx"),
+                   sheet="main_gwas") %>%
+  data.frame()
+knitr::kable(head(gwas,3))
+
+# GWAS for clustering traits
+gwas_traits <- read_excel(file.path(data_dir, "clustering_data_sources_example.xlsx"),
+                          sheet="trait_gwas")
+knitr::kable(head(gwas_traits,3))
+
+# GWAS to be used for final allele alignment
+main_ss_filepath <- gwas %>% filter(largest=="Yes") %>% pull(full_path)
+
+gwas_ss_files <- setNames(gwas$full_path, gwas$study)
+trait_ss_files <- setNames(gwas_traits$full_path, gwas_traits$trait)
+trait_ss_size <- setNames(gwas_traits$sample_size, gwas_traits$trait)
+
+```
+
+### 4.) Pull significant variants for outcome of interest
+Here we loop through the summary statistics in gwas_ss_files and pull out variants that meet the p-value cutoff. Required columns in the summary statistics files:
+
+* VAR_ID
+* P_VALUE
+* BETA or ODDS_RATIO
+
+We then remove duplicate variants and indels.
+
+```{r pull_sig_snps}
+
+# P-value threshold for variants in main trait
+PVCUTOFF = 5e-8
+
+n_gwas <- length(gwas_ss_files)
+
+vars_sig = data.frame(VAR_ID = as.character(),
+                      P_VALUE = as.numeric(),
+                      Risk_Allele=as.character(),
+                      GWAS=as.character())
+
+for(i in 1:n_gwas) {
+  print(paste0("...Reading ", names(gwas_ss_files)[i], "..."))
+
+  vars <- fread(gwas_ss_files[i], data.table = F, stringsAsFactors=F)
+
+  if (!"BETA" %in% colnames(vars)){
+    print("Converting Odds Ratio to Log Odds Ratio...")
+    vars <- vars %>%
+      mutate(BETA = log(as.numeric(ODDS_RATIO)))
+  }
+  vars <- vars %>%
+    filter(as.numeric(P_VALUE) <= PVCUTOFF) %>%
+    subset(grepl("^[0-9]+_[0-9]+_[ACGT]+_[ACGT]", VAR_ID)) %>%
+    separate(VAR_ID, into=c("CHR", "POS", "REF", "ALT"), sep="_", remove = F) %>%
+    mutate(Risk_Allele = ifelse(BETA>=0, ALT, REF)) %>%
+    mutate(GWAS = gwas$study[i]) %>%
+    select(VAR_ID, P_VALUE, Risk_Allele, GWAS)
+
+  print(nrow(vars))
+  vars_sig = rbind(vars_sig, vars)
+}
+knitr::kable(head(vars_sig,3))
+
+# remove duplicates
+vars_sig_uniq <- vars_sig %>%
+  arrange(VAR_ID, P_VALUE) %>%
+  filter(!duplicated(VAR_ID)) %>% # so we remove duplicates with the higher pvalue
+  rename(PVALUE = P_VALUE)
+print(paste("No. unique SNPs:",nrow(vars_sig_uniq)))
+
+# remove indels
+vars_sig_noIndels <- vars_sig_uniq %>%
+  separate(VAR_ID, into=c("CHR","POS","REF","ALT"),sep="_",remove = F) %>%
+  mutate(alleles = paste0(REF,ALT)) %>%
+  subset(nchar(alleles)==2 | (nchar(alleles)<=4 & grepl(",",alleles))) %>%
+  select(VAR_ID, PVALUE, Risk_Allele, GWAS)
+print(paste("No. SNPs excluding indels:",nrow(vars_sig_noIndels)))
+
+```
+
+### 5.) LD- or position-based variant pruning
+The purpose of this section is to ensure that we have a set of independent signals in the variant set. LD-pruning is the preferred method, however the LDlinkR API used for this can be slow for large requests (>1000 total SNPs).
+
+* Because the LDlinkR server request can often be killed for large requests, the ld_prune function write the results to the project folder. If an issue occurs, the user can upate the chromosome input to the one where the requrest was killed (e.g. change from c(1:22) to c(6:22) if killed on 6th chromosome).
+
+Position-based clumping often provides similar results and will be computed much faster. The user is also able to provide the kilobase window for this function.
+
+Note, both methods run one chromosome at a time and prioritize variants by p-value.
+
+
+```{r pruning, results='hide', message=FALSE, warning=FALSE}
+
+ld_prune(df_snps = vars_sig_noIndels,
+                    pop = "EUR",
+                    output_dir = project_dir,
+                    r2 = 0.05,
+                    maf=0.001,
+                    my_token = user_token,
+                    chr = c(1:22))
+# Position-based clumping
+clump_input <- vars_sig_noIndels %>%
+  separate(VAR_ID, into=c("CHR","POS","REF","ALT"), sep = "_",remove = F) %>%
+  mutate(ChrPos = paste0("chr", CHR, ":", POS))
+
+clump_results <- snp_clump(clump_input,
+                              window=500000)
+
+```
+
+### 5A.) Compile LD-pruning or positional-clumping results
+```{r compile_prune_results}
+
+# if using LD-pruning, read in output files from project folder and combine
+ld_files <- list.files(path = project_dir,
+                       pattern = "^snpClip_results",
+                       full.names = T)
+
+df_clipped_res = data.frame("RS_Number"=as.character(),
+                         "Position"=as.character(),
+                         "Alleles"= as.character(),
+                         "Details"=as.character())
+
+rename_cols_clipped <- c(RS_Number="RS Number",
+                         Position_grch37="Position")
+
+for (ld_file in ld_files){
+  df <- fread(ld_file, stringsAsFactors = F, data.table = F) %>%
+    dplyr::rename(any_of(rename_cols_clipped))
+  df_clipped_res <- rbind(df_clipped_res, df)
+}
+
+df_clipped_kept <- df_clipped_res %>%
+    filter(Details=="Variant kept.")
+
+pruned_vars <- vars_sig_noIndels %>%
+    separate(VAR_ID, into=c("CHR","POS","REF","ALT"), sep = "_",remove = F) %>%
+    mutate(ChrPos = paste0("chr", CHR, ":", POS)) %>%
+    filter(ChrPos %in% df_clipped_kept$Position)
+print(sprintf("T2D SNPs pruned from %i to %i...", nrow(vars_sig_noIndels), nrow(pruned_vars)))
+
+# if using position-based clumping, just filter the clump_input by the SNP IDs in the output
+pruned_vars_clumped <- clump_input %>%
+  filter(VAR_ID %in% clump_results)
+print(sprintf("T2D SNPs clumped from %i to %i...", nrow(clump_input), nrow(pruned_vars_clumped)))
+```
+
+### 6.) Variant missingness in traits
+At this point we have a set of independent variants, however some of them may not be ideal for the bNMF clustering algorithm. For starters, we do not want SNPs that are missing in many of the trait GWAS that will be used for clustering. In this section we determine which variants have high missingness.
+
+Note that each variants missingness is tracked by the presence of its sample size in the output variable, df_Ns. This is done in case the user wants to also check the average/median sample size of the variant set for each trait. If a trait GWAS sample is too low (e.g. < 5,000), it is advised to remove that trait from the clustering, as it might provide unreliable effect sizes and signals. To do so, simply update trait_ss_files.
+
+```{r variant_missingness, , results='hide'}
+
+# determine which variants are present in each trait GWAS
+gwas_variants <- pruned_vars$VAR_ID
+df_Ns <- count_traits_per_variant(gwas_variants,
+                                  trait_ss_files)
+# fix column names
+df_Ns_rev <- df_Ns %>%
+  column_to_rownames("VAR_ID") %>%
+  set_colnames(names(trait_ss_files))
+knitr::kable(df_Ns_rev[1:3, 1:5])
+
+# calculating variant missingess in traits
+variant_counts_df <- data.frame(VAR_ID=rownames(df_Ns_rev),
+                                frac=rowSums(!is.na(df_Ns_rev[,names(trait_ss_files)]))/length(trait_ss_files))
+var_nonmissingness <- ifelse(
+  gwas_variants %in% variant_counts_df$VAR_ID,
+  # if in counts data frame, take the non-missing fraction:
+  variant_counts_df$frac[match(gwas_variants, variant_counts_df$VAR_ID)],
+  # else not in data frame, so non-missing fraction is 0:
+  0
+)
+var_nonmissingness <- setNames(var_nonmissingness, gwas_variants)
+```
+
+### 7.) Identify variants needing proxies
+In addition to variants with high trait missingness, we also do not want to include amibiguous (A/T, C/G) or multi-allelic variants. The find_variants_needing_proxies function determines which of our variants meet any of these criteria.
+
+The default cutoff for variant non-missingness in the trait GWAS is 0.8. This means that a SNP is included in proxies_needed_df if it is missing in >20% of the trait GWAS. 
+
+```{r SNPs_needing_proxies}
+proxies_needed_df <- find_variants_needing_proxies(pruned_vars,
+                                                   var_nonmissingness,
+                                                   rsID_map_file,
+                                                   missing_cutoff = 0.8)
+```
+
+### 8.) Proxy search
+We will now search for proxies that are in high-LD with the SNPs in proxies_needed_df. The user must supply several inputs here:
+
+* method - either 'TopLD' or 'LDlink'
+  * Note that LDlinkR can take a long time to run and is not advised if proxies_needed_df includes >50 SNPs or so
+  * TopLD will run much faster, however it is not compatible with macOS.
+  * Depending on which method is selected, either LDlink_token or topLD_path must be supplied.
+* it is also important to include the correct reference panel/population for your analysis
+  * TopLD populations include EUR, EAS, SAS and AFR
+  * LDlinkR populations can be found in their documentation
+* the user can also define their trait missingness and LD cutoffs for the potential proxies using frac_nonmissing_num and r2_num, respectively
+
+To save time, we will only search for proxies for the first 5 SNPs in...
+
+```{r proxy_search, results='hide', message=FALSE, warning=FALSE}
+
+proxies_needed_df <- proxies_needed_df %>% slice(1:5)
+
+proxy_search_results <- choose_proxies(need_proxies = proxies_needed_df,
+                                        method="LDlink",
+                                        LDlink_token = user_token,
+                                        topLD_path = NULL,
+                                        rsID_map_file = rsID_map_file,
+                                        trait_ss_files = trait_ss_files,
+                                        pruned_variants = pruned_vars,
+                                        population="EUR",
+                                        frac_nonmissing_num=0.8,
+                                        r2_num=0.8)
+knitr::kable(head(proxy_search_results,3))
+
+df_proxies <- proxy_search_results %>%
+  dplyr::select(VAR_ID, proxy_VAR_ID) %>%
+  dplyr::inner_join(pruned_vars[,c("VAR_ID","GWAS")], by="VAR_ID") %>%
+  mutate(Risk_Allele=NA, PVALUE=NA)
+
+```
+
+```{r show_proxy_res}
+
+knitr::kable(head(proxy_search_results,3))
+
+```
+
+### 9.) Fetch summary statistics
+Here we will pull the summary stats for our variant list from the trait GWAS. The output will contain a list of two variables:
+
+1. z_mat - matrix of variant-trait z-scores (beta/se) aligned to the outcome risk-increasing allele from main_ss_filepath
+2. N_mat - matrix of variant-trait sample sizes
+
+Note that a SNP will be dropped from the variant set if any of the following conditions occur:
+
+* The variant is not found in main_ss_filepath
+* The variant has p-value below pval_cutoff (default 0.05) in main_ss_filepath
+* The variant has a p-value below the Bonferroni cutoff (0.05/N_SNPs) in main_ss_filepath AND the original risk allele does not match the risk allele from main_ss_filepath
+  * this is why we track the risk alleles from the original GWAS
+  
+```{r fetch_ss}
+
+# combine the original SNPs from pruned_vars and the proxies we found in df_proxies...")
+df_orig_snps <- pruned_vars %>%
+  filter(!VAR_ID %in% proxies_needed_df$VAR_ID)
+
+df_input_snps <- rbind(df_orig_snps[,c("VAR_ID","PVALUE", "Risk_Allele", "GWAS")],
+                       df_proxies[,c("VAR_ID","PVALUE", "Risk_Allele", "GWAS")]) %>%
+  arrange(PVALUE) %>%
+  filter(!duplicated(VAR_ID))
+
+sprintf("%i original SNPs...", nrow(df_orig_snps))
+sprintf("%i proxy SNPs...", nrow(df_proxies))
+sprintf("%i total unique SNPs!", nrow(df_input_snps))
+
+# fetch summary stats
+initial_zscore_matrices <- fetch_summary_stats(
+  df_input_snps,
+  main_ss_filepath,
+  trait_ss_files,
+  trait_ss_size,
+  pval_cutoff=0.05
+)
+# alignment_GWAS_summStats.csv will contain the SNPs and risk alleles pulled from main_ss_filepath
+
+```
+
+### 10.) Get rsIDs for final SNPs
+Here we are simply getting the rsIDs for our final variant set from the aforementioned rsID-to-VAR_ID map. This step can be skipped if you are not interested in generating the summary HTML report at the end of this file.
+
+```{r rsIDs}
+
+print("Getting rsIDs for final snps and saving to results...")
+z_mat <- initial_zscore_matrices$z_mat
+N_mat <- initial_zscore_matrices$N_mat
+
+df_var_ids <- df_input_snps %>%
+  separate(VAR_ID, into=c("Chr","Pos","Ref","Alt"),sep="_",remove = F) %>%
+  mutate(ChrPos=paste(Chr,Pos,sep = ":")) %>%
+  subset(ChrPos %in% rownames(z_mat))
+write(df_var_ids$VAR_ID,'my_snps.tmp')
+
+system(sprintf("grep -wFf my_snps.tmp %s > %s",
+               rsID_map_file, file.path(project_dir, "rsID_map.txt")))
+
+df_rsIDs <- fread(cmd=sprintf("grep -wFf my_snps.tmp %s",rsID_map_file),
+                  header = F,
+                  col.names = c("VAR_ID","rsID"))
+print(sprintf("rsIDs found for %i of %i SNPs...", nrow(df_rsIDs), nrow(df_var_ids)))
+
+df_rsIDs_final <- df_rsIDs %>%
+  filter(VAR_ID %in% df_var_ids$VAR_ID)
+write_delim(x=df_rsIDs_final,
+            file = file.path(project_dir, "rsID_map.txt"),
+            col_names = T)
+
+```
+
+### 11.) Fill the missing values in the trait-association matrix
+Because we allow variants with up to 20% missing data, there will most likely be missing values in the z_mat matrix. The bNMF algorithm cannot handle missing data, so we must either remove these variants or fill/impute the missing values. 
+
+We provide four options for addressing the missing values via the method_fill input:
+
+1. "median" (default): missing SNP values are filled with the trait median.
+2. "zero": missing SNP values are filled with zero
+3. "remove": any SNPs with missing values are removed
+4. "proxies" (preferred method, but slowest): we search for proxies for those missing values. Since we are just looking to fill missing values, we recommend lowering the LD-r2 and trait-missingness cutoffs, compared to the initial proxy search. Note that only the traits with missing values are considered for the proxy search, which makes it more likely to find a proxy that fits our criteria. After this step, any values STILL missing will be filled with the median trait value.
+
+* if using the "proxy" method, you must also supply proxy_method ('LDlink' or 'TopLD'), population, and LDlink_token/topLD_path
+
+```{r fill_missing}
+# for the purpose of this tutorial and computation speed, will fill with trait median to 
+initial_zscore_matrices_final <- fill_missing_zcores(
+  initial_zscore_matrices = initial_zscore_matrices,
+  df_snps = df_snps,
+  trait_ss_files = trait_ss_files,
+  trait_ss_size = trait_ss_size,
+  main_ss_filepath = main_ss_filepath,
+  rsID_map_file = rsID_map_file,
+  method_fill="median",
+  LDlink_token=NULL,
+  topLD_path=NULL,
+  population=NULL)
+
+```
+
+### 12.) Generate the non-negative matrix
+The bNMF algorithm requires non-negative values for its input. The prep_z_matrix performs several steps to generate this non-negative matrix:
+
+1. Similar to pruning the SNPs for independent signals, we also want the traits to be both relevant and independent.
+
+  * First we remove traits, which do not have at least one SNP at Bonferroni signficance
+  * We then remove highly correlated traits based on their z-score, keeping the trait with the largest maximum z-score
+2. We then separate the z-score matrix (N variants x M traits) into positive and negative columns (N variants x 2M traits)
+
+```{r non_neg_matrix}
+
+prep_z_output <- prep_z_matrix(z_mat = initial_zscore_matrices_final$z_mat,
+                               N_mat = initial_zscore_matrices_final$N_mat,
+                               corr_cutoff = 0.8)
+
+# prep_z_output has two outputs:
+
+#   1.) The scaled, non-negative z-score matrix
+final_zscore_matrix <- prep_z_output$final_z_mat
+
+#   2.) Results from the trait filtering
+df_traits_filtered <- prep_z_output$df_traits
+write_csv(x = df_traits_filtered,
+          file = file.path(project_dir,"df_traits.csv"))
+knitr::kable(head(df_traits_filtered,3))
+
+# prep_z_matrix also save trait correlation matrix to working dir, so move to project dir
+system(sprintf("mv trait_cor_mat.txt %s", project_dir))
+
+print(sprintf("Final matrix: %i SNPs x %i traits",
+      nrow(final_zscore_matrix),
+      ncol(final_zscore_matrix)/2))
+```
+
+### 13.) Run the bNMF algorithm
+The bNMF algorithm runs a number of clustering iterations (n_reps), each time starting with different random matrices (WxH) and converges to a solution until the solution is with the designated tolerance. We then pick the optimal number of clusters (K) based on the K value that occurs in the greatest number of iterations. 
+
+This function run time increases exponentially with the input matrix size. If your analysis involves a large number of SNPs/traits, considering increasing the tolerance from 1e-7 (default) to something like 1e-5.
+
+```{r run_bNMF, results='hide'}
+bnmf_reps <- run_bNMF(final_zscore_matrix,
+                      n_reps=25,
+                      tolerance = 1e-7)
+summarize_bNMF(bnmf_reps, dir_save=project_dir)
+
+```
+
+# 14.) Summarize results
+summarize_bNMF will output the clustering results to the designated folder, including the cluster weights. If you would like a more extensive summary of the results, the below function can be used to generate an HTML report.The HTML should be saved in the path supplied to the main_dir input.
+
+```{r summarize_clusters, results='hide'}
+# Use K=NULL if you want results for the optimal K. If you are interested in seeing results for another value of K, assign that number (e.g. k=10)
+k = NULL
+if (is.null(k)){
+  html_filename <- "results_for_maxK.html"
+} else {
+  html_filename <- sprintf("results_for_K_%i.html", k)
+}
+
+rmarkdown::render(
+  './format_bNMF_results.Rmd',
+  output_file = html_filename,
+  params = list(main_dir = project_dir,
+                k = k,
+                loci_file="query",
+                my_traits=gwas_traits)
+)
+system(sprintf("mv %s %s", html_filename, project_dir))
+
