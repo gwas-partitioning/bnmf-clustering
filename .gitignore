@@ -4,3 +4,4 @@ opt/*
 cache/*
 
 *.DS_store
+pipeline_walkthrough/bNMF_tutorial.Rmd
