@@ -3,5 +3,4 @@ data/*
 opt/*
 cache/*
 
-# Potentially-sensitive data
-./scripts/bNMF_tutorial.Rmd
+*.DS_store
