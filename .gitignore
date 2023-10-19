@@ -4,4 +4,4 @@ opt/*
 cache/*
 
 *.DS_store
-pipeline_walkthrough/
+pipeline_walkthrough/*
