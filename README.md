@@ -1,3 +1,6 @@
+## T2D Multi-ancestry Partitioned Polygenic Scores
+Cluster weights are available from the Smith, Deutsch et al Nature Medicine 2024 paper in the "Smith_Deutsch_NatureMedicine_2024" folder. Partitioned polygenic scores can be generated using the enclosed variant cluster weights. We have included weights for ancestry-specific and multi-ancestry clusters.
+
 ## Pipeline for GWAS clustering using Bayesian non-negative matrix factorization (bNMF)
 
 The bNMF procedure, as applied here, is used to detect clusters of GWAS variants for some outcome of interest based on the associations of those variants with a set of additional traits. This pipeline includes pre-processing steps (such as quality control of variants and traits and the choice of proxy variants), preparation of the z-score matrix, clustering, and summarization of results.
