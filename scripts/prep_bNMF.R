@@ -1,5 +1,5 @@
 library(tidyverse)
-library(data.table) 
+library(data.table)
 
 fetch_summary_stats <- function(df_variants, gwas_ss_file, trait_ss_files, trait_ss_size=NULL, pval_cutoff=1) {
   
@@ -45,6 +45,7 @@ fetch_summary_stats <- function(df_variants, gwas_ss_file, trait_ss_files, trait
                      z="Zscore",
                      z="ZSCORE")
     
+    print(head(df))
     df <- df %>%
       rename(any_of(rename_cols)) %>%
       filter(!duplicated(VAR_ID)) %>%
@@ -71,15 +72,15 @@ fetch_summary_stats <- function(df_variants, gwas_ss_file, trait_ss_files, trait
       drop_na()
   }
 
-  print("Reading original GWAS summary statistics...")
-  
   variant_vec <- df_variants$VAR_ID
   
   if (class(gwas_ss_file)=="character"){
+    print("Reading original GWAS summary statistics (file path)...")
     gwas_ss <- fread(gwas_ss_file, data.table=F, stringsAsFactors=F) %>%
       filter(VAR_ID %in% variant_vec)
   } else {
     # input dataframe with VAR_ID, P_VALUE, SNP, Risk_Allele, Nonrisk_Allel
+    print("Reading original GWAS summary statistics (data.frame)...")
     gwas_ss <- gwas_ss_file %>%
       filter(VAR_ID %in% variant_vec)
   }
@@ -249,6 +250,7 @@ prep_z_matrix <- function(z_mat, N_mat,
       break
     }
     trait_cor_mat <- trait_cor_mat[remaining_traits, remaining_traits]
+    print(dim(trait_cor_mat))
     to_remove <- rownames(trait_cor_mat)[abs(trait_cor_mat[, remaining_traits[1]]) >= corr_cutoff]
 
     # track results in dataframe
@@ -429,7 +431,8 @@ fill_missing_zcores <- function(initial_zscore_matrices,
       
       print("Fetching summary stats for cover SNPs...")
       df_covers <- df_covers %>%
-        mutate(Risk_Allele=NA, PVALUE=NA)
+        mutate(Risk_Allele=NA, PVALUE=NA) %>%
+        rename(orig_VAR_ID=VAR_ID, VAR_ID=proxy_VAR_ID)
 
       trait_ss_size_covers <- trait_ss_size[unique(na_ix$col)]
       
@@ -448,8 +451,8 @@ fill_missing_zcores <- function(initial_zscore_matrices,
     
       # match ChrPos for orig SNPs and cover proxies
       df_covers_merged <- df_covers %>%
-        mutate(ChrPos_orig = gsub("_", ":", str_before_nth(VAR_ID, "_", 2))) %>%
-        mutate(ChrPos_proxy = gsub("_", ":", str_before_nth(proxy_VAR_ID, "_", 2)))
+        mutate(ChrPos_orig = gsub("_", ":", str_before_nth(orig_VAR_ID, "_", 2))) %>%
+        mutate(ChrPos_proxy = gsub("_", ":", str_before_nth(VAR_ID, "_", 2)))
       
       print(paste("Num missing data before:",
                   sum(is.na(z_mat))))  # 123
