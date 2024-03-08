@@ -317,7 +317,7 @@ prep_z_matrix <- function(z_mat, N_mat,
 }
 
 
-fill_missing_zcores <- function(initial_zscore_matrices,
+fill_missing_zscores <- function(initial_zscore_matrices,
                                 df_snps,
                                 trait_ss_files,
                                 trait_ss_size,

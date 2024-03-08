@@ -281,7 +281,7 @@ df_snps <- df_input_snps %>%
   data.frame()
 
 print("Searching for cover proxies for missing z-scores...")
-initial_zscore_matrices_final <- fill_missing_zcores(initial_zscore_matrices,
+initial_zscore_matrices_final <- fill_missing_zscores(initial_zscore_matrices,
                                                       df_snps,
                                                       trait_ss_files,
                                                       trait_ss_size,
