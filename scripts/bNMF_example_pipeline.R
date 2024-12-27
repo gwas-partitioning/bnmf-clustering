@@ -25,10 +25,11 @@ setwd(dirname(getActiveDocumentContext()$path))
 
 # USER INPUTS!!!
 project_dir = './test_results' # path to where you want results saved
-user_token = 'cb5457b210a6' # token for LDlinkR api
+user_token = 'YOUR_LDLINK_API_TOKEN' # token for LDlinkR api
 
 # create project folder 
 dir.create(project_dir)
+
 
 #----
 
@@ -218,11 +219,23 @@ save.image(file = file.path(project_dir, "pipeline_data.RData"))
 # SECTION 7: Fetch summary statistics for SNPs in trait GWAS
 
 print("Prepping input for fetch_summary_stats...")
+
+# Remove SNPs from pruned_vars that needed proxies
 df_orig_snps <- pruned_vars %>%
   filter(!VAR_ID %in% proxies_needed_df$VAR_ID)
 
-df_input_snps <- rbind(df_orig_snps[,c("VAR_ID","PVALUE", "Risk_Allele", "GWAS")],
-                       df_proxies[,c("VAR_ID","PVALUE", "Risk_Allele", "GWAS")]) %>%
+# Join with pruned vars so we can get the original GWAS where the proxy came from 
+# and add the necessary columns (if you don't care about the original GWAS, can
+# ski the inner_join step and just set GWAS=NA)
+df_proxies <- proxy_search_results %>%
+  dplyr::select(VAR_ID, proxy_VAR_ID) %>%
+  dplyr::inner_join(pruned_vars[,c("VAR_ID","GWAS")], by="VAR_ID") %>%
+  mutate(Risk_Allele=NA, PVALUE=NA)
+
+# combine original SNPs with proxy SNP
+# MAKE SURE assign proxy_VAR_ID to VAR_ID in df_proxies!!!
+df_input_snps <- rbind(df_orig_snps %>% select(VAR_ID, PVALUE, Risk_Allele,GWAS),
+                       df_proxies %>% select(VAR_ID=proxy_VAR_ID, PVALUE, Risk_Allele,GWAS)) %>%
   arrange(PVALUE) %>%
   filter(!duplicated(VAR_ID))
 
