@@ -1,3 +1,3 @@
-Chr,Pos,Ref,Alt,RSID,Effect_Allele,Weight
+Chr,Pos_hg38,Ref,Alt,RSID,Risk_Allele,Weight
 2,233395552,A,G,rs838722,G,1.27131145158399
 2,233759924,C,T,rs887829,T,14.3539837522901
