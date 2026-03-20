@@ -5,3 +5,9 @@ cache/*
 
 *.DS_store
 pipeline_walkthrough/*
+
+# Large reference/binary files
+*.vcf.gz
+*.vcf.gz.tbi
+*.RData
+*.rds

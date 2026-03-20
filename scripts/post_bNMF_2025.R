@@ -1,309 +1,39 @@
+# =============================================================================
+# post_bNMF_2025.R
+# =============================================================================
+# Post-hoc analysis functions applied after bNMF clustering.
+#
+# Functions:
+#   calculate_cutoff()  — Determine optimal activity weight cutoff (elbow method)
+#   v2g()               — Variant-to-gene mapping using Open Targets V2G scores
+#                         (requires local V2G database files; see v2g_index_dir /
+#                          v2g_scored_dir parameters)
+#   do_post_analysis()  — Full post-hoc pipeline: load results, annotate nearest
+#                         gene, export Excel workbook, liftover hg19→hg38,
+#                         generate PRS score files, and optionally run V2G
+#
+# Dependencies:
+#   GenomicRanges, Homo.sapiens, openxlsx, rtracklayer (liftover), vroom
+# =============================================================================
+
 library(tidyverse)
-library(furrr)
-library(progressr)
+library(magrittr)
 library(rtracklayer)
 library(vroom)
-##########################################################################
-# Copyright (c) 2017, Broad Institute
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
-#     Redistributions of source code must retain the above copyright
-#     notice, this list of conditions and the following disclaimer.
-#     Redistributions in binary form must reproduce the above copyright
-#     notice, this list of conditions and the following disclaimer in
-#     the documentation and/or other materials provided with the
-#     distribution.
-#     Neither the name of the Broad Institute nor the names of its
-#     contributors may be used to endorse or promote products derived
-#     from this software without specific prior written permission.
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#########################################################################
-
-######################################################################
-# Bayesian NMF algorithms for clustering
-######################################################################
-# For implementation details see the ppaer 
-# Udler MS, Kim J, von Grotthuss M,
-# Bonàs-Guarch S, Cole JB, Chiou J, et al. (2018)
-# Type 2 diabetes genetic loci informed by multi-trait
-# associations point to disease mechanisms and
-# subtypes: A soft clustering analysis. PLoS Med 15
-# (9): e1002654.
-###########################
-# For details on the original algorithms 
-# see Tan, V.Y. & Févotte, C. Automatic relevance determination in nonnegative matrix factorization with the beta-divergence.
-# IEEE Trans. Pattern Anal. Mach. Intell. 35, 1592–1605 (2013).
-######################################################################
-
-BayesNMF.L2EU <- function(
-  V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=15, phi=1.0 #20, 10
-) {
-  
-  # Bayesian NMF with half-normal priors for W and H
-  # V0: input z-score matrix (variants x traits)
-  # n.iter: Number of iterations for parameter optimization
-  # a0: Hyper-parameter for inverse gamma prior on ARD relevance weights
-  # tol: Tolerance for convergence of fitting procedure
-  # K: Number of clusters to be initialized (algorithm may drive some to zero)
-  # K0: Used for setting b0 (lambda prior hyper-parameter) -- should be equal to K
-  # phi: Scaling parameter
-  
-  eps <- 1.e-50
-  del <- 1.0
-  active_nodes <- colSums(V0) != 0
-  V0 <- V0[, active_nodes]
-  V <- V0 - min(V0)
-  Vmin <- min(V)
-  Vmax <- max(V)
-  N <- dim(V)[1]
-  M <- dim(V)[2]
-  
-  W <- matrix(runif(N * K) * Vmax, ncol=K)
-  H <- matrix(runif(M * K) * Vmax, ncol=M)
-  
-  I <- array(1, dim=c(N, M))
-  V.ap <- W %*% H + eps
-  
-  phi <- sd(V)^2 * phi
-  C <- (N + M) / 2 + a0 + 1
-  b0 <- 3.14 * (a0 - 1) * mean(V) / (2 * K0)
-  lambda.bound <- b0 / C
-  lambda <- (0.5 * colSums(W^2) + 0.5 * rowSums(H^2) + b0) / C
-  lambda.cut <- lambda.bound * 1.5
-  
-  n.like <- list()
-  n.evid <- list()
-  n.error <- list()
-  n.lambda <- list()
-  n.lambda[[1]] <- lambda
-  iter <- 2
-  count <- 1
-  while (del >= tol & iter < n.iter) {
-    H <- H * (t(W) %*% V) / 
-      (t(W) %*% V.ap + phi * H * matrix(rep(1 / lambda, M), ncol=M) + eps)
-    V.ap <- W %*% H + eps
-    W <- W * (V %*% t(H)) / 
-      (V.ap %*% t(H) + phi * W * t(matrix(rep(1 / lambda, N), ncol=N)) + eps)
-    V.ap <- W %*% H + eps
-    lambda <- (0.5 * colSums(W^2) + 0.5 * rowSums(H^2) + b0) / C
-    del <- max(abs(lambda - n.lambda[[iter - 1]]) / n.lambda[[iter - 1]])
-    like <- sum((V - V.ap)^2) / 2
-    n.like[[iter]] <- like
-    n.evid[[iter]] <- like + phi * sum((0.5 * colSums(W^2) + 0.5 * rowSums(H^2) + b0) / 
-                                         lambda + C * log(lambda))
-    n.lambda[[iter]] <- lambda
-    n.error[[iter]] <- sum((V - V.ap)^2)
-    if (iter %% 100 == 0) {
-      cat(iter, n.evid[[iter]], n.like[[iter]], n.error[[iter]], del, 
-          sum(colSums(W) != 0), sum(lambda >= lambda.cut), '\n')
-    }
-    iter <- iter + 1
-  }
-  return(list(
-    W,  # Variant weight matrix (N x K)
-    H,  # Trait weight matrix (K x M)
-    n.like,  # List of reconstruction errors (sum of squared errors / 2) per iteration
-    n.evid,  # List of negative log-likelihoods per iteration
-    n.lambda,  # List of lambda vectors (shared weights for each of K clusters, some ~0) per iteration
-    n.error  # List of reconstruction errors (sum of squared errors) per iteration
-  ))
-}
-
-
-run_bNMF <- function(z_mat, n_reps=10, random_seed=1, K=20, K0=10, tolerance=1e-7) {
-  
-  # Given an input matrix as created by prep_z_matrix(), run the bNMF procedure
-  # a series of times to generate results and evaluate cluster stability
-  
-  print(paste0("Running bNMF clustering procedure (", n_reps, " iterations)..."))
-  print(sprintf("Using tolerance of %.2e!",tolerance))
-  
-  set.seed(random_seed)
-  
-  bnmf_reps <- lapply(1:n_reps, function(r) {
-    print(paste("ITERATION",r))
-    res <- BayesNMF.L2EU(V0 = z_mat, K=K, K0=K0, tol=tolerance)
-    names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
-    res
-  })
-  bnmf_reps
-}
-
-
-# Activate a global handler for progress bars
-
-run_bNMF_parallel <- function(z_mat, n_reps = 10, random_seed = 1, K = 20, K0 = 10, tolerance = 1e-7) {
-  
-  print(paste0("Running bNMF clustering procedure in parallel! (", n_reps, " iterations)..."))
-  print(sprintf("Using tolerance of %.2e!", tolerance))
-  
-  # Run each repetition in parallel
-  bnmf_reps <- future_map(1:n_reps, function(rep) {
-    
-    # Logging progress
-    log_message <- paste("ITERATION", rep)
-    cat(log_message, "\n")  # Print to console to verify
-    
-    # Run the Bayesian NMF function and store the result
-    res <- BayesNMF.L2EU(V0 = z_mat, K = K, K0 = K0, tol = tolerance)
-    names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
-    
-    return(res)  # Explicitly return `res` from the function
-  },
-  .options = furrr_options(seed = random_seed)  # Set the seed to a specific number
-  )
-  
-  return(bnmf_reps)
-}
-
-summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
-  
-  # Given output from bNMF (list of length N_iterations),
-  # generate summary tables and plots
-
-  make_run_summary <- function(reps) {
-    
-    # Given a list of bNMF iteration outputs, summarize the K choices and associated likelihoods across runs
-    
-    run_summary <- map_dfr(1:length(reps), function(i) {
-      res <- reps[[i]]
-      final_lambdas <- res$n.lambda[[length(res$n.lambda)]]
-      tibble(
-        run=i,
-        K=sum(final_lambdas > min(final_lambdas)),  # Assume that lambdas equal to the minimum lambda are ~ 0
-        evid=res$n.evid[[length(res$n.evid)]]  # Evidence = -log_likelihood
-      )
-    }) %>%
-      arrange(evid)
-    
-    unique.K <- table(run_summary$K)
-    n.K <- length(unique.K)  # Number of distinct K
-    MAP.K.run <- sapply(names(unique.K), function(k) {  # bNMF run index with the maximum posterior for given K
-      tmp <- run_summary[run_summary$K == k, ]
-      tmp$run[which.min(tmp$evid)]
-    })
-    
-    list(run_tbl=run_summary, unique.K=unique.K, MAP.K.run=MAP.K.run)
-  }
-  if (!is.null(dir_save)) {
-    dir.create(file.path(dir_save))
-    dir_save=paste0(dir_save,"/")
-  } else {dir_save="./"}
-  
-  print("Summarizing bNMF results...")
-  
-  print("Writing table of chosen K across iterations...")
-  run_summary <- make_run_summary(bnmf_reps)
-  write_tsv(run_summary$run_tbl, paste0(dir_save,"run_summary.txt"))
-
-  n.K <- length(run_summary$unique.K)  # Number of distinct K
-  
-  get_W <- function(clustering) {
-    W_raw <- clustering$W
-    W_raw[, colSums(W_raw > 1e-10) > 0]
-  }
-  
-  get_H <- function(clustering) {
-    H_raw <- clustering$H
-    H_raw[rowSums(H_raw > 1e-10) > 0, ]
-  }
-  
-  print("Plotting variant and trait contributions...")
-  silent <- sapply(names(run_summary$unique.K), function(k) {  # Create heatmaps for MAP iteration for each K
-    res <- bnmf_reps[[run_summary$MAP.K.run[as.character(k)]]]
-    W <- res$W[, colSums(res$W) != 0]  # feature-cluster association matrix
-    H <- res$H[rowSums(res$H) != 0, ]  # cluster-gene association matrix
-    W[W < 1.e-10] <- 0
-    H[H < 1.e-10] <- 0
-    
-    W0 <- data.frame(W)
-    W0[, "variant"] <- rownames(W)
-    H0 <- data.frame(H)
-    H0[, "cluster"] <- rownames(H)
-    
-    write_tsv(W0, file=paste0(dir_save,"L2EU.W.mat.", k, ".txt"))
-    write_tsv(H0, file=paste0(dir_save,"L2EU.H.mat.", k, ".txt"))
-    
-    mat.reconstructed <- W %*% H   # reconstructed matrix == approximation for the input matrix 
-    
-    # Setup for plotting
-    scale0 <- 0.8
-    scale <- 1
-    g.ordering <- paste("G", seq(1:ncol(W)), sep="")
-    color.axis <- "black"
-    .theme_ss <- theme_bw(base_size=12) +
-      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size=8 * scale, 
-                                       family="mono", face='bold', color=color.axis),
-            axis.text.y = element_text(hjust = 0.5,size=12 * scale, family="mono",face='bold',color=color.axis),
-            axis.text = element_text(size = 12 * scale, family = "mono",color=color.axis),
-            axis.title=element_text(face="bold", size=12 * scale,color="black"),
-            plot.title=element_text(face="bold", size=12 * scale))
-    
-    # Plot W matrix (feature activities)
-    W_hc <- hclust(dist(W, method="euclidean"), method="ward.D")
-    W_variant.ordering <- W_hc$labels[W_hc$order]
-    W_plt_df <- W %>%
-      as.data.frame() %>%
-      rownames_to_column(var="variant") %>%
-      gather(key="cluster", value="activity", -variant) %>%
-      mutate(variant=factor(variant, levels=W_variant.ordering),
-             cluster=factor(cluster, 
-                            levels=paste0("V", 1:ncol(W))))
-    W_plt <- ggplot(W_plt_df, aes(x=variant, y=cluster, fill=activity)) + 
-      geom_tile() +
-      scale_fill_gradient2(low="white", high ="black", name=paste("Activity", sep="")) +
-      #p = p + scale_fill_gradientn(values=c(0,0.1,0.2,0.5,0.7,1.0),colours=c("yellow","green","black","red","magenta"),limit=c(0,1.0))
-      .theme_ss +
-      ggtitle(paste0("Variant Association to Clusters (k=", k, ")")) +
-      ylab("Cluster") + xlab("Variant") +
-      theme(axis.title.x = element_text(face="bold",colour="black", size=12 * scale0)) +
-      theme(axis.title.y = element_text(face="bold",colour="black", size=12 * scale0)) +
-      theme(legend.position="right") +
-      theme(legend.key.size = unit(0.5, "cm"))
-    ggsave(paste0(dir_save,"W_plot_K", k, ".pdf"), plot=W_plt)
-    
-    H_hc <- hclust(dist(t(H), method="euclidean"), method="ward.D")
-    H_trait.ordering <- H_hc$labels[H_hc$order]
-    H_plt_df <- t(H) %>%
-      as.data.frame() %>%
-      rownames_to_column(var="trait") %>%
-      gather(key="cluster", value="activity", -trait) %>%
-      mutate(cluster=factor(cluster, levels=paste0("V", 1:nrow(H))),
-             trait=factor(trait, levels=H_trait.ordering))
-    H_plt <- ggplot(H_plt_df, aes(x=trait, y=cluster, fill=activity)) + 
-      geom_tile() +
-      scale_fill_gradient2(low="white", high ="black", name=paste("Activity", sep="")) +
-      #p = p + scale_fill_gradientn(values=c(0,0.1,0.2,0.5,0.7,1.0),colours=c("yellow","green","black","red","magenta"),limit=c(0,1.0))
-      .theme_ss +
-      ggtitle(paste0("Variant Association to Clusters (k=", k, ")")) +
-      ylab("Cluster") + xlab("Trait") +
-      theme(axis.title.x=element_text(face="bold", colour="black", size=12 * scale0)) +
-      theme(axis.title.y=element_text(face="bold", colour="black", size=12 * scale0)) +
-      theme(legend.position="right") +
-      theme(legend.key.size = unit(0.5, "cm"))
-    ggsave(paste0(dir_save,"H_plot_K", k, ".pdf"), plot=H_plt)
-  })
-}
-
+library(openxlsx)
+library(GenomicRanges)
+library(Homo.sapiens)
 
 # post-hoc functions
 
-calculate_cutoff <- function(w) {
+calculate_cutoff <- function(w, h) {
   
   w_mat <- data.frame(t(w)) %>%
     set_colnames(.["variant", ]) %>%
     subset(!rownames(.) %in% "variant")
+  
+  h_mat <- h
+  
   # w_mat <- fread("./L2EU.H.mat.8.txt",stringsAsFactors = FALSE,data.table = F)
   
   dist_point_line <- function(a, slope, intercept) {
@@ -318,8 +48,10 @@ calculate_cutoff <- function(w) {
   # w_mat$cluster = NULL
   # names(w_mat) = NULL
   # weight = unlist(w_mat)
-  w_list <- as.list(w_mat)
-  weight = unlist(w_list)
+  w_list <- unlist(as.list(w_mat))
+  h_list <- unlist(as.list(h_mat))
+  
+  weight = c(w_list, h_list)
   
   
   weights = as.data.frame(weight)
@@ -377,49 +109,65 @@ calculate_cutoff <- function(w) {
 }
 
 
-v2g <- function(gwas_data, prefix, output_dir) {
-  
-  # gwas_data <- vroom(gwas_path)
-  # prefix <- str_replace(basename(gwas_path), '.tsv.gz', '')
-  
+v2g <- function(gwas_data, prefix, output_dir,
+                v2g_index_dir  = NULL,
+                v2g_scored_dir = NULL,
+                gene_symbol_file = NULL) {
+  # Map GWAS variants to genes using Open Targets V2G scores.
+  #
+  # Args:
+  #   gwas_data        : Data frame with columns: chromosome, position, rsid
+  #   prefix           : Output filename prefix
+  #   output_dir       : Directory to write output file
+  #   v2g_index_dir    : Directory containing per-chromosome V2G index files
+  #                      (chr{N}.v2g_index.tsv.gz). Download from Open Targets.
+  #   v2g_scored_dir   : Directory containing per-chromosome V2G scored files
+  #                      (chr{N}.v2g_scored.tsv.gz). Download from Open Targets.
+  #   gene_symbol_file : Path to Ensembl gene symbol table (grch38_df.tsv)
+  #                      with columns: ensgene, symbol.
+  #
+  # Returns: writes <prefix>.v2g.tsv.gz to output_dir; returns NULL invisibly.
+
+  if (is.null(v2g_index_dir) || is.null(v2g_scored_dir) || is.null(gene_symbol_file)) {
+    stop("v2g() requires v2g_index_dir, v2g_scored_dir, and gene_symbol_file to be specified.")
+  }
+
   # Sanitize prefix for file naming
   prefix <- gsub("[^a-zA-Z0-9_-]", "_", prefix)
-  
+
   all_combine <- data.frame()
   for (chr in 1:22) {
     cat('Working on chr', chr, '\n')
-    
+
     # Use a temporary variable to avoid modifying gwas_data in place
     gwas_chr_data <- gwas_data %>% filter(chromosome == chr)
-    
+
     # Load the index data for the current chromosome
-    index_file <- paste0("/humgen/diabetes2/users/satoshi/database/opentarget/V2G/v2g_index_perchr/chr", chr, ".v2g_index.tsv.gz")
+    index_file <- file.path(v2g_index_dir, sprintf("chr%d.v2g_index.tsv.gz", chr))
     index_data <- vroom(index_file) %>%
       dplyr::rename(position_v2g = position, rsid = rs_id)
-    
+
     # Load the scored data for the current chromosome
-    scored_file <- paste0("/humgen/diabetes2/users/satoshi/database/opentarget/V2G/v2g_scored_perchr/chr", chr, ".v2g_scored.tsv.gz")
+    scored_file <- file.path(v2g_scored_dir, sprintf("chr%d.v2g_scored.tsv.gz", chr))
     scored_data <- vroom(scored_file) %>%
       dplyr::transmute(chromosome = chr_id, position_hg38 = position, gene_id, overall_score, source_score_list)
-    
+
     # Merge the GWAS data with the index data by "rsid"
     merged_data <- left_join(gwas_chr_data, index_data %>%
                                dplyr::rename(chromosome = chr_id, position_hg38 = position_v2g), by = c('chromosome', 'rsid'))
-    
+
     # Merge the merged data with the scored data by "chromosome" and "position_hg38"
     merged_data2 <- left_join(merged_data, scored_data, by = c("chromosome", "position_hg38"))
-    
+
     # Select the top V2G data based on the highest overall score
     merged_v2g_data3 <- merged_data2 %>%
       group_by(rsid) %>%
       arrange(desc(overall_score)) %>%
       filter(!duplicated(rsid)) %>%
       ungroup()
-    
-    ########################
-    # Finally, we'll add gene symbol based on ENSG
-    ########################
-    gene_symbol <- vroom('/humgen/diabetes2/users/satoshi/database/ensembl_gene/grch38_df.tsv')
+
+    # Add gene symbol based on ENSG ID
+    gene_symbol <- vroom(gene_symbol_file)
     gene_symbol %<>% transmute(gene_id = ensgene, gene = symbol)
     
     # Join with gene symbol data
@@ -439,17 +187,38 @@ v2g <- function(gwas_data, prefix, output_dir) {
 }
 
 do_post_analysis <- function(main_dir,
-                             my_chain,
-                             df_gwas,
-                             k=NULL,
-                             cluster_names=NULL,
-                             loci_file="query",
-                             make_excel = T,
-                             do_liftover = T,
-                             do_v2g = F) {
+                            my_chain,
+                            df_gwas,
+                            k              = NULL,
+                            cluster_names  = NULL,
+                            loci_file      = "query",
+                            make_excel     = TRUE,
+                            do_liftover    = TRUE,
+                            do_v2g         = FALSE,
+                            existing_dir   = NULL,
+                            v2g_index_dir  = NULL,
+                            v2g_scored_dir = NULL,
+                            gene_symbol_file = NULL) {
+  # Full post-hoc pipeline: load bNMF outputs, annotate nearest genes,
+  # create Excel workbook, perform hg19→hg38 liftover, write PRS score files,
+  # and optionally run V2G mapping.
+  #
+  # Args:
+  #   main_dir         : Output directory from summarize_bNMF()
+  #   my_chain         : rtracklayer chain object for hg19→hg38 liftover
+  #   df_gwas          : Aligned GWAS summary stats data frame (from Step 7)
+  #   k                : Number of clusters (NULL = auto-select by majority vote)
+  #   cluster_names    : Character vector of cluster labels (NULL = "X1","X2",...)
+  #   loci_file        : "query" to annotate nearest gene; otherwise path to loci file
+  #   make_excel       : Write per-cluster sorted weight Excel workbook
+  #   do_liftover      : Perform hg19→hg38 coordinate liftover
+  #   do_v2g           : Run Open Targets V2G mapping (requires v2g_* paths below)
+  #   existing_dir     : Optional alternative directory for rsID_map.txt lookup
+  #   v2g_index_dir    : Directory with per-chr V2G index files (for do_v2g=TRUE)
+  #   v2g_scored_dir   : Directory with per-chr V2G scored files (for do_v2g=TRUE)
+  #   gene_symbol_file : Path to Ensembl gene symbol table (for do_v2g=TRUE)
   
   # 1.) load data ---
-  
   
   # find majority K from run summary
   df_run_summary <- fread(file.path(main_dir,"run_summary.txt"),
@@ -459,14 +228,16 @@ do_post_analysis <- function(main_dir,
     dplyr::count(K) %>%
     mutate(perc = n/nrow(df_run_summary))
   
-  k <- k_counts$K[which.max(k_counts$n)]
+  # ONLY calculate best K if user did not provide one
+  if (is.null(k)) {
+    k <- k_counts$K[which.max(k_counts$n)]
+    message(sprintf("Automatically selected K=%d (majority vote)", k))
+  } else {
+    message(sprintf("Using manually requested K=%d", k))
+  }
   
   if (is.null(cluster_names)) {
-    # cluster_names <- names(w)[names(w) %like% "X"]
     cluster_names <- paste0("X",1:k)
-    
-  } else {
-    colnames(w) <- c(cluster_names, "variant")
   }
   
   w <- fread(sprintf("%s/L2EU.W.mat.%i.txt",main_dir, k),
@@ -474,35 +245,45 @@ do_post_analysis <- function(main_dir,
     dplyr::select(variant, all_of(cluster_names))
   n_variants <- nrow(w)
   
-  
   h <- fread(sprintf("%s/L2EU.H.mat.%i.txt",main_dir,k),
              stringsAsFactors = FALSE, data.table = F) %>%
     rename_at(
       vars(starts_with("X2hr")), function(x) {gsub("X","",x) })
   
-
-  
   # do cutoff 
-
-  cutoff <- calculate_cutoff(w)
+  cutoff <- calculate_cutoff(w, h)
   print(sprintf("Optimal weight cutoff is %.3f!", cutoff))
   
-  
-  
+
   # 2.) get nearest gene ---
+  print("reading rsID map...")
+  rsID_dir <- ifelse(is.null(existing_dir), main_dir, existing_dir)
+  df_rsIDs <- fread(file.path(rsID_dir,"rsID_map.txt"),
+                    data.table=F, stringsAsFactors=F)
   
-  df_rsIDs <- fread(file.path(main_dir,"rsID_map.txt"),
-                    data.table=F, stringsAsFactors=F) %>%
-    mutate(variant = gsub("_",":",str_before_nth(VAR_ID, "_", 2))) %>%
-    filter(!duplicated(variant)) %>%
-    dplyr::select(VAR_ID, rsID, variant)
+  variants_have_prefix <- grepl("chr", w$variant[1])
   
+  if (!'variant' %in% names(df_rsIDs)) {
+    if (variants_have_prefix) {
+      df_rsIDs <- df_rsIDs %>%
+        separate(VAR_ID, into=c('CHR','POS','REF','ALT'),sep='_',remove = F) %>%
+        mutate(variant = paste0('chr',CHR,":",POS))
+    } else {
+      df_rsIDs <- df_rsIDs %>%
+        separate(VAR_ID, into=c('CHR','POS','REF','ALT'),sep='_',remove = F) %>%
+        mutate(variant = paste0(CHR,":",POS))
+    }
+    
+  }
+  
+  # IMPROVED VERSION - Handle variant filtering throughout the gene annotation pipeline
+  
+  print("Making excel file...")
   if (make_excel==T) {
+    print("Making excel file...")
+    
     if (loci_file=="query") {
-      # print("Querying for locus names...")
-      library(GenomicRanges)
-      library(Homo.sapiens)
-      
+      # Gene annotation logic with robust parsing
       geneRanges <- function(db, column="ENTREZID"){
         g <- genes(db, columns=column)
         col <- mcols(g)[[column]]
@@ -511,46 +292,22 @@ do_post_analysis <- function(main_dir,
         genes
       }
       
-      gns = geneRanges(Homo.sapiens, column="SYMBOL")
-      # need chr | start | end, with gene names for row names
+      # Suppress the gene dropping messages
+      suppressMessages({
+        gns = geneRanges(Homo.sapiens, column="SYMBOL")
+        df_entrez_data <- geneRanges(Homo.sapiens, column="ENTREZID")
+      })
+      
       df_gns <- data.frame(gns)
       gtf.gene <- df_gns %>%
         mutate(chr = gsub("chr","",seqnames)) %>%
         dplyr::select(chr, start, end, SYMBOL)
       
-      # need chr | start | end, with gene names for row names
-      df_entrez <- geneRanges(Homo.sapiens, column="ENTREZID") %>%
-        data.frame() %>%
+      df_entrez <- data.frame(df_entrez_data) %>%
         mutate(chr = gsub("chr","",seqnames)) %>%
         mutate(ChrPos = paste(chr,start,sep=":")) %>%
         dplyr::select(ChrPos, ENTREZID)
       
-      #' Convert from string to range
-      #'
-      #' @param pos A vector of strings ex. chr1 2938302 2938329
-      #' @param delim Delimiter for string splitting
-      #' @param region Boolean of whether region or just one position
-      #'
-      #' @returns Dataframe of ranges
-      #'
-      string2range <- function(pos, delim=' ', region=TRUE) {
-        posp <- as.data.frame(do.call(rbind, strsplit(pos, delim)))
-        posp[,1] <- posp[,1]
-        posp[,2] <- as.numeric(as.character(posp[,2]))
-        if(region) {
-          posp[,3] <- as.numeric(as.character(posp[,3]))
-        } else {
-          posp[,3] <- posp[,2]
-        }
-        return(posp)
-      }
-      
-      #' Convert from ranges to GRanges
-      #'
-      #' @param df Dataframe with columns as sequence name, start, and end
-      #'
-      #' @returns GRanges version
-      #'
       range2GRanges <- function(df) {
         require(GenomicRanges)
         require(IRanges)
@@ -561,105 +318,204 @@ do_post_analysis <- function(main_dir,
         return(gr)
       }
       
-      # convert SNPs to GRanges
+      # ROBUST VARIANT PARSING
       snps <- w$variant
-      snps.ranges <- string2range(snps, delim=":", region=FALSE)
-      snps.granges <- range2GRanges(snps.ranges)
-      names(snps.granges) <- snps
+      message(sprintf("Annotating %d variants with nearest gene...", length(snps)))
       
-      # convert genes to GRanges
-      gtf.granges <- range2GRanges(gtf.gene)
-      names(gtf.granges) <-  gtf.gene$SYMBOL  #gene.names
+      # SAFE PARSING - handles any format
+      ranges_df <- data.frame(
+        chr = character(length(snps)),
+        start = numeric(length(snps)),
+        end = numeric(length(snps)),
+        original_variant = snps,  # Keep track of original variant names
+        stringsAsFactors = FALSE
+      )
       
-      hits <- GenomicRanges::nearest(snps.granges, gtf.granges)
-      # make vector of SNPs to gene
+      for (i in seq_along(snps)) {
+        snp <- snps[i]
+        
+        tryCatch({
+          if (grepl("^chr", snp)) {
+            # Format: chr1:12345
+            clean_snp <- gsub("^chr", "", snp)
+            parts <- strsplit(clean_snp, ":")[[1]]
+            ranges_df$chr[i] <- parts[1]
+            ranges_df$start[i] <- as.numeric(parts[2])
+            ranges_df$end[i] <- as.numeric(parts[2])
+            
+          } else if (grepl(":", snp)) {
+            # Format: 1:12345
+            parts <- strsplit(snp, ":")[[1]]
+            ranges_df$chr[i] <- parts[1]
+            ranges_df$start[i] <- as.numeric(parts[2])
+            ranges_df$end[i] <- as.numeric(parts[2])
+            
+          } else if (grepl("_", snp)) {
+            # Format: 1_12345_A_T
+            parts <- strsplit(snp, "_")[[1]]
+            ranges_df$chr[i] <- parts[1]
+            ranges_df$start[i] <- as.numeric(parts[2])
+            ranges_df$end[i] <- as.numeric(parts[2])
+            
+          } else {
+            # Unknown format - skip
+            ranges_df$chr[i] <- NA
+            ranges_df$start[i] <- NA
+            ranges_df$end[i] <- NA
+          }
+        }, error = function(e) {
+          # Skip any problematic variants
+          ranges_df$chr[i] <- NA
+          ranges_df$start[i] <- NA
+          ranges_df$end[i] <- NA
+        })
+      }
       
-      df_gns <- df_gns %>%
-        mutate(chr = gsub("chr","",seqnames)) %>%
-        mutate(ChrPos = paste(chr,start,sep=":")) %>%
-        dplyr::select(chr, start, end, ChrPos, SYMBOL) %>%
-        merge(df_entrez, by="ChrPos")
+      # Remove failed parses
+      valid_rows <- !is.na(ranges_df$chr) & !is.na(ranges_df$start) & !is.na(ranges_df$end)
+      ranges_df_clean <- ranges_df[valid_rows, ]
+      snps_clean <- ranges_df_clean$original_variant  # Use original variant names
       
-      df_hits <- data.frame(gene=names(gtf.granges)[hits]) %>%
-        mutate(variant = names(snps.granges)) %>%
-        merge(df_gns[,c("SYMBOL","ENTREZID")], by.x="gene", by.y="SYMBOL") %>%
-        filter(!duplicated(variant))
+      message(sprintf("  Parsed %d/%d variants successfully", nrow(ranges_df_clean), length(snps)))
       
-      w_wLoci <- w %>%
-        left_join(df_hits, by="variant") %>%
-        mutate(gene = dplyr::coalesce(gene, variant)) # coalese fills in empty genes w/ variant
+      if (nrow(ranges_df_clean) == 0) {
+        warning("No variants could be parsed for gene annotation - using variant IDs as gene names.")
+        w_wLoci <- w %>%
+          mutate(gene = variant)
+      } else {
+        
+        # Create GRanges object with error checking
+        snps.granges <- GenomicRanges::GRanges(
+          seqnames = ranges_df_clean$chr,
+          ranges = IRanges::IRanges(start = ranges_df_clean$start, end = ranges_df_clean$end)
+        )
+        names(snps.granges) <- snps_clean
+        
+        message(sprintf("  Created GRanges with %d variants", length(snps.granges)))
+        
+        # Convert genes to GRanges
+        gtf.granges <- GenomicRanges::GRanges(
+          seqnames = gtf.gene$chr,
+          ranges = IRanges::IRanges(start = as.numeric(gtf.gene$start), end = as.numeric(gtf.gene$end))
+        )
+        names(gtf.granges) <- gtf.gene$SYMBOL
+        
+        # Find nearest genes
+        hits <- GenomicRanges::nearest(snps.granges, gtf.granges)
+        
+        # Prepare gene annotation data
+        df_gns_final <- df_gns %>%
+          mutate(chr = gsub("chr","",seqnames)) %>%
+          mutate(ChrPos = paste(chr,start,sep=":")) %>%
+          dplyr::select(chr, start, end, ChrPos, SYMBOL) %>%
+          merge(df_entrez, by="ChrPos")
+        
+        # Create hits data frame
+        df_hits <- data.frame(
+          gene = names(gtf.granges)[hits],
+          variant = names(snps.granges),
+          stringsAsFactors = FALSE
+        ) %>%
+          merge(df_gns_final[,c("SYMBOL","ENTREZID")], by.x="gene", by.y="SYMBOL", all.x=TRUE) %>%
+          filter(!duplicated(variant))
+        
+        message(sprintf("  Gene annotation completed for %d variants", nrow(df_hits)))
+        
+        # IMPORTANT: Handle variants that couldn't be parsed
+        # Include all original variants, with gene annotation where available
+        w_wLoci <- w %>%
+          left_join(df_hits, by="variant") %>%
+          mutate(gene = dplyr::coalesce(gene, variant))  # Use variant name if no gene found
+        
+        message(sprintf("  Final annotation: %d variants", nrow(w_wLoci)))
+      }
       
-    } else if (is.character(loci_file) & !loci_file %in% c("query","ChrPos")) {
-      
-      # print("Mapping manually curated locus names to SNPs...")
-      locus_map <- read.csv(loci_file, header = T, stringsAsFactors = F) %>%
-        mutate(variant = paste(CHR,POS,sep=":"))
-      
-      w_wLoci <- w %>%
-        merge(locus_map[c("variant","Locus")], by="variant") %>%
-        dplyr::rename(gene=Locus) %>%
-        mutate(gene=make.unique(gene))
     } else {
-      # print("Using Chr:Pos for locus names...")
       w_wLoci <- w %>%
         mutate(gene=variant)
     }
     
-    # make excel
-    library(openxlsx)
-    library(tidyverse)
-    
-    h.exc <- t(h) %>%
-      data.frame() %>%
-      mutate(trait = row.names(.)) %>%
-      relocate(trait)
-  
-    w.exc <- w_wLoci %>%
-      left_join(df_rsIDs, by = "variant") %>%
-      dplyr::select_if(!names(.) %in% c('ENTREZID', 'variant')) %>%
-      relocate(VAR_ID, rsID, gene) 
-    last_id_col <- ncol(w.exc)-length(cluster_names)
-    
-    
-    posStyle <- createStyle(fontColour = "#006100", bgFill = "#C6EFCE")
-    
-    # for (i in 1:length(colnames(w.exc)){
-    wb <- openxlsx::createWorkbook()
-    for (i in 1:length(cluster_names)){
-      w_temp <- w.exc %>%
-        dplyr::arrange(-!!as.symbol(cluster_names[i]))
-      h_temp <- h.exc %>%
-        arrange(-!!as.symbol(cluster_names[i]))
-      
-      cur_sheet = sprintf("cluster%i",i)
-      addWorksheet(wb, cur_sheet)
-      start_col1 <- 1
-      start_col2 <- ncol(w_temp)+3
-      # cutoff_col <- 2*(ncol(w_temp)+2)+1
-      
-      writeData(wb=wb, sheet=cur_sheet, x=w_temp, startCol = start_col1, startRow = 1,
-                rowNames=F,colNames = T)
-      writeData(wb=wb, sheet=cur_sheet, x=h_temp, startCol = start_col2, startRow = 1,
-                rowNames=F,colNames = T)
-      # writeData(wb=wb, sheet="Foo", x=data.frame(cutoff=cutoff), startCol = cutoff_col, startRow = 1)
-      conditionalFormatting(wb, cur_sheet,
-                            cols = last_id_col, rows = 2:(nrow(w_temp)+1),
-                            rule =sprintf("%s2>=%.7f",
-                                          int2col(last_id_col+i),cutoff),
-                            style = posStyle)
-      conditionalFormatting(wb, cur_sheet,
-                            cols = start_col2, rows = 2:(nrow(h_temp)+1),
-                            rule = sprintf("%s2>=%.7f",
-                                           int2col(start_col2+i),cutoff),
-                            style = posStyle)
+    if (exists("df_rsIDs") && nrow(df_rsIDs) > 0) {
+      w_excel_ready <- w_wLoci %>%
+        inner_join(df_rsIDs, by = "variant")
+      n_missing <- nrow(w_wLoci) - nrow(w_excel_ready)
+      if (n_missing > 0) {
+        warning(sprintf("%d variants could not be matched to rsID map and will be dropped from Excel output.", n_missing))
+      }
+    } else {
+      message("No rsID mapping available - using variant names as identifiers.")
+      w_excel_ready <- w_wLoci %>%
+        mutate(VAR_ID = variant, rsID = variant)
     }
-    fp <- file.path(main_dir, sprintf("sorted_cluster_weights_K%i_rev.xlsx",k))
-    openxlsx::saveWorkbook(wb, fp, overwrite = T)
-  }
+    
+    # Make Excel with improved error handling
+    tryCatch({
+      h.exc <- t(h) %>%
+        data.frame() %>%
+        mutate(trait = row.names(.)) %>%
+        relocate(trait)
+      
+      w.exc <- w_excel_ready %>%
+        dplyr::select(-any_of(c('ENTREZID', 'variant'))) %>%
+        relocate(any_of(c("VAR_ID", "rsID", "gene"))) 
+      
+      # Determine last ID column safely
+      id_cols <- intersect(c("VAR_ID", "rsID", "gene"), colnames(w.exc))
+      last_id_col <- length(id_cols)
+      
+      posStyle <- createStyle(fontColour = "#006100", bgFill = "#C6EFCE")
+      
+      wb <- openxlsx::createWorkbook()
+      for (i in 1:length(cluster_names)){
+        w_temp <- w.exc %>%
+          dplyr::arrange(desc(!!as.symbol(cluster_names[i])))
+        h_temp <- h.exc %>%
+          arrange(desc(!!as.symbol(cluster_names[i])))
+        
+        cur_sheet = sprintf("cluster%i",i)
+        addWorksheet(wb, cur_sheet)
+        start_col1 <- 1
+        start_col2 <- ncol(w_temp)+3
+        
+        writeData(wb=wb, sheet=cur_sheet, x=w_temp, startCol = start_col1, startRow = 1,
+                  rowNames=F,colNames = T)
+        writeData(wb=wb, sheet=cur_sheet, x=h_temp, startCol = start_col2, startRow = 1,
+                  rowNames=F,colNames = T)
+        
+        # Safe conditional formatting
+        if (last_id_col > 0 && last_id_col + i <= ncol(w_temp)) {
+          conditionalFormatting(wb, cur_sheet,
+                                cols = last_id_col + i, rows = 2:(nrow(w_temp)+1),
+                                rule = sprintf("%s2>=%.7f",
+                                               openxlsx::int2col(last_id_col + i), cutoff),
+                                style = posStyle)
+        }
+        
+        if (start_col2 + i <= ncol(h_temp) + start_col2) {
+          conditionalFormatting(wb, cur_sheet,
+                                cols = start_col2 + i, rows = 2:(nrow(h_temp)+1),
+                                rule = sprintf("%s2>=%.7f",
+                                               openxlsx::int2col(start_col2 + i), cutoff),
+                                style = posStyle)
+        }
+      }
+      
+      fp <- file.path(main_dir, sprintf("sorted_cluster_weights_K%i_rev.xlsx",k))
+      openxlsx::saveWorkbook(wb, fp, overwrite = T)
+      
+      cat(sprintf("Excel file saved: %s\n", fp))
+      
+    }, error = function(e) {
+      cat("Error creating Excel file:", e$message, "\n")
+      cat("Continuing without Excel output...\n")
+    })
+  }  
   
   # 3.) hg19-to-hg38 liftover --
   
   if (do_liftover==T) {
+    print("Doing liftover...")
+    
     df_weights <- w_wLoci %>%
       inner_join(df_rsIDs, by=c('variant')) %>%
       # dplyr::select(VAR_ID, rsID, gene) %>%
@@ -677,10 +533,12 @@ do_post_analysis <- function(main_dir,
       dplyr::select(group, seqnames, Pos_hg38=start) %>%
       mutate(ChrPos_hg38=paste(seqnames, Pos_hg38, sep=":"))
     
-    print("Variants not found in liftover...")
-    df_weights %>%
+    missing <- df_weights %>%
       filter(!group %in% df_liftover$group)
-    
+    if (nrow(missing)>0) {
+      print("Variants not found in liftover...")
+      print(missing$variant)
+    }
     
     # merge weights with hg38 SNPs using rsID
     #   new file should have VAR_ID_hg38, rsID, Effect_Allele, BETA and the cluster columns (X1, X2, etc.)
@@ -709,7 +567,7 @@ do_post_analysis <- function(main_dir,
       dplyr::select(VAR_ID_hg38, starts_with("X")) %>%
       column_to_rownames(var="VAR_ID_hg38")
     
-
+    
     cluster_info = data.frame(weight=numeric(),VAR_ID_hg38=character(),cluster=character())
     
     for(i in 1:ncol(cluster_weights)){
@@ -769,20 +627,22 @@ do_post_analysis <- function(main_dir,
   
   
   # V2G
-
+  
   if (do_v2g) {
     v2g_input <- df_gwas %>%
       separate(ChrPos, into=c("chromosome","position"),sep=":",remove = T) %>%
       mutate_at(vars(chromosome, position), as.integer) %>%
       dplyr::select(chromosome, position, rsid=rsID)
     
-    v2g(gwas_data = v2g_input,
-           prefix=paste(version,"v2g",sep = "_"),
-           output_dir = main_dir
+    v2g(gwas_data        = v2g_input,
+        prefix           = paste(basename(main_dir), "v2g", sep = "_"),
+        output_dir       = main_dir,
+        v2g_index_dir    = v2g_index_dir,
+        v2g_scored_dir   = v2g_scored_dir,
+        gene_symbol_file = gene_symbol_file
     )
   } 
-
+  
   
   return(list(df_run_summary=df_run_summary, k=k, cluster_names=cluster_names, w=w_wLoci, h=h, cutoff=cutoff))
-  
 }

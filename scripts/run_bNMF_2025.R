@@ -1,8 +1,29 @@
+# =============================================================================
+# run_bNMF_2025.R
+# =============================================================================
+# Core Bayesian NMF (bNMF) functions for clustering genetic variants by their
+# multi-trait GWAS association profiles.
+#
+# Functions:
+#   BayesNMF.L2EU()       — Bayesian NMF with L2 norm / Euclidean distance
+#                           (ARD prior for automatic cluster number selection)
+#   run_bNMF()            — Run bNMF sequentially for n_reps repetitions
+#   run_bNMF_parallel()   — Run bNMF in parallel using furrr/future
+#   summarize_bNMF()      — Summarize K distribution and write W/H matrices + plots
+#   test_phi_values()     — Sensitivity analysis across phi regularization values
+#
+# Usage:
+#   Call run_bNMF_parallel() on the output of prep_z_matrix(). Then pass the
+#   result to summarize_bNMF() to write outputs, followed by do_post_analysis()
+#   in post_bNMF_2025.R.
+#
+#   Parallel workers are configured via plan() from the future package.
+#   Example: plan(multisession, workers = 8)
+# =============================================================================
+
 library(tidyverse)
 library(furrr)
-library(progressr)
-library(rtracklayer)
-library(vroom)
+
 ##########################################################################
 # Copyright (c) 2017, Broad Institute
 # Redistribution and use in source and binary forms, with or without
@@ -49,9 +70,24 @@ library(vroom)
 
 BayesNMF.L2EU <- function(
     V0, n.iter=10000, a0=10, tol=1e-7, K=15, K0=15, phi=1.0,
-    window_size=25, min_iter=100  # New parameters for convergence monitoring
+    window_size=25, min_iter=100
 ) {
-  # ... existing initial comments ...
+  # Bayesian NMF with L2/Euclidean divergence and ARD prior.
+  #
+  # Factorizes V ≈ W %*% H, where clusters with low lambda (relevance) are
+  # pruned automatically. The number of active clusters at convergence is the
+  # inferred K.
+  #
+  # Args:
+  #   V0          : Non-negative input matrix (variants x traits, or the 2M expanded form)
+  #   n.iter      : Maximum number of update iterations
+  #   a0          : Hyperparameter for the ARD gamma prior
+  #   tol         : Convergence tolerance on relative lambda change
+  #   K           : Initial (maximum) number of clusters
+  #   K0          : Prior expectation for number of active clusters (sets b0)
+  #   phi         : Regularization strength (noise variance scaling)
+  #   window_size : Rolling window for early-stopping error check
+  #   min_iter    : Minimum iterations before early stopping is evaluated
   
   eps <- 1.e-50
   del <- 1.0
@@ -165,36 +201,6 @@ BayesNMF.L2EU <- function(
   ))
 }
 
-# Function to test multiple phi values
-test_phi_values <- function(V0, phi_values = c(1.0, 2.0, 5.0, 10.0), n_reps = 10, ...) {
-  results <- list()
-  
-  for (phi in phi_values) {
-    cat(sprintf("\nTesting phi = %g\n", phi))
-    
-    best_solution <- NULL
-    best_error <- Inf  # Initialize with a high error value
-    
-    for (i in 1:n_reps) {
-      result <- BayesNMF.L2EU(V0, phi = phi, ...)
-      
-      # Assume the function returns an error metric, e.g., result$error
-      if (result[["n.error"]] < best_error) {  # Use double brackets to extract numeric value
-        best_solution <- result
-        best_error <- result[["n.error"]]
-      }
-    }
-    
-    results[[as.character(phi)]] <- best_solution
-  }
-  
-  return(results)
-}
-# Example usage:
-# phi_test_results <- test_phi_values(V0, phi_values=c(1.0, 2.0, 5.0, 10.0))
-# print(phi_test_results$comparison)
-
-
 
 run_bNMF <- function(z_mat, n_reps=10, random_seed=1, K=20, K0=10, tolerance=1e-7, phi=1) {
   
@@ -209,7 +215,6 @@ run_bNMF <- function(z_mat, n_reps=10, random_seed=1, K=20, K0=10, tolerance=1e-
   bnmf_reps <- lapply(1:n_reps, function(r) {
     print(paste("ITERATION",r))
     res <- BayesNMF.L2EU(V0 = z_mat, K=K, K0=K0, tol=tolerance, phi=phi)
-    # names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
     res
   })
   bnmf_reps
@@ -232,11 +237,9 @@ run_bNMF_parallel <- function(z_mat, n_reps = 10, random_seed = 1, K = 20, K0 = 
     
     # Run the Bayesian NMF function and store the result
     res <- BayesNMF.L2EU(V0 = z_mat, K = K, K0 = K0, tol = tolerance, phi=phi)
-    # names(res) <- c("W", "H", "n.like", "n.evid", "n.lambda", "n.error")
-    
-    return(res)  # Explicitly return `res` from the function
+    return(res)
   },
-  .options = furrr_options(seed = random_seed)  # Set the seed to a specific number
+  .options = furrr_options(seed = TRUE)   # let furrr handle per-worker seeds
   )
   
   return(bnmf_reps)
@@ -370,4 +373,35 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
     ggsave(paste0(dir_save,"H_plot_K", k, ".pdf"), plot=H_plt)
   })
 }
+
+# Function to test multiple phi values
+test_phi_values <- function(V0, phi_values = c(1.0, 2.0, 5.0, 10.0), n_reps = 10, ...) {
+  results <- list()
+  
+  for (phi in phi_values) {
+    cat(sprintf("\nTesting phi = %g\n", phi))
+    
+    best_solution <- NULL
+    best_error <- Inf  # Initialize with a high error value
+    
+    for (i in 1:n_reps) {
+      result <- BayesNMF.L2EU(V0, phi = phi, ...)
+
+      # Extract the final (converged) reconstruction error
+      final_error <- result$n.error[[length(result$n.error)]]
+      if (!is.null(final_error) && final_error < best_error) {
+        best_solution <- result
+        best_error    <- final_error
+      }
+    }
+    
+    results[[as.character(phi)]] <- best_solution
+  }
+  
+  return(results)
+}
+# Example usage:
+# phi_test_results <- test_phi_values(V0, phi_values=c(1.0, 2.0, 5.0, 10.0))
+# print(phi_test_results$comparison)
+
 

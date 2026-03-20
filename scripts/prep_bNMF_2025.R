@@ -1,264 +1,537 @@
+# =============================================================================
+# prep_bNMF_2025.R
+# =============================================================================
+# Helper functions for fetching GWAS summary statistics and preparing the
+# z-score matrix used as input to the bNMF clustering algorithm.
+#
+# Functions:
+#   peek_headers()          — Read column names from the first line of a file (gz-aware)
+#   read_single_trait_dt()  — Fetch and align summary stats for one trait via grep/tabix
+#   fetch_summary_stats()   — Fetch and align summary stats across all traits; returns z- and N-matrices
+#   prep_z_matrix()         — Filter traits, prune by correlation, scale z-scores, expand to non-negative form
+#   fill_missing_zscores()  — (legacy) Fill missing z-scores using proxy variants
+#
+# Assumptions:
+#   - Input variants use "Chr:Pos" (colon-separated) as the standard SNP key
+#   - Trait summary stat files contain at minimum: a SNP ID column, BETA, SE
+#   - Genome build: hg19/GRCh37
+# =============================================================================
+
 library(tidyverse)
 library(data.table)
-library(dplyr)
+library(future.apply)
+library(stringr)
 
-
-fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss_size=NULL, pval_cutoff=1, read_trait_method = "datatable") {
-  
-  # Given a final (pruned & proxied) set of variants to be clustered, 
-  # fetch z-scores and sample size info from summary statistics for each of a 
-  # series of traits
-  # INPUTS:
-  #   - variant_vec: vector of variants to be clustered
-  #   - gwas_ss: filepath of  with VAR_IDs and betas from the original GWAS
-  #   - trait_ss_vec: named vector of trait summary statistic filepaths
-  # Final variant vector should be in VAR_ID format: [CHR]_[POS]_[REF]_[ALT] (using hg19)
-  # GWAS summary statistic data frame must have at least the following 
-  # columns: SNP (CHR:POS), REF, ALT, BETA
-  # Each trait summary statistic dataset must have the following 
-  # columns: VAR_ID, Effect_Allele_PH, BETA, SE, P_VALUE, N_PH
-  
-  # ISSUES:
-  # - potential for strand-flip?
-  
-
-  read_single_trait_dt <- function(trait, read_trait_input) {
-    message(sprintf("Processing %s...", trait))
-    
-    # Read the header line (as a character vector)
-    header_line <- readLines(trait_ss_files[[trait]], n = 1)
-    headers <- strsplit(header_line, "\t")[[1]]
-    
-    # Read the filtered data from the trait file using an external grep command.
-    # (Assumes that "all_snps_pos.tmp" contains your list of VAR_ID values in the same format as in the file.)
-    cmd_str <- if (endsWith(trait_ss_files[[trait]], ".gz")) {
-      sprintf("gzip -cd %s | grep -Ff %s", trait_ss_files[[trait]], tmp_var_file)
-    } else {
-      sprintf("grep -Ff %s %s", tmp_var_file, trait_ss_files[[trait]])
-    }
-    
-    # Use fread to read the results from the command into a data.table.
-    dt <- fread(cmd = cmd_str, header = FALSE, col.names = headers, stringsAsFactors = FALSE)
-
-        # If the trait_ss_size for this trait is available, assign it to column N_PH.
-    if (!is.na(trait_ss_size[[trait]])) {
-      dt[, N_PH := trait_ss_size[[trait]]]
-    }
-    
-    # If no rows were found, create a dummy data.table.
-    if (nrow(dt) == 0) {
-      dt <- data.table(VAR_ID = NA, BETA = NA, SE = NA, P_VALUE = NA, N = NA)
-    }
-    
-    # Rename columns as needed. (Note: data.table's setnames is used here.)
-    # Our rename mapping: VAR_ID -> VAR_ID_hg19, N_PH -> N, BETA -> beta, SE -> se,
-    # P_VALUE -> FTOP_p_value_meta, z -> Zscore. (The duplicate mapping for "z" is ignored.)
-
-    rename_map <- list("VAR_ID_hg19"="VAR_ID", "N" = "N_PH", "beta" = "BETA",
-                       "se" = "SE", "FTOP_p_value_meta" = "P_VALUE", "Zscore" = "z")
-    for (old in names(rename_map)) {
-      if (old %in% names(dt)) {
-        setnames(dt, old, rename_map[[old]])
-      }
-    }
-    
-    # Remove duplicates based on VAR_ID_hg19.
-    dt <- unique(dt, by = "VAR_ID")
-    
-    # Separate VAR_ID into CHR, POS, REF, ALT using tstrsplit.
-    dt[, c("CHR", "POS", "REF", "ALT") := tstrsplit(VAR_ID, "_", fixed = TRUE)]
-    
-    # Create the SNP column as "CHR:POS".
-    dt[, SNP := paste0(CHR, ":", POS)]
-    
-    # Create Effect_Allele_PH: if the column exists, leave it; otherwise, set to ALT.
-    if (!("Effect_Allele_PH" %in% names(dt))) {
-      dt[, Effect_Allele_PH := ALT]
-    }
-    
-    # Keep only the necessary columns.
-    keep_cols <- c("SNP", "Effect_Allele_PH", "REF", "ALT", "N_PH", "BETA", "SE", "P_VALUE", "z")
-    keep_cols <- keep_cols[keep_cols %in% names(dt)]
-    dt <- dt[, ..keep_cols]
-    
-    # Perform a right join with read_trait_input on "SNP".
-    # Ensure that both dt and read_trait_input are data.tables keyed by "SNP".
-    setkey(dt, SNP)
-    setkey(read_trait_input, SNP)
-    dt <- read_trait_input[dt]  # This is equivalent to a right join: all rows from dt, matched to read_trait_input.
-    
-    # Filter rows where concatenated alleles match:
-    # Keep rows where paste0(REF, ALT) equals either paste0(Risk_Allele, Nonrisk_Allele)
-    # or paste0(Nonrisk_Allele, Risk_Allele). (Risk_Allele and Nonrisk_Allele come from read_trait_input.)
-    dt[, allele_combo := paste0(REF, ALT)]
-    dt <- dt[(allele_combo == paste0(Risk_Allele, Nonrisk_Allele)) | 
-               (allele_combo == paste0(Nonrisk_Allele, Risk_Allele))]
-    
-    # Adjust P_VALUE: if P_VALUE is zero, replace with minimum nonzero value.
-    if (any(dt$P_VALUE == 0, na.rm = TRUE)) {
-      min_val <- min(dt$P_VALUE[dt$P_VALUE > 0], na.rm = TRUE)
-      dt[P_VALUE == 0, P_VALUE := min_val]
-    }
-    
-    # If the Zscore column is missing or all NA, compute it as beta/se (after replacing zeros in se).
-    if (!("Zscore" %in% names(dt)) || all(is.na(dt$Zscore))) {
-      if (any(dt$SE == 0, na.rm = TRUE)) {
-        min_se <- min(dt$SE[dt$SE > 0], na.rm = TRUE)
-        dt[SE == 0, SE := min_se]
-      }
-      dt[, z := BETA / SE]
-    }
-    
-    # Align Zscore sign based on effect allele:
-    # If Effect_Allele_PH equals Risk_Allele then keep Zscore;
-    # if equals Nonrisk_Allele then flip sign; otherwise set to NA.
-    dt[, z := ifelse(Effect_Allele_PH == Risk_Allele, z,
-                          ifelse(Effect_Allele_PH == Nonrisk_Allele, -z, NA_real_))]
-    
-    # Keep only the desired columns and rename as needed.
-    dt <- dt[, .(SNP, z , N_PH, P_VALUE)]
-    
-    # Ensure P_VALUE is numeric.
-    dt[, P_VALUE := as.numeric(P_VALUE)]
-    
-    # Remove rows with any missing values.
-    dt <- na.omit(dt)
-    
-    return(dt)
-  }
-  
-  
-  
-  print("Reading original GWAS summary statistics...")
-  variant_vec <- df_input$VAR_ID
-  tmp_var_file <- "variants_to_query.tmp"
-  
-  print("Writing initials SNPs to file for grepping...")
-  writeLines(variant_vec, tmp_var_file)
-  
-  
-  if (class(gwas_ss_file)=="character"){
-    
-    print("Reading headers...")
-    headers <- as.character(fread(gwas_ss_file, nrows=1,
-                                  data.table=F, stringsAsFactors=F, header=F))
-    print(headers)
-    
-    print("Grepping file...")
-    if (endsWith(gwas_ss_file,".gz")) {
-      gwas_ss <- fread(cmd = sprintf("gzip -cd %s | grep -Ff variants_to_query.tmp", gwas_ss_file),
-                       header=F, col.names=headers,
-                       data.table = FALSE, stringsAsFactors = FALSE)
-      
-    } else {
-      gwas_ss <- fread(cmd = sprintf("fgrep -Fwf variants_to_query.tmp %s", gwas_ss_file),
-                       header=F, col.names=headers,
-                       data.table = FALSE, stringsAsFactors = FALSE)
-    }
-
-    file.remove(tmp_var_file)
+# Helper: safe read of column headers from a file (supports .gz)
+peek_headers <- function(filepath) {
+  if (endsWith(filepath, ".gz")) {
+    hdr <- readLines(gzfile(filepath), n = 1)
   } else {
-    # input dataframe with VAR_ID, P_VALUE, SNP, Risk_Allele, Nonrisk_Allel
-    gwas_ss <- gwas_ss_file %>%
-      filter(VAR_ID %in% variant_vec)
+    hdr <- readLines(filepath, n = 1)
+  }
+  strsplit(trimws(hdr), "\\s+")[[1]]
+}
+
+# Rewritten, robust read_single_trait_dt
+read_single_trait_dt <- function(trait,
+                                 read_trait_input,
+                                 trait_ss_files,
+                                 trait_ss_size = NULL,
+                                 tmp_var_file = "variants_to_query.tmp") {
+  
+  message(sprintf("Processing %s...", trait))
+  
+  # ---- 0. Basic checks ----
+  if (!trait %in% names(trait_ss_files)) {
+    stop("trait not found in trait_ss_files")
+  }
+  trait_file <- trait_ss_files[[trait]]
+  
+  # ---- 1. Inspect trait file header to detect ID column ----
+  headers <- peek_headers(trait_file)
+  id_col_in_file <- if ("SNP" %in% headers) "SNP" else if ("VAR_ID" %in% headers) "VAR_ID" else NULL
+  if (is.null(id_col_in_file)) {
+    message(sprintf("  No SNP or VAR_ID column found in %s", trait))
+    return(NULL)
+  }
+  
+  # ---- 2. Input format detection (from read_trait_input$SNP) ----
+  # Ensure read_trait_input is a data.table
+  if (!is.data.table(read_trait_input)) read_trait_input <- as.data.table(read_trait_input)
+  
+  input_snps <- read_trait_input$SNP
+  if (length(input_snps) == 0) {
+    message("  No input SNPs provided")
+    return(NULL)
+  }
+  sample_input <- input_snps[1]
+  
+  input_has_chr_prefix        <- grepl("^chr", sample_input, ignore.case = TRUE)
+  input_is_chrpos_colon       <- grepl("^(chr)?\\d+:\\d+$", sample_input, ignore.case = TRUE)
+  input_is_chrpos_underscore  <- grepl("^\\d+_\\d+$", sample_input)
+  input_is_varid              <- grepl("^\\d+_\\d+_[ACGT]+_[ACGT]+$", sample_input, ignore.case = FALSE)
+  
+  message(sprintf("  Input format: chr_prefix=%s, colon=%s, underscore=%s, varid=%s",
+                  input_has_chr_prefix, input_is_chrpos_colon, input_is_chrpos_underscore, input_is_varid))
+  
+  # ---- 3. Build search_snps to match trait file format ----
+  # We'll create a vector search_snps that maps 1:1 to input_snps (original -> search)
+  search_snps <- input_snps
+  
+  # If trait uses VAR_ID, we want "CHR_POS" (no alleles)
+  # If trait uses colon format, we want "chrN:pos" or "N:pos" according to trait prefix
+  # If trait uses underscore format, we want "N_pos"
+  # We'll detect trait sample to know what's needed
+  # Read a tiny sample from trait file to detect its ID style
+  sample_trait_id <- fread(cmd = if (endsWith(trait_file, ".gz")) sprintf("gzip -cd %s | head -n 5", trait_file) else sprintf("head -n 5 %s", trait_file),
+                           select = id_col_in_file, data.table = FALSE, showProgress = FALSE)[1,1]
+  
+  trait_has_chr_prefix       <- grepl("^chr", sample_trait_id, ignore.case = TRUE)
+  trait_is_chrpos_colon      <- grepl("^(chr)?\\d+:\\d+$", sample_trait_id, ignore.case = TRUE)
+  trait_is_chrpos_underscore <- grepl("^\\d+_\\d+$", sample_trait_id)
+  trait_is_varid             <- grepl("^\\d+_\\d+_[ACGT]+_[ACGT]+$", sample_trait_id)
+  
+  message(sprintf("  Trait file format (%s): chr_prefix=%s, colon=%s, underscore=%s, varid=%s",
+                  id_col_in_file, trait_has_chr_prefix, trait_is_chrpos_colon, trait_is_chrpos_underscore, trait_is_varid))
+  message(sprintf("  Sample from trait file: %s", sample_trait_id))
+  
+  # Convert input -> search format
+  # Start from canonical forms derived from input:
+  # - make chr_pos_underscore: "1_12345"
+  # - make chr_pos_colon: "1:12345" (optionally "chr1:12345")
+  canonical_underscore <- if (input_is_chrpos_colon) gsub(":", "_", gsub("^chr", "", input_snps, ignore.case = TRUE)) else if (input_is_chrpos_underscore) input_snps else if (input_is_varid) sub("_[ACGT]+_[ACGT]+$", "", input_snps) else input_snps
+  canonical_colon      <- gsub("_", ":", canonical_underscore)
+  canonical_chr_colon  <- ifelse(grepl("^chr", input_snps, ignore.case = TRUE), gsub("_", ":", input_snps), paste0("chr", canonical_colon))
+  
+  if (trait_is_varid) {
+    # trait uses VAR_ID: search should be chr_pos_underscore without alleles (e.g., "1_2189477")
+    search_snps <- canonical_underscore
+  } else if (trait_is_chrpos_colon) {
+    # trait uses colon. Respect trait prefix preference
+    if (trait_has_chr_prefix) {
+      # needs "chr1:12345"
+      # If input lacks "chr", add it
+      search_snps <- ifelse(grepl("^chr", canonical_colon, ignore.case = TRUE), canonical_colon, paste0("chr", canonical_colon))
+    } else {
+      # needs "1:12345" (no chr)
+      search_snps <- canonical_colon
+    }
+  } else if (trait_is_chrpos_underscore) {
+    # trait uses underscore format "1_12345"
+    search_snps <- canonical_underscore
+  } else {
+    # fallback: try matching exact input if nothing detected
+    search_snps <- input_snps
+  }
+  
+  # Map original -> search
+  snp_mapping <- data.table(original_snp = input_snps, search_snp = search_snps)
+  
+  message(sprintf("  Converted search terms. Example: %s -> %s",
+                  snp_mapping$original_snp[1], snp_mapping$search_snp[1]))
+  
+  # Write mapping to temp file used by grep (overwriting tmp_var_file)
+  # Caller may already have written one, but make sure it's the correct set for this trait.
+  writeLines(unique(snp_mapping$search_snp), tmp_var_file)
+  
+  # ---- 4. Grep/read trait file for matches ----
+  cmd_str <- if (endsWith(trait_file, ".gz")) {
+    sprintf("gzip -cd %s | grep -Ff %s", trait_file, tmp_var_file)
+  } else {
+    sprintf("grep -Ff %s %s", tmp_var_file, trait_file)
+  }
+  
+  dt <- tryCatch({
+    # read with names from header (we already peeked headers)
+    fread(cmd = cmd_str, header = FALSE, col.names = headers, data.table = TRUE, showProgress = FALSE)
+  }, error = function(e) {
+    message("  Grep returned no results or fread failed: ", e$message)
+    return(data.table())
+  })
+  
+  if (nrow(dt) == 0) {
+    message(sprintf("  No SNP matches found for %s", trait))
+    return(NULL)
+  }
+  message(sprintf("  Found %d rows after grep", nrow(dt)))
+  
+  # ---- 5. Harmonize column names EARLY ----
+  # Standard allele column canonicalization: use EA and NEA internally
+  if ("Effect_Allele_PH" %in% names(dt)) setnames(dt, "Effect_Allele_PH", "EA")
+  if ("Effect_Allele"    %in% names(dt)) setnames(dt, "Effect_Allele", "EA")
+  if ("effect_allele"    %in% names(dt)) setnames(dt, "effect_allele", "EA")
+  if ("A1" %in% names(dt) && !("EA" %in% names(dt))) setnames(dt, "A1", "EA")
+  
+  if ("NEA" %in% names(dt)) {
+    # ok
+  } else if ("A2" %in% names(dt)) {
+    setnames(dt, "A2", "NEA")
+  }
+  
+  # Standardize P/BETA/SE names
+  if ("p" %in% names(dt)) setnames(dt, "p", "P_VALUE")
+  if ("pval" %in% names(dt)) setnames(dt, "pval", "P_VALUE")
+  if ("N" %in% names(dt) && !("N_PH" %in% names(dt))) setnames(dt, "N", "N_PH")
+  if ("Effect" %in% names(dt) && !("BETA" %in% names(dt))) setnames(dt, "Effect", "BETA")
+  
+  # ---- 6. Extract NEA from VAR_ID if missing ----
+  if (!"NEA" %in% names(dt)) {
+    if ("VAR_ID" %in% names(dt)) {
+      
+      # VAR_ID format: CHR_POS_REF_ALT
+      tmp_cols <- tstrsplit(dt$VAR_ID, "_", fixed = TRUE)
+      
+      if (length(tmp_cols) < 4) {
+        message("  ERROR: VAR_ID does not have 4 fields for ", trait)
+        return(NULL)
+      }
+      
+      dt[, chr_from_varid := tmp_cols[[1]]]
+      dt[, pos_from_varid := tmp_cols[[2]]]
+      dt[, ref_from_varid := tmp_cols[[3]]]
+      dt[, alt_from_varid := tmp_cols[[4]]]
+      
+      # assign NEA based on EA vs ref/alt
+      if ("EA" %in% names(dt)) {
+        dt[, NEA := fifelse(toupper(EA) == toupper(ref_from_varid), alt_from_varid,
+                            fifelse(toupper(EA) == toupper(alt_from_varid), ref_from_varid, NA_character_))]
+      } else {
+        dt[, NEA := alt_from_varid]
+      }
+      
+      # chr_pos key
+      dt[, varid_chrpos_us := paste0(chr_from_varid, "_", pos_from_varid)]
+    } else {
+      message("  ERROR: No NEA column and no VAR_ID to extract from")
+      return(NULL)
+    }
+  }  
+  # ---- 7. Build match_key on trait dt so we can join back to original search names ----
+  # If trait file uses VAR_ID, match_key should be chr_pos underscore
+  if (id_col_in_file == "VAR_ID" || trait_is_varid) {
+    # prefer varid_chrpos_us if present, else try to derive from CHR+POS columns
+    if ("varid_chrpos_us" %in% names(dt)) {
+      dt[, match_key := varid_chrpos_us]
+    } else if (all(c("CHR", "POS") %in% names(dt))) {
+      dt[, match_key := paste0(CHR, "_", POS)]
+    } else {
+      # last resort: derive from VAR_ID
+      if ("VAR_ID" %in% names(dt)) {
+        dt[, match_key := sub("_[^_]+_[^_]+$", "", VAR_ID)]  # drop _REF_ALT
+      } else {
+        dt[, match_key := NA_character_]
+      }
+    }
+  } else {
+    # trait uses explicit SNP column (could be chr:pos or chr_pos or rsID)
+    dt[, match_key := get(id_col_in_file)]
+  }
+  
+  # ---- 8. Join dt to mapping table to restore original input SNP IDs ----
+  setDT(snp_mapping)
+  setkey(snp_mapping, search_snp)
+  dt_merged <- dt[snp_mapping, on = .(match_key = search_snp), nomatch = 0]
+  dt <- copy(dt_merged)
+  setnames(dt, "original_snp", "SNP")
+  
+  # ───── SPECIAL HANDLING: GLGC / older consortia with no EA/NEA columns ─────
+  if (!"EA" %in% names(dt) && "VAR_ID" %in% names(dt)) {
+    message("  No EA column found → assuming GLGC/old-consortium format (effect = 2nd allele in VAR_ID)")
+    dt[, c("ref_glgc", "alt_glgc") := tstrsplit(sub("^[^_]+_[^_]+_", "", VAR_ID), "_", fixed = FALSE)]
+    dt[, EA  := alt_glgc]
+    dt[, NEA := ref_glgc]
+    dt[, c("ref_glgc", "alt_glgc") := NULL]
+  }
+  
+  # Check row count using dt, not dt_merged
+  if (nrow(dt) == 0) {
+    message(sprintf("  No SNPs matched after key mapping for %s", trait))
+    return(NULL)
+  }
+  
+  
+  # ---- 9. Ensure EA/NEA and BETA/SE present and consistent ----
+  # At this stage, dt has EA and NEA (either originally or via VAR_ID extraction)
+  if (!"EA" %in% names(dt)) {
+    message(sprintf("  ERROR: No EA present for %s", trait))
+    return(NULL)
+  }
+  if (!"NEA" %in% names(dt)) {
+    message(sprintf("  ERROR: No NEA present for %s", trait))
+    return(NULL)
+  }
+  
+  # Remove rows where EA==NEA
+  dt <- dt[toupper(EA) != toupper(NEA)]
+  if (nrow(dt) == 0) return(NULL)
+  
+  # Standardize sample size column
+  # Convert vector first — scalar := coerces to existing column type, so type must be fixed first
+  if ("N_PH" %in% names(dt)) dt[, N_PH := as.numeric(N_PH)]
+  if (!is.null(trait_ss_size) && trait %in% names(trait_ss_size) && !is.na(trait_ss_size[[trait]])) {
+    dt[, N_PH := as.numeric(trait_ss_size[[trait]])]
+  } else if (!"N_PH" %in% names(dt)) {
+    dt[, N_PH := NA_real_]
+  }
+  
+  # Standardize P_VALUE column numeric
+  if ("P_VALUE" %in% names(dt)) {
+    dt[, P_VALUE := as.numeric(P_VALUE)]
+  } else if ("pval" %in% names(dt)) {
+    dt[, P_VALUE := as.numeric(pval)]
+  }
+  
+  # Standardize BETA/SE
+  if (!("BETA" %in% names(dt)) || !("SE" %in% names(dt))) {
+    message(sprintf("  Cannot compute z-score for %s without BETA/SE", trait))
+    return(NULL)
+  }
+  dt[, SE := as.numeric(SE)]
+  dt[, BETA := as.numeric(BETA)]
+  
+  # fix SE==0
+  if (any(dt$SE == 0, na.rm = TRUE)) {
+    min_pos_se <- min(dt$SE[dt$SE > 0], na.rm = TRUE)
+    dt[SE == 0, SE := min_pos_se]
+  }
+  
+  # ---- 10. Join with read_trait_input (gwas input alleles) to get Risk/Nonrisk alleles ----
+  # ---- 10. Join with read_trait_input (gwas input alleles) to get Risk/Nonrisk alleles ----
+  if (!all(c("Risk_Allele", "Nonrisk_Allele") %in% names(read_trait_input))) {
+    stop("read_trait_input must have Risk_Allele and Nonrisk_Allele")
+  }
+  
+  # FIX: Ensure both dt and read_trait_input have matching SNP formats
+  dt_has_chr <- grepl("^chr", dt$SNP[1], ignore.case = TRUE)
+  input_has_chr <- grepl("^chr", read_trait_input$SNP[1], ignore.case = TRUE)
+  
+  message(sprintf("  SNP format check: dt has chr=%s, input has chr=%s", 
+                  dt_has_chr, input_has_chr))
+  
+  # Standardize to match read_trait_input format
+  if (dt_has_chr && !input_has_chr) {
+    message("  Removing 'chr' prefix from dt SNPs to match input")
+    dt[, SNP := gsub("^chr", "", SNP, ignore.case = TRUE)]
+  } else if (!dt_has_chr && input_has_chr) {
+    message("  Adding 'chr' prefix to dt SNPs to match input")
+    dt[, SNP := paste0("chr", SNP)]
+  }
+  
+  # Convert to data.table and join
+  if (!is.data.table(dt)) dt <- as.data.table(dt)
+  if (!is.data.table(read_trait_input)) read_trait_input <- as.data.table(read_trait_input)
+  
+  dt <- dt[read_trait_input, on = "SNP", nomatch = 0]
+
+  if (nrow(dt) == 0) {
+    message(sprintf("  No SNPs after joining with input for %s", trait))
+    return(NULL)
+  }
+  message(sprintf("  %d SNPs after joining with input", nrow(dt)))
+  
+  # ---- 11. Allele matching (unordered pair equality) ----
+  dt[, trait_alleles := paste0(pmin(toupper(EA), toupper(NEA)), "_", pmax(toupper(EA), toupper(NEA)))]
+  dt[, gwas_alleles  := paste0(pmin(toupper(Risk_Allele), toupper(Nonrisk_Allele)), "_", pmax(toupper(Risk_Allele), toupper(Nonrisk_Allele)))]
+  
+  message(sprintf("  Before allele matching: %d SNPs", nrow(dt)))
+  message(sprintf("  Sample trait_alleles: %s", dt$trait_alleles[1]))
+  message(sprintf("  Sample gwas_alleles: %s", dt$gwas_alleles[1]))
+  matches <- sum(dt$trait_alleles == dt$gwas_alleles, na.rm = TRUE)
+  message(sprintf("  Allele matches: %d", matches))
+  
+  dt <- dt[trait_alleles == gwas_alleles]
+  if (nrow(dt) == 0) {
+    message(sprintf("  No SNPs with matching alleles found for %s", trait))
+    return(NULL)
+  }
+  
+  # ---- 12. Compute z and orient to Risk_Allele ----
+  dt[, z := BETA / SE]
+  
+  # If Effect allele equals Risk_Allele then z as-is, else flip sign
+  dt[, z := ifelse(toupper(EA) == toupper(Risk_Allele), z,
+                   ifelse(toupper(NEA) == toupper(Risk_Allele), -z, NA_real_))]
+  
+  dt <- dt[, .(SNP, z, N_PH, P_VALUE)]
+  dt[, P_VALUE := as.numeric(P_VALUE)]
+
+  n_z_na <- sum(is.na(dt$z))
+  if (n_z_na > 0)
+    warning(sprintf("[%s]: Dropping %d rows where z is NA (missing BETA or SE).", trait, n_z_na))
+  dt <- dt[!is.na(z)]
+
+  if (nrow(dt) > 0 && all(is.na(dt$N_PH)))
+    warning(sprintf(paste0("[%s]: N_PH is NA for all rows. Provide sample size via trait_ss_size ",
+                           "in the config Excel, or add an 'N' column to the formatted summary ",
+                           "stats file. The N matrix for this trait will use NA."), trait))
+
+  message(sprintf("  Final: %d SNPs for %s", nrow(dt), trait))
+  
+  # Clean up temporaries if present
+  cols_to_drop <- intersect(c("ref_from_varid", "alt_from_varid", "chr_from_varid", "pos_from_varid", "varid_chrpos_us", "trait_alleles", "gwas_alleles"), names(dt))
+  if (length(cols_to_drop)) dt[, (cols_to_drop) := NULL]
+  
+  return(dt)
+}
+
+fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss_size = NULL, pval_cutoff = 1) {
+  
+  # GOAL: Fetches and aligns summary statistics using "Chr:Pos" as the standard SNP identifier.
+  #
+  # ASSUMPTIONS:
+  #   - df_input: A data frame with 'SNP' (Chr:Pos format), 'Risk_Allele', 'REF', and 'ALT' columns.
+  #   - gwas_ss_file: Can be a file path or a data frame.
+  #     - If a data frame, it must contain 'SNP', 'REF', 'ALT', 'BETA', and 'P_VALUE' columns.
+  #     - If a file, it must be searchable by 'SNP' (Chr:Pos) and contain the same required columns.
+  #   - trait_ss_files: A named vector of filepaths. Each file must have 'SNP', 'EA', 'NEA', 'BETA', etc.
+  #
+  # OUTPUT: A list containing:
+  #   - df_z: A data frame of aligned Z-scores (SNPs x Traits).
+  #   - df_N: A data frame of sample sizes (SNPs x Traits).
+  #   - df_gwas: The filtered and formatted data from the primary GWAS.
+  
+
+  # -------------------------------------------------------------------------- #
+  # Main Function Body
+  # -------------------------------------------------------------------------- #
+  
+  # --- 1. Process Primary GWAS ---
+  
+  print("Writing SNP list (chr:pos) to file for grepping...")
+  tmp_var_file <- "variants_to_query.tmp"
+  writeLines(df_input$SNP, tmp_var_file)
+  
+  if (is.character(gwas_ss_file)) {
+    print("Reading primary GWAS summary statistics from file...")
+    headers <- as.character(fread(gwas_ss_file, nrows = 1, data.table = F, header = F))
+    cmd_grep <- if (endsWith(gwas_ss_file, ".gz")) {
+      sprintf("gzip -cd %s | grep -Fwf %s", gwas_ss_file, tmp_var_file)
+    } else {
+      sprintf("grep -Fwf %s %s", gwas_ss_file, tmp_var_file)
+    }
+    gwas_ss <- fread(cmd = cmd_grep, header = F, col.names = headers, data.table = FALSE, stringsAsFactors = FALSE)
+  } else {
+    print("Filtering pre-loaded primary GWAS data frame...")
+    gwas_ss <- gwas_ss_file %>% filter(SNP %in% df_input$SNP)
+    
   }
 
-  print(sprintf("%i of %i SNPs found in main GWAS...", nrow(gwas_ss), nrow(df_input)))
-  print(head(gwas_ss))
-  
-  if (!all(c("SNP","Risk_Allele","Nonrisk_Allele") %in% names(gwas_ss))){
-    print("Separating VAR_ID...")
-    gwas_ss <- gwas_ss %>%
-      separate(VAR_ID, into=c("Chr","Pos","REF","ALT"), sep = "_", remove = F)
-    
-    if (!"BETA" %in% colnames(gwas_ss)){
-      # print("Converting Odds Ratio to Log Odds Ratio...")
-      gwas_ss <- gwas_ss %>%
-        mutate(BETA = log(ODDS_RATIO))
+  print(sprintf("%i of %i SNPs found in primary GWAS.", nrow(gwas_ss), nrow(df_input)))
+
+  # Standardize primary GWAS: Derive Risk/Non-risk Alleles from BETA, REF, and ALT
+  if (!all(c("Risk_Allele", "Nonrisk_Allele") %in% names(gwas_ss))) {
+    print("Standardizing primary GWAS: Deriving Risk/Non-risk Alleles...")
+    if (!"BETA" %in% colnames(gwas_ss) && "ODDS_RATIO" %in% colnames(gwas_ss)) {
+      gwas_ss <- gwas_ss %>% mutate(BETA = log(ODDS_RATIO))
     }
-    # print("Creating SNP and Risk Allele columns...")
+
+
+    required_cols <- c("REF", "ALT", "BETA")
+    if(!all(required_cols %in% names(gwas_ss))){
+      stop(paste("Primary GWAS is missing required columns for standardization:", paste(setdiff(required_cols, names(gwas_ss)), collapse=", ")))
+    }
+    
     gwas_ss <- gwas_ss %>%
-      mutate(SNP = paste(Chr,Pos,sep=":")) %>%
-      mutate(Risk_Allele=ifelse(BETA > 0, ALT, REF),
-             Nonrisk_Allele=ifelse(BETA > 0, REF, ALT))
-  } 
+      mutate(
+        Risk_Allele = if_else(BETA > 0, ALT, REF),
+        Nonrisk_Allele = if_else(BETA > 0, REF, ALT)
+      )
+  }
   
-  my_vars <- c('SNP', 'ALT', 'REF', 'Risk_Allele', 'Nonrisk_Allele', 'P_VALUE', 'BETA', 'SE', 'z')
-  gwas_ss <- gwas_ss %>%
-    select(any_of(my_vars))
-  
-  print("Merging formatted GWAS with final variant vector...")
-  
-  print("Rename risk_allelel to Risk_Allele_Orig...")
-  
+  # --- 2. Merge with Input and Filter SNPs ---
   df_input_wGWAS <- df_input %>%
-    dplyr::rename(Risk_Allele_Orig=Risk_Allele) %>%
-    separate(VAR_ID, into=c("CHR", "POS", "REF", "ALT"), sep="_") %>%
-    mutate(SNP=paste(CHR, POS, sep=":")) %>%
+    dplyr::rename(Risk_Allele_Orig = Risk_Allele) %>%
     select(SNP, Risk_Allele_Orig) %>%
-    inner_join(gwas_ss, by="SNP") %>%
-    mutate_at(vars(P_VALUE),as.numeric)
+    inner_join(gwas_ss, by = "SNP") %>%
+    mutate(across(any_of("P_VALUE"), as.numeric)) %>%
+    mutate(P_VALUE = if_else(P_VALUE == 0, .Machine$double.xmin, P_VALUE))
   
-  print(paste0(nrow(df_input_wGWAS), " of ", length(variant_vec)," variants are available in the primary GWAS."))
-  print(sprintf("Max p-value in primary GWAS: %.3e", max(df_input_wGWAS$P_VALUE)))
+  print(paste0(nrow(df_input_wGWAS), " variants available after merging with primary GWAS."))
   
-  pval_bonf <- 0.05/nrow(df_input_wGWAS)
-  
-  opp_risk <- df_input_wGWAS %>%
-    filter(between(P_VALUE, pval_bonf, pval_cutoff) & Risk_Allele != Risk_Allele_Orig)
-  print(sprintf("%i variants with opposite risk allele and above Bonferroni cutoff...", nrow(opp_risk)))
-  
-  high_pval <- df_input_wGWAS %>%
-    filter(P_VALUE > pval_cutoff)
-  print(sprintf("%i variants above absolute p-value cutoff...", nrow(high_pval)))
-  
+  pval_bonf <- 0.05 / nrow(df_input_wGWAS)
+  opp_risk <- df_input_wGWAS %>% filter(between(P_VALUE, pval_bonf, pval_cutoff) & Risk_Allele != Risk_Allele_Orig)
+  high_pval <- df_input_wGWAS %>% filter(P_VALUE > pval_cutoff)
   uniq_to_drop <- unique(c(opp_risk$SNP, high_pval$SNP))
-  print(sprintf("%i unique variants being dropped due to risk allele or p-value...", length(uniq_to_drop)))
   
   df_input_wGWAS_filtered <- df_input_wGWAS %>%
-    filter(P_VALUE < pval_bonf | between(P_VALUE, pval_bonf, pval_cutoff) & Risk_Allele == Risk_Allele_Orig)
-  print(sprintf("%i variants after p-value and risk allele filter...", nrow(df_input_wGWAS_filtered)))
+    filter(!SNP %in% uniq_to_drop)
   
-  df_read_trait_input <- df_input_wGWAS_filtered %>% 
+  print(sprintf("%i variants remain after p-value and risk allele filtering.", nrow(df_input_wGWAS_filtered)))
+  
+  df_read_trait_input <- df_input_wGWAS_filtered %>%
     dplyr::select(SNP, Risk_Allele, Nonrisk_Allele) %>%
     as.data.table()
-  print(paste(nrow(df_read_trait_input), "remaining SNPs after p-value filtering"))
   
-  print("Writing final SNPs to file for grepping...")
-  writeLines(gsub(":","_",df_read_trait_input$SNP), tmp_var_file)
-
-  print("Retrieving z-scores and sample sizes for each trait...")
-
-  # run read_single_trait
-  trait_df_list <- lapply(names(trait_ss_files), read_single_trait_dt, df_read_trait_input) %>%
-    setNames(names(trait_ss_files)) %>%
-    bind_rows(.id="trait")  # Bind all processed trait datasets into a single "long" data frame
-
-  z_df_wide <- trait_df_list %>%
-    select(trait, SNP, z) %>%
-    pivot_wider(names_from="trait", values_from="z")
-  z_mat <- as.matrix(z_df_wide[, -1])
-  rownames(z_mat) <- z_df_wide$SNP
-
-  N_df_wide <- trait_df_list %>%
-    select(trait, SNP, N_PH) %>%
-    pivot_wider(names_from="trait", values_from="N_PH")
-  N_mat <- as.matrix(N_df_wide[, -1])
-  rownames(N_mat) <- N_df_wide$SNP
-
-  system(paste("rm",tmp_var_file))
-
-  df_z <- data.frame(z_mat) %>%
-    set_colnames(names(trait_ss_files))
-  df_N <- data.frame(N_mat) %>%
-    set_colnames(names(trait_ss_files))
-
-  print("Do all REF/ALT alleles match risk alleles?")
-  print(all(with(df_input_wGWAS_filtered, paste0(Risk_Allele, Nonrisk_Allele)==paste0(REF, ALT) |
-                   paste0(Risk_Allele, Nonrisk_Allele)==c(paste0(ALT, REF)))))
+  writeLines(df_read_trait_input$SNP, tmp_var_file)
+  
+  # --- 3. Process All Trait Files ---
+  # 1. Run lapply on the trait names. This creates an UNNAMED list.
+  list_of_results <- lapply(names(trait_ss_files), function(trait) {
+    read_single_trait_dt(
+      trait = trait,
+      read_trait_input = df_read_trait_input,
+      trait_ss_files = trait_ss_files,
+      trait_ss_size = trait_ss_size,
+      tmp_var_file = tmp_var_file
+    )
+  })
+  
+  # 2. *** THE FIX: Immediately set the names of the list ***
+  #    This ensures the list is correctly named before any other step.
+  names(list_of_results) <- names(trait_ss_files)
+  
+  # 3. Now, the rest of the logic will work correctly.
+  #    Filter out any NULL results from failed traits.
+  valid_results_list <- Filter(Negate(is.null), list_of_results)
+  
+  # 4. Bind the rows. It now receives a named list.
+  trait_df_list <- bind_rows(valid_results_list, .id = "trait")
+  
+  print(head(trait_df_list))
+  # --- 4. Consolidate and Return Output ---
+  if (nrow(trait_df_list) > 0) {
+    
+    trait_order <- names(trait_ss_files) 
+    trait_df_list$trait <- factor(trait_df_list$trait, levels = trait_order)
+    
+    # Pivot Z-scores
+    z_df_wide <- trait_df_list %>%
+      select(trait, SNP, z) %>%
+      # ADD THIS BLOCK to ensure each SNP/trait is unique before pivoting
+      group_by(trait, SNP) %>% 
+      dplyr::slice(1) %>% 
+      ungroup() %>%
+      pivot_wider(names_from = "trait", values_from = "z")
+    
+    z_mat <- as.matrix(z_df_wide[, -1])
+    rownames(z_mat) <- z_df_wide$SNP
+    
+    # Pivot Sample Sizes (your existing code for this is correct)
+    N_df_wide <- trait_df_list %>%
+      select(trait, SNP, N_PH) %>%
+      group_by(trait, SNP) %>% 
+      dplyr::slice(1) %>% 
+      ungroup() %>%
+      pivot_wider(names_from = "trait", values_from = "N_PH")
+    
+    N_mat <- as.matrix(N_df_wide[, -1])
+    rownames(N_mat) <- N_df_wide$SNP
+    
+    df_z <- as.data.frame(z_mat)
+    df_N <- as.data.frame(N_mat)
+    
+  } else {
+    print("No overlapping SNPs with matching alleles found in any trait files. Returning empty data frames.")
+    df_z <- data.frame(matrix(ncol = length(trait_ss_files), nrow = 0, dimnames = list(NULL, names(trait_ss_files))))
+    df_N <- data.frame(matrix(ncol = length(trait_ss_files), nrow = 0, dimnames = list(NULL, names(trait_ss_files))))
+  }
+  
+  file.remove(tmp_var_file)
   print("Done!")
-  return(list(df_z=df_z, df_N=df_N, df_gwas=df_input_wGWAS_filtered))
+  return(list(df_z = df_z, df_N = df_N, df_gwas = df_input_wGWAS_filtered))
 }
+
+
 
 
 
@@ -321,29 +594,6 @@ prep_z_matrix <- function(z_mat, N_mat,
                   collapse="\n"),sep=":\n"))
   z_mat <- z_mat[, traits_kept]
 
-  # 3.) Remove traits with low variance and low SNR
-  # Compute variance and median absolute z-score for each trait.
-  trait_variances <- apply(z_mat, 2, function(x) var(x, na.rm = TRUE))
-  trait_median_abs <- apply(z_mat, 2, function(x) median(abs(x), na.rm = TRUE))
-  
-  # Compute a simple SNR: median absolute / variance (you could use MAD instead)
-  trait_snr <- trait_median_abs / trait_variances
-  
-  # Set thresholds—these thresholds need to be tuned based on your data.
-  variance_threshold <- 1
-  snr_threshold <- 1  # for example
-  
-  # Identify traits to keep: keep if variance is above the threshold or if SNR is high.
-  traits_to_keep <- names(z_mat)[(trait_variances >= variance_threshold) | (trait_snr >= snr_threshold) ]
-  traits_to_remove <- names(z_mat)[!names(z_mat) %in% traits_to_keep]
-  z_mat <- z_mat[, traits_to_keep]
-  
-  cat("Traits removed for low variance/SNR:", paste(traits_to_remove, collapse = "\n"), "\n")
-  df_traits_filtered <- rbind(df_traits_filtered,
-                              data.frame(trait = traits_to_remove,
-                                         result = "removed (low signal)",
-                                         note = NA)
-  )
   
   # 4.) Prune traits by correlation (remove traits with Pearson |r| > 0.85)
   cat(sprintf("\n\nPrune traits by correlation (remove traits with Pearson |r| > %.2f)\n",
@@ -442,8 +692,8 @@ prep_z_matrix <- function(z_mat, N_mat,
     final_z_mat <- z_mat
   }
   
-  output <- list(final_z_mat=final_z_mat,
-                 df_traits=df_traits_filtered)
+  return(list(final_z_mat = final_z_mat,
+              df_traits   = df_traits_filtered))
 }
 
 
@@ -648,4 +898,179 @@ fill_missing_zscores <- function(initial_zscore_matrices,
     replace(x, is.na(x), median(x, na.rm = TRUE)))
 
   list(z_mat=z_mat_cover_med, N_mat=N_mat_cover_med, proxy_df=df_covers_merged, z_mat_covers)
+}
+
+
+prep_z_matrix_wProteins <- function(z_mat, N_mat,
+                                    corr_cutoff=0.85,
+                                    keep_my_traits=NULL,
+                                    rm_traits=NULL,
+                                    pval_cutoff=NULL,
+                                    nonneg=T,
+                                    protein_cols=NULL,          
+                                    filter_concentrated_proteins=TRUE,  
+                                    concentration_threshold=75,  
+                                    block_reweight=TRUE,        
+                                    target_protein_ratio=1.2,
+                                    z_cap=12) {  # Added z_cap argument
+  
+  # Standard P-value filtering setup
+  z_mat_orig <- z_mat
+  if (is.null(pval_cutoff)){
+    pval_cutoff <- 0.05 / nrow(z_mat) 
+  }
+  
+  df_traits_filtered <- data.frame(trait=as.character(), result=as.character(), note=as.character())
+  
+  # 1. Remove manual traits
+  if (!is.null(rm_traits)) {
+    z_mat <- z_mat[, !colnames(z_mat) %in% rm_traits]
+    df_traits_filtered <- rbind(df_traits_filtered, 
+                                data.frame(trait=rm_traits, result="removed (manual)", note=NA))
+  }
+  
+  # ---------------------------------------------------------
+  # NEW STEP 1: WINSORIZATION (Apply immediately)
+  # ---------------------------------------------------------
+  if (!is.null(z_cap)) {
+    cat(sprintf("\n\nWinsorizing Z-scores at +/- %.2f\n", z_cap))
+    n_capped <- sum(abs(z_mat) > z_cap, na.rm = TRUE)
+    cat(sprintf("Capping %d values (%.2f%% of matrix)\n", 
+                n_capped, 100 * n_capped / prod(dim(z_mat))))
+    
+    # Cap values while preserving sign
+    z_mat[z_mat > z_cap] <- z_cap
+    z_mat[z_mat < -z_cap] <- -z_cap
+  }
+  # ---------------------------------------------------------
+  
+  # 2. Filter by P-value
+  minP_vec <- apply(z_mat, 2, function(x) min(2 * pnorm(abs(x), lower.tail=F), na.rm=T))
+  traits_kept <- colnames(z_mat)[minP_vec < pval_cutoff]
+  
+  # Log removed traits
+  removed_p <- setdiff(colnames(z_mat), traits_kept)
+  if(length(removed_p) > 0) {
+    df_traits_filtered <- rbind(df_traits_filtered, 
+                                data.frame(trait=removed_p, result="removed (p-value)", note=paste0("<", pval_cutoff)))
+  }
+  z_mat <- z_mat[, traits_kept]
+  
+  # 3. Prune by Correlation
+  cat(sprintf("\nPruning traits by correlation (|r| > %.2f)\n", corr_cutoff))
+  trait_cor_mat <- cor(z_mat, use="pairwise.complete.obs")
+  
+  # Sort priorities by max Z (magnitude of signal)
+  remaining_traits <- names(sort(apply(z_mat, 2, max, na.rm=T), decreasing = T))
+  keep_traits <- c()
+  
+  while (length(remaining_traits) > 0) {
+    curr <- remaining_traits[1]
+    keep_traits <- c(keep_traits, curr)
+    
+    # Find correlates
+    cor_vals <- trait_cor_mat[curr, remaining_traits]
+    to_remove <- names(cor_vals)[abs(cor_vals) >= corr_cutoff & names(cor_vals) != curr]
+    
+    if (length(to_remove) > 0) {
+      df_traits_filtered <- rbind(df_traits_filtered,
+                                  data.frame(trait=to_remove, result="removed (correlation)", 
+                                             note=paste("correlated w/", curr)))
+    }
+    remaining_traits <- setdiff(remaining_traits, c(curr, to_remove))
+  }
+  
+  # Restore any manually kept traits
+  final_keep <- unique(c(keep_traits, intersect(keep_my_traits, colnames(z_mat))))
+  z_mat <- z_mat[, final_keep]
+  
+  # 4. Sample Size Adjustment
+  cat("\nPerforming sample size adjustment...\n")
+  medN_vec <- apply(N_mat[, colnames(z_mat)], 2, median, na.rm=T)
+  z_mat <- z_mat / sqrt(N_mat[, colnames(z_mat)]) * mean(sqrt(medN_vec))
+  z_mat[is.na(z_mat)] <- 0
+  
+  # ---------------------------------------------------------
+  # NEW STEP 2: PROTEIN CONCENTRATION FILTER
+  # ---------------------------------------------------------
+  protein_filtering_results <- NULL
+  if (!is.null(protein_cols) && filter_concentrated_proteins) {
+    cat("\nChecking for hyper-concentrated proteins...\n")
+    
+    current_prots <- intersect(protein_cols, colnames(z_mat))
+    
+    if (length(current_prots) > 0) {
+      # Calculate concentration metrics
+      prot_metrics <- data.frame(protein = current_prots, top1_pct = NA_real_)
+      
+      for (i in 1:nrow(prot_metrics)) {
+        p <- prot_metrics$protein[i]
+        vals <- z_mat[, p]^2 # Use squared signal
+        total_signal <- sum(vals)
+        if (total_signal > 0) {
+          prot_metrics$top1_pct[i] <- 100 * max(vals) / total_signal
+        } else {
+          prot_metrics$top1_pct[i] <- 0
+        }
+      }
+      
+      to_remove <- prot_metrics$protein[prot_metrics$top1_pct > concentration_threshold]
+      
+      if (length(to_remove) > 0) {
+        cat(sprintf("Removing %d proteins with >%d%% signal in 1 SNP\n", length(to_remove), concentration_threshold))
+        z_mat <- z_mat[, !colnames(z_mat) %in% to_remove]
+        
+        df_traits_filtered <- rbind(df_traits_filtered,
+                                    data.frame(trait=to_remove, result="removed (concentration)", 
+                                               note=paste0("top1 > ", concentration_threshold, "%")))
+      }
+    }
+  }
+  
+  # 5. Expand to Non-Negative
+  if (nonneg) {
+    z_mat_pos <- z_mat; z_mat_pos[z_mat_pos < 0] <- 0
+    colnames(z_mat_pos) <- paste0(colnames(z_mat), "_pos")
+    
+    z_mat_neg <- -z_mat; z_mat_neg[z_mat_neg < 0] <- 0
+    colnames(z_mat_neg) <- paste0(colnames(z_mat), "_neg")
+    
+    final_z_mat <- cbind(z_mat_pos, z_mat_neg)
+  } else {
+    final_z_mat <- z_mat
+  }
+  
+  # ---------------------------------------------------------
+  # NEW STEP 3: BLOCK REWEIGHTING (Post-Expansion)
+  # ---------------------------------------------------------
+  block_reweighting_results <- NULL
+  if (!is.null(protein_cols) && block_reweight) {
+    
+    # Identify columns (handling _pos/_neg suffixes)
+    all_cols <- colnames(final_z_mat)
+    is_prot <- grepl(paste(protein_cols, collapse="|"), all_cols) & 
+      !grepl(paste(setdiff(colnames(z_mat_orig), protein_cols), collapse="|"), all_cols)
+    
+    prot_cols_final <- all_cols[is_prot]
+    trait_cols_final <- all_cols[!is_prot]
+    
+    if (length(prot_cols_final) > 0 && length(trait_cols_final) > 0) {
+      frob_p <- sqrt(sum(final_z_mat[, prot_cols_final]^2))
+      frob_t <- sqrt(sum(final_z_mat[, trait_cols_final]^2))
+      
+      # Calculate scalar weight
+      w <- (frob_t * target_protein_ratio) / frob_p
+      
+      cat(sprintf("\nReweighting Proteins: Traits=%.1f, Prots=%.1f -> Applying weight %.2f\n", 
+                  frob_t, frob_p, w))
+      
+      final_z_mat[, prot_cols_final] <- final_z_mat[, prot_cols_final] * w
+      
+      block_reweighting_results <- list(weight=w, frob_trait=frob_t, frob_prot_orig=frob_p)
+    }
+  }
+  
+  return(list(final_z_mat=final_z_mat, 
+              df_traits=df_traits_filtered,
+              block_reweighting=block_reweighting_results))
 }
