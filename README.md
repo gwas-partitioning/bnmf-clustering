@@ -37,8 +37,10 @@ Sample input files are provided in `example_data/` to illustrate the expected fo
 **Summary statistics columns** (required): `VAR_ID`, `Effect_Allele_PH`, `P_VALUE`, and either `BETA`+`SE` or `ODDS_RATIO`. An `N_PH` (sample size) column is optional — sample sizes can also be supplied via the manifest Excel file.
 
 **GWAS manifest (Excel):** The pipeline is configured via a two-sheet Excel workbook:
-* **`main_gwas` sheet** — one row per GWAS study for the primary trait being clustered. Required columns: `study`, `trait`, `population`, `full_path` (path to summary stats file), `largest` (`Yes` for the study used to define the variant set).
+* **`main_gwas` sheet** — one row per GWAS study for the primary trait being clustered. Required columns: `study`, `trait`, `population` (used together to build a per-study ID and to group studies for multi-ancestry LD pruning), `full_path` (path to summary stats file), `largest` (`Yes` for the study used to define the variant set; `No` otherwise).
 * **`trait_gwas` sheet** — one row per additional trait used to characterize clusters. Required columns: `trait`, `full_path`, `sample_size`. Z-scores for each variant are computed from each trait's summary stats.
+
+Only `full_path` is read for the file location. The `root_path` and `file` helper columns in the example are optional bookkeeping — in the example workbook `full_path` is simply their concatenation, written out as a plain string so it can be read without Excel recalculating any formulas.
 
 See `example_data/clustering_data_source_example.xlsx` for a working example of this format.
 

@@ -53,8 +53,8 @@ working_dir <- getwd()  # or set explicitly, e.g. "/path/to/project"
 # Pipeline version label (used for output directory and checkpoint filenames)
 version <- "my_trait_v1"
 
-# Path to the GWAS manifest Excel file (see clustering_data_source_template.xlsx for template)
-gwas_file <- file.path(working_dir, "clustering_data_source_template.xlsx")
+# Path to the GWAS manifest Excel file (see example_data/clustering_data_source_example.xlsx for the expected format)
+gwas_file <- file.path(working_dir, "clustering_data_source_example.xlsx")
 
 # Directory for helper R scripts (choose_variants, prep_bNMF, run_bNMF, post_bNMF)
 scripts_dir <- working_dir

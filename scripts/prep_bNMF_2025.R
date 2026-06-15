@@ -352,6 +352,10 @@ read_single_trait_dt <- function(trait,
   dt[, z := ifelse(toupper(EA) == toupper(Risk_Allele), z,
                    ifelse(toupper(NEA) == toupper(Risk_Allele), -z, NA_real_))]
   
+  if (!"P_VALUE" %in% names(dt)) {
+    message(sprintf("  No P_VALUE in source — deriving from z-score for %s", trait))
+    dt[, P_VALUE := 2 * pnorm(-abs(z))]
+  }
   dt <- dt[, .(SNP, z, N_PH, P_VALUE)]
   dt[, P_VALUE := as.numeric(P_VALUE)]
 
@@ -374,7 +378,7 @@ read_single_trait_dt <- function(trait,
   return(dt)
 }
 
-fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss_size = NULL, pval_cutoff = 1) {
+fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss_size = NULL, pval_cutoff = 1, checkpoint_dir = NULL) {
   
   # GOAL: Fetches and aligns summary statistics using "Chr:Pos" as the standard SNP identifier.
   #
@@ -465,15 +469,37 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   writeLines(df_read_trait_input$SNP, tmp_var_file)
   
   # --- 3. Process All Trait Files ---
+  if (!is.null(checkpoint_dir))
+    dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
+
   # 1. Run lapply on the trait names. This creates an UNNAMED list.
   list_of_results <- lapply(names(trait_ss_files), function(trait) {
-    read_single_trait_dt(
-      trait = trait,
-      read_trait_input = df_read_trait_input,
-      trait_ss_files = trait_ss_files,
-      trait_ss_size = trait_ss_size,
-      tmp_var_file = tmp_var_file
+    cp_file <- if (!is.null(checkpoint_dir))
+      file.path(checkpoint_dir, paste0(gsub("[^A-Za-z0-9_.-]", "_", trait), ".rds"))
+    else NULL
+
+    if (!is.null(cp_file) && file.exists(cp_file)) {
+      message(sprintf("  [checkpoint] %s", trait))
+      return(readRDS(cp_file))
+    }
+
+    result <- tryCatch(
+      read_single_trait_dt(
+        trait = trait,
+        read_trait_input = df_read_trait_input,
+        trait_ss_files = trait_ss_files,
+        trait_ss_size = trait_ss_size,
+        tmp_var_file = tmp_var_file
+      ),
+      error = function(e) {
+        message(sprintf("  SKIPPING %s (error): %s", trait, conditionMessage(e)))
+        NULL
+      }
     )
+
+    if (!is.null(cp_file)) saveRDS(result, cp_file)
+
+    result
   })
   
   # 2. *** THE FIX: Immediately set the names of the list ***
@@ -491,7 +517,7 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   # --- 4. Consolidate and Return Output ---
   if (nrow(trait_df_list) > 0) {
     
-    trait_order <- names(trait_ss_files) 
+    trait_order <- unique(names(trait_ss_files))
     trait_df_list$trait <- factor(trait_df_list$trait, levels = trait_order)
     
     # Pivot Z-scores
