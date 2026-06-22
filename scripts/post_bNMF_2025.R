@@ -126,7 +126,7 @@ v2g <- function(gwas_data, prefix, output_dir,
   #   gene_symbol_file : Path to Ensembl gene symbol table (grch38_df.tsv)
   #                      with columns: ensgene, symbol.
   #
-  # Returns: writes <prefix>.v2g.tsv.gz to output_dir; returns NULL invisibly.
+  # Returns: writes <prefix>.v2g.tsv.gz to output_dir; returns all_combine invisibly.
 
   if (is.null(v2g_index_dir) || is.null(v2g_scored_dir) || is.null(gene_symbol_file)) {
     stop("v2g() requires v2g_index_dir, v2g_scored_dir, and gene_symbol_file to be specified.")
@@ -135,45 +135,52 @@ v2g <- function(gwas_data, prefix, output_dir,
   # Sanitize prefix for file naming
   prefix <- gsub("[^a-zA-Z0-9_-]", "_", prefix)
 
+  # Read gene symbols once (not per-chromosome)
+  gene_symbol <- vroom(gene_symbol_file, show_col_types = FALSE) %>%
+    transmute(gene_id = ensgene, gene = symbol)
+
+  chrs_present <- sort(unique(gwas_data$chromosome))
   all_combine <- data.frame()
-  for (chr in 1:22) {
+  for (chr in chrs_present) {
     cat('Working on chr', chr, '\n')
 
-    # Use a temporary variable to avoid modifying gwas_data in place
     gwas_chr_data <- gwas_data %>% filter(chromosome == chr)
 
-    # Load the index data for the current chromosome
+    # Read index; filter to only rsIDs in our variant set
+    our_rsids <- gwas_chr_data$rsid
     index_file <- file.path(v2g_index_dir, sprintf("chr%d.v2g_index.tsv.gz", chr))
-    index_data <- vroom(index_file) %>%
-      dplyr::rename(position_v2g = position, rsid = rs_id)
+    index_data <- vroom(index_file, show_col_types = FALSE) %>%
+      dplyr::rename(position_v2g = position, rsid = rs_id) %>%
+      filter(rsid %in% our_rsids)
 
-    # Load the scored data for the current chromosome
+    # Use matched hg38 positions to filter the 97M-row scored file via shell
+    our_positions <- unique(index_data$position_v2g)
     scored_file <- file.path(v2g_scored_dir, sprintf("chr%d.v2g_scored.tsv.gz", chr))
-    scored_data <- vroom(scored_file) %>%
-      dplyr::transmute(chromosome = chr_id, position_hg38 = position, gene_id, overall_score, source_score_list)
+    if (length(our_positions) > 0) {
+      pos_pattern <- paste(our_positions, collapse = "|")
+      scored_data <- vroom(
+        pipe(sprintf("gzip -dc '%s' | awk -F'\\t' 'NR==1 || ($2~/^(%s)$/)'", scored_file, pos_pattern)),
+        show_col_types = FALSE
+      ) %>%
+        dplyr::transmute(chromosome = chr_id, position_hg38 = position, gene_id, overall_score, source_score_list)
+    } else {
+      scored_data <- data.frame(chromosome = integer(), position_hg38 = integer(),
+                                gene_id = character(), overall_score = numeric(),
+                                source_score_list = character())
+    }
 
-    # Merge the GWAS data with the index data by "rsid"
-    merged_data <- left_join(gwas_chr_data, index_data %>%
-                               dplyr::rename(chromosome = chr_id, position_hg38 = position_v2g), by = c('chromosome', 'rsid'))
-
-    # Merge the merged data with the scored data by "chromosome" and "position_hg38"
+    merged_data <- left_join(gwas_chr_data,
+                             index_data %>% dplyr::rename(chromosome = chr_id, position_hg38 = position_v2g),
+                             by = c('chromosome', 'rsid'))
     merged_data2 <- left_join(merged_data, scored_data, by = c("chromosome", "position_hg38"))
 
-    # Select the top V2G data based on the highest overall score
     merged_v2g_data3 <- merged_data2 %>%
       group_by(rsid) %>%
       arrange(desc(overall_score)) %>%
       filter(!duplicated(rsid)) %>%
       ungroup()
 
-    # Add gene symbol based on ENSG ID
-    gene_symbol <- vroom(gene_symbol_file)
-    gene_symbol %<>% transmute(gene_id = ensgene, gene = symbol)
-    
-    # Join with gene symbol data
     combine_df <- left_join(merged_v2g_data3, gene_symbol, by = 'gene_id')
-    
-    # Append to all_combine using bind_rows for better performance
     all_combine <- bind_rows(all_combine, combine_df)
   }
   
@@ -184,6 +191,7 @@ v2g <- function(gwas_data, prefix, output_dir,
   new_file = paste0(prefix, '.v2g.tsv.gz')
   write_tsv(all_combine, file = file.path(output_dir, new_file))
   print("Done with V2G!")
+  return(invisible(all_combine))
 }
 
 do_post_analysis <- function(main_dir,
@@ -250,10 +258,26 @@ do_post_analysis <- function(main_dir,
     rename_at(
       vars(starts_with("X2hr")), function(x) {gsub("X","",x) })
   
-  # do cutoff 
+  # do cutoff
   cutoff <- calculate_cutoff(w, h)
   print(sprintf("Optimal weight cutoff is %.3f!", cutoff))
-  
+
+  # 1b.) Run V2G early so gene assignments are available for Excel output
+  v2g_result <- NULL
+  if (do_v2g) {
+    v2g_input <- df_gwas %>%
+      separate(ChrPos, into = c("chromosome", "position"), sep = ":", remove = TRUE) %>%
+      mutate_at(vars(chromosome, position), as.integer) %>%
+      dplyr::select(chromosome, position, rsid = rsID)
+    v2g_result <- v2g(
+      gwas_data        = v2g_input,
+      prefix           = paste(basename(main_dir), "v2g", sep = "_"),
+      output_dir       = main_dir,
+      v2g_index_dir    = v2g_index_dir,
+      v2g_scored_dir   = v2g_scored_dir,
+      gene_symbol_file = gene_symbol_file
+    )
+  }
 
   # 2.) get nearest gene ---
   print("reading rsID map...")
@@ -447,7 +471,18 @@ do_post_analysis <- function(main_dir,
       w_excel_ready <- w_wLoci %>%
         mutate(VAR_ID = variant, rsID = variant)
     }
-    
+
+    # Rename nearest gene column; join OpenTargets V2G gene if available
+    w_excel_ready <- w_excel_ready %>%
+      dplyr::rename(Nearest_Gene = gene)
+    if (!is.null(v2g_result)) {
+      v2g_genes <- v2g_result %>%
+        dplyr::select(rsID = rsid, OpenTargets_Gene = gene) %>%
+        dplyr::filter(!is.na(OpenTargets_Gene))
+      w_excel_ready <- w_excel_ready %>%
+        left_join(v2g_genes, by = "rsID")
+    }
+
     # Make Excel with improved error handling
     tryCatch({
       h.exc <- t(h) %>%
@@ -457,10 +492,10 @@ do_post_analysis <- function(main_dir,
       
       w.exc <- w_excel_ready %>%
         dplyr::select(-any_of(c('ENTREZID', 'variant'))) %>%
-        relocate(any_of(c("VAR_ID", "rsID", "gene"))) 
-      
+        relocate(any_of(c("VAR_ID", "rsID", "Nearest_Gene", "OpenTargets_Gene")))
+
       # Determine last ID column safely
-      id_cols <- intersect(c("VAR_ID", "rsID", "gene"), colnames(w.exc))
+      id_cols <- intersect(c("VAR_ID", "rsID", "Nearest_Gene", "OpenTargets_Gene"), colnames(w.exc))
       last_id_col <- length(id_cols)
       
       posStyle <- createStyle(fontColour = "#006100", bgFill = "#C6EFCE")
@@ -515,6 +550,7 @@ do_post_analysis <- function(main_dir,
   
   if (do_liftover==T) {
     print("Doing liftover...")
+    if (is.character(my_chain)) my_chain <- rtracklayer::import.chain(my_chain)
     
     df_weights <- w_wLoci %>%
       inner_join(df_rsIDs, by=c('variant')) %>%
@@ -624,24 +660,6 @@ do_post_analysis <- function(main_dir,
     write_delim(for_VCF, file.path(main_dir,"bcftools_input.txt"),
                 delim = "\t",col_names = F)
   }
-  
-  
-  # V2G
-  
-  if (do_v2g) {
-    v2g_input <- df_gwas %>%
-      separate(ChrPos, into=c("chromosome","position"),sep=":",remove = T) %>%
-      mutate_at(vars(chromosome, position), as.integer) %>%
-      dplyr::select(chromosome, position, rsid=rsID)
-    
-    v2g(gwas_data        = v2g_input,
-        prefix           = paste(basename(main_dir), "v2g", sep = "_"),
-        output_dir       = main_dir,
-        v2g_index_dir    = v2g_index_dir,
-        v2g_scored_dir   = v2g_scored_dir,
-        gene_symbol_file = gene_symbol_file
-    )
-  } 
   
   
   return(list(df_run_summary=df_run_summary, k=k, cluster_names=cluster_names, w=w_wLoci, h=h, cutoff=cutoff))

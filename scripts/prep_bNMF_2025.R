@@ -516,33 +516,25 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   print(head(trait_df_list))
   # --- 4. Consolidate and Return Output ---
   if (nrow(trait_df_list) > 0) {
-    
+
     trait_order <- unique(names(trait_ss_files))
-    trait_df_list$trait <- factor(trait_df_list$trait, levels = trait_order)
-    
-    # Pivot Z-scores
-    z_df_wide <- trait_df_list %>%
-      select(trait, SNP, z) %>%
-      # ADD THIS BLOCK to ensure each SNP/trait is unique before pivoting
-      group_by(trait, SNP) %>% 
-      dplyr::slice(1) %>% 
-      ungroup() %>%
-      pivot_wider(names_from = "trait", values_from = "z")
-    
-    z_mat <- as.matrix(z_df_wide[, -1])
+
+    # Use data.table dcast — much faster than pivot_wider on large matrices
+    trait_df_dt <- as.data.table(trait_df_list)
+    trait_df_dt[, trait := factor(trait, levels = trait_order)]
+    trait_df_dt <- unique(trait_df_dt, by = c("trait", "SNP"))
+
+    message("Expanding using dcast!")
+    message(sprintf("  Pivoting %d trait-SNP pairs to wide format ...", nrow(trait_df_dt)))
+
+    z_df_wide  <- dcast(trait_df_dt, SNP ~ trait, value.var = "z")
+    z_mat <- as.matrix(z_df_wide[, -1, with = FALSE])
     rownames(z_mat) <- z_df_wide$SNP
-    
-    # Pivot Sample Sizes (your existing code for this is correct)
-    N_df_wide <- trait_df_list %>%
-      select(trait, SNP, N_PH) %>%
-      group_by(trait, SNP) %>% 
-      dplyr::slice(1) %>% 
-      ungroup() %>%
-      pivot_wider(names_from = "trait", values_from = "N_PH")
-    
-    N_mat <- as.matrix(N_df_wide[, -1])
+
+    N_df_wide  <- dcast(trait_df_dt, SNP ~ trait, value.var = "N_PH")
+    N_mat <- as.matrix(N_df_wide[, -1, with = FALSE])
     rownames(N_mat) <- N_df_wide$SNP
-    
+
     df_z <- as.data.frame(z_mat)
     df_N <- as.data.frame(N_mat)
     

@@ -1,94 +1,105 @@
 # ==============================================================================
 # Generate rsID to VAR_ID Mapping File for bNMF Clustering Pipeline
 # ==============================================================================
-# This script downloads 1000 Genomes Phase 3 data from Ensembl (by chromosome)
-# and creates a mapping file compatible with the bNMF clustering pipeline
-# 
-# Output format: VAR_ID (CHR_POS_REF_ALT) \t rsID
+# Downloads 1000 Genomes Phase 3 VCFs from Ensembl (GRCh37) and builds a
+# VAR_ID <-> rsID mapping file for the bNMF pipeline.
+#
+# Output format: hg19_posID (chrN:POS) \t rsID \t ref_allele \t alt_allele (no header)
 # Reference genome: GRCh37/hg19
+#
+# Requirements: curl, data.table
+# Disk space: up to ~20 GB during download (files deleted after processing)
 # ==============================================================================
 
-library(vcfR)
-library(dplyr)
+library(curl)
+library(data.table)
 
 # Configuration
-CURRENT <- getwd()
-base_url <- "http://ftp.ensembl.org/pub/grch37/current/variation/vcf/homo_sapiens/"
+CURRENT    <- getwd()
+base_url   <- "http://ftp.ensembl.org/pub/grch37/current/variation/vcf/homo_sapiens/"
 output_file <- file.path(CURRENT, "list_VARID_rsID_updated.txt")
-temp_dir <- file.path(CURRENT, "temp_vcf")
+temp_dir   <- file.path(CURRENT, "temp_vcf")
 
-# Create temporary directory
-if (!dir.exists(temp_dir)) {
-  dir.create(temp_dir)
+if (!dir.exists(temp_dir)) dir.create(temp_dir)
+
+chromosomes  <- 1:22
+filenames    <- sprintf("homo_sapiens-chr%s.vcf.gz", chromosomes)
+urls         <- paste0(base_url, filenames)
+local_files  <- file.path(temp_dir, filenames)
+
+# ==============================================================================
+# Step 1: Parallel download of all chromosomes
+# ==============================================================================
+to_download <- which(!file.exists(local_files))
+
+if (length(to_download) > 0) {
+  message(sprintf("Downloading %d chromosome VCFs in parallel...", length(to_download)))
+  results <- multi_download(
+    urls[to_download],
+    local_files[to_download],
+    progress  = TRUE,
+    resume    = TRUE,
+    timeout   = 7200
+  )
+
+  failed <- which(results$status_code != 200 | nchar(results$error) > 0)
+  if (length(failed) > 0) {
+    message("The following chromosomes failed to download:")
+    print(results[failed, c("url", "status_code", "error")])
+    for (f in results$destfile[failed]) {
+      if (file.exists(f)) file.remove(f)
+    }
+  }
+  message(sprintf("Downloads complete: %d/%d succeeded.",
+                  length(to_download) - length(failed), length(to_download)))
+} else {
+  message("All chromosome files already present, skipping download.")
 }
 
-# Define chromosomes to process
-chromosomes <- c(1:22)
-
-# Function to download and process a single chromosome
-process_chromosome <- function(chr) {
+# ==============================================================================
+# Step 2: Process each chromosome (fread via shell pipe — skips genotype columns)
+# ==============================================================================
+process_chromosome <- function(chr, local_file) {
   message(sprintf("Processing chromosome %s...", chr))
-  
-  # Construct URL and local filename
-  filename <- sprintf("homo_sapiens-chr%s.vcf.gz", chr)
-  url <- paste0(base_url, filename)
-  local_file <- file.path(temp_dir, filename)
-  
-  # Download if not exists
-  if (!file.exists(local_file)) {
-    message(sprintf("  Downloading %s...", filename))
-    tryCatch({
-      download.file(url, local_file, mode = "wb", quiet = TRUE)
-    }, error = function(e) {
-      message(sprintf("  Error downloading chr%s: %s", chr, e$message))
-      return(NULL)
-    })
-  }
-  
-  # Check if file exists and has content
+
   if (!file.exists(local_file) || file.size(local_file) == 0) {
-    message(sprintf("  Skipping chr%s - file not available", chr))
+    message(sprintf("  Skipping chr%s — file not available.", chr))
     return(NULL)
   }
-  
-  # Read and process VCF
+
   tryCatch({
-    message(sprintf("  Reading VCF for chr%s...", chr))
-    vcf <- read.vcfR(local_file, verbose = FALSE)
-    
-    if (nrow(vcf@fix) == 0) {
-      message(sprintf("  No variants found in chr%s", chr))
+    vars <- fread(
+      cmd          = sprintf("gzip -dc '%s' | grep -v '^#'", local_file),
+      select       = 1:5,
+      col.names    = c("CHROM", "POS", "ID", "REF", "ALT"),
+      header       = FALSE,
+      showProgress = FALSE
+    )
+
+    if (nrow(vars) == 0) {
+      message(sprintf("  No variants in chr%s.", chr))
       return(NULL)
     }
-    
-    # Extract variant information
-    vars <- as.data.frame(vcf@fix[, c("CHROM", "POS", "ID", "REF", "ALT")])
-    
-    # Apply quality control filters
-    vars_filtered <- vars %>%
-      # Valid rsIDs only
-      filter(ID != "." & grepl("^rs[0-9]+$", ID)) %>%
-      # Biallelic SNPs only
-      filter(
-        nchar(REF) == 1 & nchar(ALT) == 1 &
-          REF %in% c("A", "C", "G", "T") & ALT %in% c("A", "C", "G", "T") &
-          !grepl(",", ALT)
-      ) %>%
-      # Create VAR_ID
-      mutate(VAR_ID = paste(CHROM, POS, REF, ALT, sep = "_")) %>%
-      select(VAR_ID, rsID = ID) %>%
-      # Remove duplicates within chromosome
-      distinct(VAR_ID, .keep_all = TRUE) %>%
-      distinct(rsID, .keep_all = TRUE)
-    
-    message(sprintf("  Chr%s: %s variants after filtering", 
+
+    vars_filtered <- vars[
+      ID != "." & grepl("^rs[0-9]+$", ID) &
+      nchar(REF) == 1L & nchar(ALT) == 1L &
+      REF %chin% c("A","C","G","T") &
+      ALT %chin% c("A","C","G","T") &
+      !grepl(",", ALT)
+    ]
+
+    vars_filtered[, hg19_posID := paste0("chr", CHROM, ":", POS)]
+    vars_filtered <- vars_filtered[, .(hg19_posID, rsID = ID, ref_allele = REF, alt_allele = ALT)]
+    vars_filtered <- unique(vars_filtered, by = "hg19_posID")
+    vars_filtered <- unique(vars_filtered, by = "rsID")
+
+    message(sprintf("  Chr%s: %s variants after filtering.",
                     chr, format(nrow(vars_filtered), big.mark = ",")))
-    
-    # Clean up chromosome file
+
     file.remove(local_file)
-    
     return(vars_filtered)
-    
+
   }, error = function(e) {
     message(sprintf("  Error processing chr%s: %s", chr, e$message))
     if (file.exists(local_file)) file.remove(local_file)
@@ -96,82 +107,47 @@ process_chromosome <- function(chr) {
   })
 }
 
-# Main processing
-message("Starting chromosome-by-chromosome processing...")
-message(sprintf("Will process chromosomes: %s", paste(chromosomes, collapse = ", ")))
-
-# Process all chromosomes
-all_variants <- list()
-total_downloaded <- 0
-
-for (chr in chromosomes) {
-  result <- process_chromosome(chr)
-  if (!is.null(result) && nrow(result) > 0) {
-    all_variants[[as.character(chr)]] <- result
-    total_downloaded <- total_downloaded + 1
-  }
+all_variants <- vector("list", length(chromosomes))
+for (i in seq_along(chromosomes)) {
+  all_variants[[i]] <- process_chromosome(chromosomes[i], local_files[i])
 }
 
-# Combine all chromosomes
+# ==============================================================================
+# Step 3: Combine and write output
+# ==============================================================================
+all_variants <- Filter(Negate(is.null), all_variants)
+
 if (length(all_variants) > 0) {
   message("\nCombining results from all chromosomes...")
-  vars_final <- bind_rows(all_variants)
-  
-  # Final deduplication across chromosomes (in case of overlaps)
-  vars_final <- vars_final %>%
-    distinct(VAR_ID, .keep_all = TRUE) %>%
-    distinct(rsID, .keep_all = TRUE) %>%
-    arrange(VAR_ID)
-  
-  message(sprintf("Combined total: %s variants", format(nrow(vars_final), big.mark = ",")))
-  
-  # Write output file
-  message(sprintf("Writing mapping file to: %s", output_file))
-  write.table(vars_final, 
-              file = output_file, 
-              append = FALSE, 
-              quote = FALSE, 
-              sep = "\t",
-              row.names = FALSE,
-              col.names = FALSE)
-  
-  # Summary statistics
+  vars_final <- rbindlist(all_variants)
+  vars_final <- unique(vars_final, by = "hg19_posID")
+  vars_final <- unique(vars_final, by = "rsID")
+  setorder(vars_final, hg19_posID)
+
+  message(sprintf("Total variants: %s", format(nrow(vars_final), big.mark = ",")))
+  message(sprintf("Writing to: %s", output_file))
+
+  fwrite(vars_final, file = output_file, sep = "\t", col.names = FALSE, quote = FALSE)
+
   message("\n=== SUMMARY ===")
-  message(sprintf("Chromosomes successfully processed: %d/%d", total_downloaded, length(chromosomes)))
-  message(sprintf("Total variants in final mapping: %s", format(nrow(vars_final), big.mark = ",")))
-  
-  # Chromosome breakdown
-  chr_summary <- vars_final %>%
-    separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"), sep = "_", remove = FALSE) %>%
-    count(CHR, name = "count") %>%
-    arrange(as.numeric(CHR)) 
-  
-  message("Variants by chromosome:")
-  for(i in 1:nrow(chr_summary)) {
-    message(sprintf("  Chr %s: %s variants", 
-                    chr_summary$CHR[i], 
-                    format(chr_summary$count[i], big.mark = ",")))
+  chr_counts <- vars_final[, .(count = .N), by = .(CHR = sub("chr(.*):.*", "\\1", hg19_posID))]
+  chr_counts[, CHR := as.integer(CHR)]
+  setorder(chr_counts, CHR)
+  for (i in seq_len(nrow(chr_counts))) {
+    message(sprintf("  Chr%s: %s variants",
+                    chr_counts$CHR[i], format(chr_counts$count[i], big.mark = ",")))
   }
-  
-  message(sprintf("\nMapping file saved as: %s", basename(output_file)))
-  message("File format: VAR_ID<tab>rsID (no header)")
-  
+  message(sprintf("\nFile format: VAR_ID<tab>rsID (no header)\nSaved: %s", output_file))
+
 } else {
-  message("\nERROR: No variants were successfully processed!")
-  message("Please check your internet connection and the Ensembl FTP site.")
+  message("\nERROR: No variants successfully processed.")
+  message("Check your internet connection and the Ensembl FTP site.")
 }
 
-# Clean up temporary directory
+# Cleanup
 if (dir.exists(temp_dir)) {
   unlink(temp_dir, recursive = TRUE)
   message("Temporary files cleaned up.")
 }
-
-# Additional notes for users
-message("\n=== NOTES ===")
-message("• This mapping is based on 1000 Genomes Phase 3 data (GRCh37/hg19)")
-message("• Only biallelic SNPs with valid rsIDs are included")
-message("• Multi-allelic variants and indels are excluded")
-message("• If some chromosomes failed, you can re-run to retry those only")
 
 message("\nScript completed!")
