@@ -3,9 +3,17 @@
 
 repo_dir <- Sys.getenv("BNMF_REPO_DIR", unset = normalizePath(".."))
 
+# The helpers live in scripts/ in the repository. A flat copy of the scripts
+# with tests/ beside them (e.g. a snapshot on a cluster) also works.
+scripts_dir <- if (dir.exists(file.path(repo_dir, "scripts"))) {
+  file.path(repo_dir, "scripts")
+} else {
+  repo_dir
+}
+
 suppressWarnings(suppressPackageStartupMessages({
-  source(file.path(repo_dir, "scripts", "choose_variants_2025.R"))
-  source(file.path(repo_dir, "scripts", "prep_bNMF_2025.R"))
+  source(file.path(scripts_dir, "choose_variants_2025.R"))
+  source(file.path(scripts_dir, "prep_bNMF_2025.R"))
 }))
 
 quietly <- function(expr) {

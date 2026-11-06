@@ -125,6 +125,9 @@ The tests build small synthetic summary statistics files and need no network acc
 * **`fetch_summary_stats()`** — Retrieve z-scores (oriented to the risk allele) and sample sizes across all traits for the variant set, with per-trait allele-matching counts
 * **`prep_z_matrix()`** — Final trait filters, sample size adjustment, and construction of the non-negative bNMF input matrix (N variants × 2M traits, with separate columns for positive and negative associations)
 
+#### `qc_report.R` — Per-run QC report
+* **`write_qc_report()`** — Write `QC_report.html`, one self-contained page per run. It opens with a "Things to check" list (assumed effect alleles, low agreement with the primary GWAS, sentinel-level variants removed, traits matched on the opposite strand, sentinels with no trait data, sentinels with no proxy) followed by the tables behind each item. The run script collects the pieces in a list as it goes; sections with no data are left out, so the report can be written part-way through a run and again at the end. See the header of the script and `main_script_example.R` for the pattern.
+
 #### `run_bNMF_2025.R` — bNMF clustering
 * **`BayesNMF.L2EU()`** — Core L2-Euclidean Bayesian NMF with ARD prior (auto-selects number of clusters K)
 * **`run_bNMF_parallel()`** — Run multiple bNMF replicates in parallel using `furrr`
@@ -156,6 +159,7 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `L2EU.H.mat.[K].txt` | Trait weight matrix (clusters × traits) for cluster count K |
 | `W_plot_K[K].pdf` | Heatmap of variant contributions to clusters |
 | `H_plot_K[K].pdf` | Heatmap of trait contributions to clusters |
+| `QC_report.html` | Per-run QC report: what to check first, then how each input was read, which variants and traits were removed and why, proxy results and K choices |
 | `input_qc_discovery_gwas.txt` | Per discovery GWAS: rows read, rows dropped as not biallelic autosomal SNPs, and the effect-allele rule used |
 | `discovery_vs_primary_agreement.txt` | Per discovery GWAS: variants found in the primary GWAS, variants listed in the opposite allele order, and risk-allele agreement |
 | `variants_removed_by_primary_gwas.txt` | Every variant removed by the primary-GWAS filters, with the reason (a `_summary` file gives counts per GWAS) |

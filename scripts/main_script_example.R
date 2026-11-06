@@ -113,6 +113,7 @@ if (RUN_PROXY_SEARCH && !dir.exists(RSID_MAP_DIR)) {
 source(file.path(scripts_dir, "choose_variants_2025.R"))
 source(file.path(scripts_dir, "prep_bNMF_2025.R"))
 source(file.path(scripts_dir, "run_bNMF_2025.R"))
+source(file.path(scripts_dir, "qc_report.R"))
 future::plan(future::sequential)
 
 manifest_file <- file.path(example_dir, "clustering_data_source_example.xlsx")
@@ -153,6 +154,30 @@ if ("effect_allele" %in% names(gwas_traits)) {
                                   gwas_traits$trait[has_override])
 }
 
+# The per-run QC report is assembled from pieces collected in `qc` as the run
+# proceeds. It is written once the final variant set is known and again at the
+# end, so a run that stops early still leaves a report behind.
+qc_report_file <- file.path(main_dir, "QC_report.html")
+qc <- list(
+  run_name = version,
+  settings = list(
+    PVCUTOFF = PVCUTOFF,
+    PVCUTOFF_PROXY = PVCUTOFF_PROXY,
+    MAIN_PVCUTOFF = MAIN_PVCUTOFF,
+    LOCUS_ORDER_BY = LOCUS_ORDER_BY,
+    PROXY_WINDOW_KB = PROXY_WINDOW_KB,
+    RUN_LDLINK_PRUNING = RUN_LDLINK_PRUNING,
+    RUN_PROXY_SEARCH = RUN_PROXY_SEARCH,
+    MIN_MEDIAN_N = MIN_MEDIAN_N,
+    MAX_TRAIT_MISSING = MAX_TRAIT_MISSING,
+    PROXY_MIN_NONMISSING = PROXY_MIN_NONMISSING,
+    CORRELATION_CUTOFF = CORRELATION_CUTOFF,
+    primary_gwas = basename(main_ss_filepath)
+  ),
+  sentinel_pvalue_cutoff = PVCUTOFF,
+  nonmissing_cutoff = PROXY_MIN_NONMISSING
+)
+
 # =============================================================================
 # 2. Select sentinel variants
 # =============================================================================
@@ -167,6 +192,7 @@ vars_sig <- get_sig_snps(
 )
 write_tsv(attr(vars_sig, "input_qc"),
           file.path(main_dir, "input_qc_discovery_gwas.txt"))
+qc$input_qc <- attr(vars_sig, "input_qc")
 
 # Cross-reference against the primary GWAS and apply its filters now, before
 # any clumping or pruning: each variant must be present in the primary GWAS,
@@ -185,6 +211,9 @@ write_tsv(attr(vars_main, "drop_summary"),
           file.path(main_dir, "variants_removed_by_primary_gwas_summary.txt"))
 write_tsv(attr(vars_main, "concordance"),
           file.path(main_dir, "discovery_vs_primary_agreement.txt"))
+qc$concordance  <- attr(vars_main, "concordance")
+qc$dropped      <- attr(vars_main, "dropped")
+qc$drop_summary <- attr(vars_main, "drop_summary")
 
 vars_no_hla <- vars_main %>%
   filter(!(CHR == 6 & between(POS, 28477797, 33448354)))
@@ -297,6 +326,7 @@ z_n_mats <- fetch_summary_stats(
   trait_effect_allele = trait_effect_allele
 )
 write_tsv(z_n_mats$trait_qc, file.path(main_dir, "input_qc_trait_gwas.txt"))
+qc$trait_qc <- z_n_mats$trait_qc
 
 zmat_fullset <- as.matrix(z_n_mats$df_z)
 Nmat_fullset <- as.matrix(z_n_mats$df_N)
@@ -336,6 +366,7 @@ traits_removed_missing <- setdiff(traits_high_N, traits_final)
 
 variant_nonmissingness <- rowMeans(!is.na(zmat_pruned[, traits_final, drop = FALSE]))
 variant_nonmissingness <- setNames(variant_nonmissingness, pruned_vars$VAR_ID)
+qc$sentinel_nonmissingness <- variant_nonmissingness
 
 # =============================================================================
 # 5. Optional proxy search and final variant assembly
@@ -429,6 +460,8 @@ if (RUN_PROXY_SEARCH) {
   }
 
   final_snps <- bind_rows(final_originals, final_proxies)
+  qc$proxies_needed <- proxies_needed
+  qc$proxies_found <- proxy_rows
 } else {
   message("Proxy search is disabled; retaining all position/LD-pruned originals.")
   final_snps <- pruned_vars %>%
@@ -491,6 +524,41 @@ if (nrow(gwas_final) != nrow(final_snps) || anyNA(gwas_final$BETA_aligned) ||
 }
 
 write_csv(gwas_final, file.path(main_dir, "alignment_GWAS_summStats.csv"))
+
+# First write of the QC report: everything about the inputs and the variant
+# set is known at this point.
+qc$final_variants <- final_snps
+qc$funnel <- tibble(
+  stage = c(
+    "Variants below the pool cutoff in any discovery GWAS",
+    "Kept by the primary-GWAS filters",
+    "After removing the HLA region",
+    "Sentinel candidates (discovery P below the sentinel cutoff)",
+    "Sentinels after clumping / LD pruning",
+    "Variants fetched for traits (sentinels plus proxy candidates)",
+    "Sentinels needing a proxy",
+    "Proxies found",
+    "Final variant set"
+  ),
+  n = c(
+    n_distinct(vars_sig$VAR_KEY),
+    nrow(vars_main),
+    nrow(vars_no_hla),
+    nrow(sentinel_candidates),
+    nrow(pruned_vars),
+    nrow(fetch_input),
+    if (RUN_PROXY_SEARCH) nrow(proxies_needed) else NA_integer_,
+    if (RUN_PROXY_SEARCH) sum(final_snps$Variant_Type == "proxy") else NA_integer_,
+    nrow(final_snps)
+  )
+)
+if (!RUN_LDLINK_PRUNING) {
+  qc$notes <- c(qc$notes, "LD pruning was disabled: every sentinel candidate was kept.")
+}
+if (!RUN_PROXY_SEARCH) {
+  qc$notes <- c(qc$notes, "The proxy search was disabled: no sentinel was replaced or dropped for missingness or strand ambiguity.")
+}
+write_qc_report(qc, qc_report_file)
 
 zmat_pre_imputed <- zmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
 Nmat_pre_imputed <- Nmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
@@ -614,3 +682,8 @@ future::plan(future::sequential)
 saveRDS(bnmf_out, file.path(main_dir, "bnmf_out.rds"))
 
 summarize_bNMF(bnmf_out, dir_save = main_dir)
+
+# Final write of the QC report, now with the trait filters and the K choices.
+qc$trait_filters <- trait_log
+qc$bnmf_run_summary <- fread(file.path(main_dir, "run_summary.txt"), data.table = FALSE)
+write_qc_report(qc, qc_report_file)
