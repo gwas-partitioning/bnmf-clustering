@@ -96,3 +96,60 @@ test_that("the legacy primary-GWAS path removes every risk-allele mismatch and s
   expect_identical(legacy$dropped$reason[legacy$dropped$SNP == "1:2000"], "risk_allele_mismatch")
   expect_identical(legacy$dropped$reason[legacy$dropped$SNP == "2:1000"], "no_main_direction")
 })
+
+# ---- parallel trait fetch -----------------------------------------------------
+
+test_that("fetching traits with several workers gives the same result as one worker", {
+  parallel_fetch <- quietly(fetch_summary_stats(
+    df_input = tf$df_input,
+    trait_ss_files = tf$files,
+    trait_ss_size = tf$sizes,
+    n_workers = 2
+  ))
+  expect_equal(parallel_fetch$df_z, fetched$df_z)
+  expect_equal(parallel_fetch$df_N, fetched$df_N)
+  expect_equal(parallel_fetch$trait_qc, fetched$trait_qc)
+})
+
+test_that("parallel workers write the same checkpoints a single worker can reuse", {
+  cp_dir <- tempfile("bnmf_cp_")
+  first <- quietly(fetch_summary_stats(
+    df_input = tf$df_input, trait_ss_files = tf$files, trait_ss_size = tf$sizes,
+    checkpoint_dir = cp_dir, n_workers = 2
+  ))
+  expect_setequal(list.files(cp_dir), paste0(names(tf$files), ".rds"))
+  # A second, single-worker call must find every checkpoint valid.
+  messages <- character(0)
+  second <- withCallingHandlers(
+    {
+      utils::capture.output(res <- fetch_summary_stats(
+        df_input = tf$df_input, trait_ss_files = tf$files, trait_ss_size = tf$sizes,
+        checkpoint_dir = cp_dir, n_workers = 1
+      ))
+      res
+    },
+    message = function(m) {
+      messages <<- c(messages, conditionMessage(m))
+      invokeRestart("muffleMessage")
+    }
+  )
+  expect_equal(sum(grepl("[checkpoint]", messages, fixed = TRUE)), length(tf$files))
+  expect_equal(second$df_z, first$df_z)
+})
+
+test_that("a trait that fails in a parallel worker is reported by name", {
+  bad_dir <- tempfile("bnmf_bad_")
+  dir.create(bad_dir)
+  bad_path <- write_tsv_fixture(
+    data.frame(VAR_ID = "1_1000_A_G", Effect_Allele_PH = "G", P_VALUE = 0.01),  # no BETA / SE
+    bad_dir, "badtrait.txt"
+  )
+  files_with_bad <- c(tf$files, badtrait = bad_path)
+  expect_error(
+    quietly(fetch_summary_stats(
+      df_input = tf$df_input, trait_ss_files = files_with_bad,
+      trait_ss_size = c(tf$sizes, badtrait = 1000), n_workers = 2
+    )),
+    "badtrait"
+  )
+})

@@ -37,7 +37,7 @@ Sample input files are provided in `example_data/` to illustrate the expected fo
 
 **LDlink API token:** Several steps use the [LDlinkR](https://cran.r-project.org/package=LDlinkR) package for LD-based operations. Request a free token at https://ldlink.nih.gov/?tab=apiaccess and store it as the environment variable `LDLINK_TOKEN`.
 
-**rsID map:** The proxy search step requires a per-chromosome file mapping `VAR_ID → rsID`. Generate it from 1000 Genomes Phase 3 using `scripts/generate_varid_to_rsid_map_file.R`, which downloads per-chromosome VCFs from Ensembl and writes one map file per chromosome to a local directory. Pass the directory path as `my_rsid_map_dir` in the USER CONFIGURATION section.
+**rsID map (optional):** The proxy search no longer needs one. `scripts/format_gwas_input.R` can use a per-chromosome file mapping `VAR_ID → rsID` to align raw files to reference alleles, and the legacy `choose_proxies()` still reads one. Generate it from 1000 Genomes Phase 3 using `scripts/generate_varid_to_rsid_map_file.R`, which downloads per-chromosome VCFs from Ensembl and writes one map file per chromosome to a local directory. Pass the directory path as `my_rsid_map_dir` in the USER CONFIGURATION section.
 
 ### Input data format
 
@@ -85,12 +85,17 @@ Two P-values are carried for every variant, in separately named columns. There i
 | `PVALUE_discovery` | Lowest P across the discovery GWAS (`main_gwas` sheet) | Whether a variant is eligible to be a sentinel |
 | `PVALUE_main` | P in the primary GWAS (`largest = Yes`) | Whether a variant stays in, and which variant leads a locus |
 
-1. **Pool.** `get_sig_snps()` collects every variant with P ≤ `PVCUTOFF_PROXY` in any discovery GWAS.
+1. **Discovery variants.** `get_sig_snps()` collects every variant with P ≤ `PVCUTOFF` in any discovery GWAS.
 2. **Primary-GWAS filters.** `get_biggest_gwas()` keeps a variant only if it is present in the primary GWAS, has a direction of effect in both GWAS (effect not missing or zero), has `PVALUE_main` ≤ `MAIN_PVCUTOFF` (default 0.05), and has the **same risk allele** in the discovery and primary GWAS. These filters run before any clumping or pruning, so a locus whose top variant fails can fall back to its next-best variant. Every removed variant is written to `variants_removed_by_primary_gwas.txt` with one reason.
-3. **Sentinels.** Variants in the pool with `PVALUE_discovery` < `PVCUTOFF`.
+3. **Sentinel candidates.** The variants that passed step 2, outside the HLA region.
 4. **Clumping / LD pruning.** `snp_clump()` and `ld_pruning_SNP.clip()` keep the first variant of each locus under `order_by`, which has no default. The example uses `c("PVALUE_main", "PVALUE_discovery")`: the strongest variant in the primary GWAS leads, with the discovery P as tiebreaker.
-5. **Trait fetch.** `fetch_summary_stats()` returns a z-score row for every variant it is given. A variant no trait file contains is a row of `NA`, never a missing row.
-6. **Proxies.** Sentinels that are strand-ambiguous or have too little trait data are replaced by an LD proxy from the pool where one exists. A sentinel with no non-missingness value at this point is an error.
+5. **Trait fetch.** `fetch_summary_stats()` returns a z-score row for every sentinel. A sentinel no trait file contains is a row of `NA`, never a missing row. This is usually the slowest step: every trait file is decompressed and scanned in full, so its time depends on the number and size of trait files, not on how many variants are requested. Set `n_workers` to read several trait files at once (results are identical for any value), and keep `checkpoint_dir` set so a rerun reuses what was already read.
+6. **Proxies.** A sentinel that is strand-ambiguous (A/T or C/G) or has data for too few traits is replaced by a variant in strong LD with it, or dropped. It is never kept as itself. Three functions do this in turn:
+   * `find_proxy_candidates()` asks LDlink for the LD partners of the flagged sentinels (r2 ≥ `PROXY_MIN_R2`). Answers are kept on disk; a rerun asks again only for sentinels with no answer, so a failed request is retried, not recorded as "no proxies".
+   * `qualify_proxy_candidates()` judges each partner against the primary GWAS by the rules a sentinel had to pass: present, a direction of effect, P ≤ `MAIN_PVCUTOFF`. It must also not be strand-ambiguous or another sentinel, and its risk allele must be the allele that travels with the sentinel's risk allele.
+   * A second `fetch_summary_stats()` call reads trait data for the qualified partners only, and `select_proxies()` chooses the one in strongest LD among those with enough trait data. One variant is never the proxy for two sentinels.
+
+   Every candidate's outcome is written to `proxy_candidates_audit.txt` and summarised in the QC report. Proxies are not limited to variants below some discovery P cutoff, and no rsID map is needed for the proxy search.
 
 ### Tests
 
@@ -107,6 +112,8 @@ The tests build small synthetic summary statistics files and need no network acc
 * `snp_clump()` and `ld_pruning_SNP.clip()` require `order_by`.
 * `fetch_summary_stats()` no longer needs the primary GWAS: pass the output of `get_biggest_gwas()` (with `SNP = ChrPos`) and omit `gwas_ss_file`. Supplying `gwas_ss_file` still works and applies the same filters there. `pval_bonf` is ignored: every risk-allele mismatch is removed.
 * Trait checkpoints written by an earlier version are recomputed automatically.
+* The pre-fetched proxy pool is gone from the example: `PVCUTOFF_PROXY`, `PROXY_WINDOW_KB` and `window_to_sentinels()` are no longer needed. Fetch the sentinels, then use the three proxy-stage functions.
+* A sentinel flagged for a proxy is never kept as itself. `choose_proxies()` no longer returns "rescued" variants.
 
 ---
 
@@ -117,9 +124,10 @@ The tests build small synthetic summary statistics files and need no network acc
 * **`get_biggest_gwas()`** — Cross-reference them against the primary (largest) GWAS and apply the primary-GWAS P and risk-allele filters, reporting every removal
 * **`snp_clump()`** — Optional position-based clumping utility (not used by the generic example); use when physical distance, rather than measured LD, is the intended rule
 * **`ld_pruning_SNP.clip()`** — Multi-population LD-based pruning via the LDlink SNPclip API
-* **`window_to_sentinels()`** — Restrict a variant pool to within a window of LD-pruned sentinels (keeps proxy candidate fetch tractable for polygenic traits)
-* **`find_variants_needing_proxies()`** — Flag strand-ambiguous, multiallelic, or high-missingness variants for proxy replacement
-* **`choose_proxies()`** — Search for LD proxies via LDlinkR and select the best candidate per variant
+* **`window_to_sentinels()`** — Legacy helper for the pre-fetched proxy pool; not used by the example
+* **`find_variants_needing_proxies()`** — Flag strand-ambiguous or high-missingness sentinels for proxy replacement
+* **`find_proxy_candidates()`**, **`qualify_proxy_candidates()`**, **`select_proxies()`** — The proxy stage: LD partners from LDlink, judged against the primary GWAS, then one proxy chosen per sentinel (see "How variants are selected")
+* **`choose_proxies()`** — Legacy single-call proxy search for run scripts that pre-fetch a pool of candidates. It no longer rescues flagged sentinels
 
 #### `prep_bNMF_2025.R` — Summary statistics fetch and z-score matrix preparation
 * **`fetch_summary_stats()`** — Retrieve z-scores (oriented to the risk allele) and sample sizes across all traits for the variant set, with per-trait allele-matching counts
@@ -163,6 +171,7 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `input_qc_discovery_gwas.txt` | Per discovery GWAS: rows read, rows dropped as not biallelic autosomal SNPs, and the effect-allele rule used |
 | `discovery_vs_primary_agreement.txt` | Per discovery GWAS: variants found in the primary GWAS, variants listed in the opposite allele order, and risk-allele agreement |
 | `variants_removed_by_primary_gwas.txt` | Every variant removed by the primary-GWAS filters, with the reason (a `_summary` file gives counts per GWAS) |
+| `proxy_candidates_audit.txt` | Every LD partner returned for a flagged sentinel and what became of it (chosen, or the reason it was not) |
 | `input_qc_trait_gwas.txt` | Per trait: effect-allele rule used and how many variants matched as reported, by strand complement, or not at all |
 | `quality_control_report.txt` | QC summary across all pipeline steps |
 | `rsID_map.txt` | Final variant set with VAR_ID → rsID mapping |

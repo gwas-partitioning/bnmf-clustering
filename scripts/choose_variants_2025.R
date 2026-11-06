@@ -397,6 +397,64 @@ get_sig_snps <- function(gwas, PVCUTOFF = 5e-8, rename_cols = NULL) {
 }
 
 
+read_primary_gwas_at_positions <- function(main_ss_filepath, positions,
+                                           rename_cols = NULL, effect_allele = NULL) {
+  # Read the primary GWAS at the given positions ("1:12345") and return one row
+  # per variant in the pipeline's standard form:
+  #   VAR_KEY, VAR_ID, CHR, POS, REF, ALT (the primary's allele order),
+  #   BETA_main (effect of ALT), SE_main, PVALUE_main,
+  #   Risk_Allele_main, Nonrisk_Allele_main
+  # Used by get_biggest_gwas() and by the proxy stage, so sentinels and proxy
+  # candidates are read from the primary GWAS in exactly the same way.
+
+  main_raw <- read_gwas_rows_at_positions(main_ss_filepath, positions, rename_cols)
+  if (!"P_VALUE" %in% names(main_raw) && "PVALUE" %in% names(main_raw)) {
+    names(main_raw)[names(main_raw) == "PVALUE"] <- "P_VALUE"
+  }
+  if (!"P_VALUE" %in% names(main_raw)) {
+    stop("The primary GWAS has no P_VALUE column. Map your column with ",
+         "rename_cols, e.g. rename_cols = c(P_VALUE = \"P\"). Columns found: ",
+         paste(names(main_raw), collapse = ", "))
+  }
+  main_std <- standardize_gwas_variants(main_raw, effect_allele = effect_allele)
+  message(sprintf("  Primary GWAS effect allele: %s",
+                  attr(main_std, "qc")$effect_allele_rule))
+
+  p_main <- suppressWarnings(as.numeric(main_std$P_VALUE))
+  p_main[!is.na(p_main) & p_main == 0] <- .Machine$double.xmin
+  if ("SE" %in% names(main_std)) {
+    se_main <- suppressWarnings(as.numeric(main_std$SE))
+  } else {
+    message("  Primary GWAS has no SE column; deriving SE from BETA and P.")
+    se_main <- abs(main_std$BETA / qnorm(p_main / 2))
+  }
+
+  main <- data.frame(
+    VAR_KEY = main_std$VAR_KEY,
+    VAR_ID = main_std$VAR_ID,
+    CHR = main_std$CHR,
+    POS = main_std$POS,
+    REF = main_std$REF,
+    ALT = main_std$ALT,
+    # Reported as the effect of ALT, whichever allele the file calls the effect
+    # allele, so BETA_main always pairs with the REF/ALT columns returned here.
+    BETA_main = ifelse(main_std$EA == main_std$ALT, main_std$BETA, -main_std$BETA),
+    SE_main = se_main,
+    PVALUE_main = p_main,
+    Risk_Allele_main = main_std$Risk_Allele,
+    Nonrisk_Allele_main = main_std$Nonrisk_Allele,
+    stringsAsFactors = FALSE
+  )
+  n_main_dup <- sum(duplicated(main$VAR_KEY))
+  if (n_main_dup > 0L) {
+    message(sprintf("  %i duplicated variant(s) in the primary GWAS; keeping the lowest-P row of each.",
+                    n_main_dup))
+    main <- main[order(main$PVALUE_main), , drop = FALSE]
+    main <- main[!duplicated(main$VAR_KEY), , drop = FALSE]
+  }
+  main
+}
+
 get_biggest_gwas <- function(main_ss_filepath, vars_sig,
                              main_pval_cutoff = 0.05,
                              rename_cols = NULL,
@@ -444,49 +502,12 @@ get_biggest_gwas <- function(main_ss_filepath, vars_sig,
   # ---- 1. Primary-GWAS rows at the candidate positions ----
   message("Reading candidate positions from the primary GWAS...")
   positions <- unique(paste(vars_sig$CHR, vars_sig$POS, sep = ":"))
-  main_raw <- read_gwas_rows_at_positions(main_ss_filepath, positions, rename_cols)
-  if (!"P_VALUE" %in% names(main_raw) && "PVALUE" %in% names(main_raw)) {
-    names(main_raw)[names(main_raw) == "PVALUE"] <- "P_VALUE"
-  }
-  if (!"P_VALUE" %in% names(main_raw)) {
-    stop("The primary GWAS has no P_VALUE column. Map your column with ",
-         "rename_cols, e.g. rename_cols = c(P_VALUE = \"P\"). Columns found: ",
-         paste(names(main_raw), collapse = ", "))
-  }
-  main_std <- standardize_gwas_variants(main_raw, effect_allele = effect_allele)
-  message(sprintf("  Primary GWAS effect allele: %s",
-                  attr(main_std, "qc")$effect_allele_rule))
-
-  p_main <- suppressWarnings(as.numeric(main_std$P_VALUE))
-  p_main[!is.na(p_main) & p_main == 0] <- .Machine$double.xmin
-  if ("SE" %in% names(main_std)) {
-    se_main <- suppressWarnings(as.numeric(main_std$SE))
-  } else {
-    message("  Primary GWAS has no SE column; deriving SE from BETA and P.")
-    se_main <- abs(main_std$BETA / qnorm(p_main / 2))
-  }
-
-  main <- data.frame(
-    VAR_KEY = main_std$VAR_KEY,
-    VAR_ID = main_std$VAR_ID,
-    REF = main_std$REF,
-    ALT = main_std$ALT,
-    # Reported as the effect of ALT, whichever allele the file calls the effect
-    # allele, so BETA_main always pairs with the REF/ALT columns returned here.
-    BETA_main = ifelse(main_std$EA == main_std$ALT, main_std$BETA, -main_std$BETA),
-    SE_main = se_main,
-    PVALUE_main = p_main,
-    Risk_Allele_main = main_std$Risk_Allele,
-    Nonrisk_Allele_main = main_std$Nonrisk_Allele,
-    stringsAsFactors = FALSE
-  )
-  n_main_dup <- sum(duplicated(main$VAR_KEY))
-  if (n_main_dup > 0L) {
-    message(sprintf("  %i duplicated variant(s) in the primary GWAS; keeping the lowest-P row of each.",
-                    n_main_dup))
-    main <- main[order(main$PVALUE_main), , drop = FALSE]
-    main <- main[!duplicated(main$VAR_KEY), , drop = FALSE]
-  }
+  main <- read_primary_gwas_at_positions(main_ss_filepath, positions,
+                                         rename_cols = rename_cols,
+                                         effect_allele = effect_allele)
+  # CHR and POS are taken from the discovery records in the join below.
+  main$CHR <- NULL
+  main$POS <- NULL
 
   # ---- 2. Join every discovery record to the primary ----
   records <- vars_sig %>%
@@ -1346,6 +1367,379 @@ find_variants_needing_proxies <- function(gwas_variant_df,
   return(result)
 }
 
+# -----------------------------------------------------------------------------
+# Proxy stage
+# -----------------------------------------------------------------------------
+# A sentinel flagged by find_variants_needing_proxies() is replaced by a variant
+# in strong LD with it, or dropped if none qualifies. There is no rescue: a
+# flagged sentinel is never kept as itself.
+#
+# The stage is three steps, called in turn by the run script:
+#   1. find_proxy_candidates()     ask LDlink for LD partners of the flagged
+#                                  sentinels (the only step that needs a network)
+#   2. qualify_proxy_candidates()  judge each candidate against the primary
+#                                  GWAS with the same rules a sentinel must pass
+#   3. select_proxies()            given trait data for the qualified candidates
+#                                  (a second fetch_summary_stats() call), choose
+#                                  one proxy per sentinel
+# Steps 2 and 3 need no network and are covered by the unit tests.
+
+query_ldproxy_batch <- function(snps, population, token, out_file,
+                                genome_build = "grch37") {
+  # Ask LDlink for the LD partners of each variant in `snps` ("chr1:12345") and
+  # append the answers to `out_file`. LDlinkR::LDproxy_batch() writes to a fixed
+  # file name in the working directory and silently skips any variant LDlink
+  # returns an error for; find_proxy_candidates() detects and reports those.
+  expected_name <- sprintf("combined_query_snp_list_%s.txt", genome_build)
+  if (basename(out_file) != expected_name) {
+    stop("out_file must be named ", expected_name)
+  }
+  calling_dir <- getwd()
+  on.exit(setwd(calling_dir), add = TRUE)
+  setwd(dirname(out_file))
+  tryCatch(
+    LDlinkR::LDproxy_batch(snps, pop = population, r2d = "r2", token = token,
+                           append = TRUE, genome_build = genome_build),
+    error = function(e) {
+      message("LDlink request stopped early: ", conditionMessage(e),
+              " (answers received so far are kept).")
+    }
+  )
+  invisible(NULL)
+}
+
+find_proxy_candidates <- function(need_proxies, token, population = "EUR",
+                                  output_dir = ".", r2_min = 0.8,
+                                  genome_build = "grch37", query_fun = NULL) {
+  # Step 1 of the proxy stage.
+  #
+  # need_proxies: data frame with VAR_ID (CHR_POS_REF_ALT) for the flagged sentinels.
+  # output_dir  : where LDlink's answers are kept. A rerun reuses the answers on
+  #               disk and asks again only for sentinels with no answer, so a
+  #               failed or rate-limited request is retried, never recorded as
+  #               "no proxies".
+  # query_fun   : function(snps, population, token, out_file, genome_build) that
+  #               appends LDlink answers to out_file; defaults to
+  #               query_ldproxy_batch(). Replaceable for testing.
+  #
+  # Returns one row per (sentinel, candidate) with r2 >= r2_min, biallelic SNPs
+  # only, excluding the sentinel itself:
+  #   VAR_ID, query_snp, proxy_rsID, proxy_ChrPos, proxy_A1, proxy_A2, r2,
+  #   Correlated_Alleles (LDlink's map from each sentinel allele to the proxy
+  #   allele it travels with, e.g. "A=C,G=T")
+  # attr(, "unanswered") lists the sentinels LDlink gave no answer for.
+
+  if (!"VAR_ID" %in% names(need_proxies)) stop("need_proxies must have a VAR_ID column.")
+  if (is.null(query_fun)) query_fun <- query_ldproxy_batch
+
+  empty <- data.frame(
+    VAR_ID = character(0), query_snp = character(0), proxy_rsID = character(0),
+    proxy_ChrPos = character(0), proxy_A1 = character(0), proxy_A2 = character(0),
+    r2 = numeric(0), Correlated_Alleles = character(0), stringsAsFactors = FALSE
+  )
+  attr(empty, "unanswered") <- character(0)
+  if (nrow(need_proxies) == 0L) return(empty)
+
+  id_parts <- data.table::tstrsplit(need_proxies$VAR_ID, "_", fixed = TRUE)
+  queries <- data.frame(
+    VAR_ID = need_proxies$VAR_ID,
+    query_snp = paste0("chr", id_parts[[1]], ":", id_parts[[2]]),
+    stringsAsFactors = FALSE
+  )
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  output_dir <- normalizePath(output_dir)
+  out_file <- file.path(output_dir, sprintf("combined_query_snp_list_%s.txt", genome_build))
+  settings_file <- file.path(output_dir, "ldproxy_settings.rds")
+  settings <- list(population = population, genome_build = genome_build, r2d = "r2")
+  if (file.exists(out_file) && file.size(out_file) > 0) {
+    if (!file.exists(settings_file) || !identical(readRDS(settings_file), settings)) {
+      stop("LDlink answers already in ", output_dir, " were made with different settings ",
+           "(population or genome build), or their settings are unknown. Use a different ",
+           "output_dir for this search.")
+    }
+  } else {
+    saveRDS(settings, settings_file)
+  }
+
+  read_answers <- function() {
+    if (!file.exists(out_file) || file.size(out_file) == 0) return(NULL)
+    # LDproxy_batch writes row numbers without a header for them, so the header
+    # has one field fewer than the rows; row.names = NULL keeps the columns aligned.
+    read.table(out_file, sep = "\t", header = TRUE, row.names = NULL,
+               stringsAsFactors = FALSE, quote = "", comment.char = "")
+  }
+  answered_snps <- function(px) if (is.null(px)) character(0) else unique(px$query_snp)
+
+  all_snps <- unique(queries$query_snp)
+  for (attempt in 1:2) {
+    pending <- setdiff(all_snps, answered_snps(read_answers()))
+    if (length(pending) == 0L) break
+    message(sprintf(
+      "Asking LDlink (%s) for LD partners of %d flagged sentinel(s)%s...",
+      population, length(pending), if (attempt == 2L) ", second attempt" else ""
+    ))
+    query_fun(pending, population, token, out_file, genome_build)
+  }
+
+  px <- read_answers()
+  unanswered_snps <- setdiff(all_snps, answered_snps(px))
+  unanswered <- queries$VAR_ID[queries$query_snp %in% unanswered_snps]
+
+  candidates <- empty
+  if (!is.null(px)) {
+    px <- px[px$query_snp %in% all_snps, , drop = FALSE]
+    px$R2 <- suppressWarnings(as.numeric(px$R2))
+    is_snp <- grepl("^\\([ACGT]/[ACGT]\\)$", px$Alleles)
+    keep <- px$Coord != px$query_snp & !is.na(px$R2) & px$R2 >= r2_min & is_snp
+    px <- px[keep, , drop = FALSE]
+    if (nrow(px) > 0L) {
+      found <- data.frame(
+        query_snp = px$query_snp,
+        proxy_rsID = ifelse(is.na(px$RS_Number) | px$RS_Number %in% c(".", ""),
+                            NA_character_, as.character(px$RS_Number)),
+        proxy_ChrPos = sub("^chr", "", px$Coord),
+        proxy_A1 = substr(px$Alleles, 2, 2),
+        proxy_A2 = substr(px$Alleles, 4, 4),
+        r2 = px$R2,
+        Correlated_Alleles = as.character(px$Correlated_Alleles),
+        stringsAsFactors = FALSE
+      )
+      candidates <- merge(queries, found, by = "query_snp", sort = FALSE)
+      candidates <- candidates[!duplicated(candidates[, c("VAR_ID", "proxy_ChrPos",
+                                                          "proxy_A1", "proxy_A2")]), ]
+      candidates <- candidates[order(match(candidates$VAR_ID, queries$VAR_ID),
+                                     -candidates$r2), names(empty)]
+      rownames(candidates) <- NULL
+    }
+  }
+
+  message(sprintf(
+    "LDlink: %d of %d flagged sentinels answered; %d candidate(s) with r2 >= %g for %d of them.",
+    length(all_snps) - length(unanswered_snps), length(all_snps),
+    nrow(candidates), r2_min, length(unique(candidates$VAR_ID))
+  ))
+  if (length(unanswered) > 0L) {
+    warning(sprintf(
+      "LDlink returned no answer for %d flagged sentinel(s) (first: %s). They get no proxy in this run; rerun to ask again.",
+      length(unanswered), paste(head(unanswered, 5), collapse = ", ")
+    ), call. = FALSE)
+  }
+  attr(candidates, "unanswered") <- unanswered
+  candidates
+}
+
+qualify_proxy_candidates <- function(candidates, main_ss_filepath, sentinels,
+                                     main_pval_cutoff = 0.05,
+                                     rename_cols = NULL, effect_allele = NULL,
+                                     require_phase_consistency = TRUE) {
+  # Step 2 of the proxy stage: judge every candidate against the primary GWAS.
+  #
+  # sentinels: data frame of ALL sentinels (flagged or not) with VAR_ID and
+  #            Risk_Allele, as returned by get_biggest_gwas().
+  #
+  # A candidate is "qualified" when it
+  #   - is not itself a sentinel (kept or flagged)
+  #   - is not strand-ambiguous (A/T or C/G)
+  #   - is in the primary GWAS (matched on position + allele pair)
+  #   - has a direction of effect and a P <= main_pval_cutoff there
+  #   - has a risk allele that travels with the sentinel's risk allele
+  #     (LDlink's Correlated_Alleles), so the proxy represents the same signal
+  #     in the same direction. Skipped when LDlink gives no allele map for the
+  #     sentinel's risk allele, or when require_phase_consistency = FALSE.
+  # Every other candidate is returned too, with the reason in `status`.
+  #
+  # Returns the candidates with: proxy_VAR_ID, CHR, POS, REF, ALT (the primary's
+  # allele order), Risk_Allele, Nonrisk_Allele, PVALUE_main, BETA_main, SE_main,
+  # status. attr(, "unanswered") is carried over from find_proxy_candidates().
+
+  needed <- c("VAR_ID", "proxy_ChrPos", "proxy_A1", "proxy_A2", "r2")
+  if (!all(needed %in% names(candidates))) {
+    stop("candidates must be the output of find_proxy_candidates(); missing: ",
+         paste(setdiff(needed, names(candidates)), collapse = ", "))
+  }
+  if (!all(c("VAR_ID", "Risk_Allele") %in% names(sentinels))) {
+    stop("sentinels must have VAR_ID and Risk_Allele columns.")
+  }
+  unanswered <- attr(candidates, "unanswered")
+  out <- as.data.frame(candidates, stringsAsFactors = FALSE)
+
+  pos_parts <- data.table::tstrsplit(out$proxy_ChrPos, ":", fixed = TRUE)
+  if (length(pos_parts) < 2L) pos_parts <- list(character(0), character(0))
+  out$CHR <- suppressWarnings(as.integer(pos_parts[[1]]))
+  out$POS <- suppressWarnings(as.integer(pos_parts[[2]]))
+  out$VAR_KEY <- canonical_variant_key(out$CHR, out$POS, out$proxy_A1, out$proxy_A2)
+
+  if (nrow(out) > 0L) {
+    main <- read_primary_gwas_at_positions(main_ss_filepath, unique(out$proxy_ChrPos),
+                                           rename_cols = rename_cols,
+                                           effect_allele = effect_allele)
+  } else {
+    main <- data.frame(VAR_KEY = character(0), VAR_ID = character(0), REF = character(0),
+                       ALT = character(0), BETA_main = numeric(0), SE_main = numeric(0),
+                       PVALUE_main = numeric(0), Risk_Allele_main = character(0),
+                       Nonrisk_Allele_main = character(0), stringsAsFactors = FALSE)
+  }
+  hit <- match(out$VAR_KEY, main$VAR_KEY)
+  out$proxy_VAR_ID   <- main$VAR_ID[hit]
+  out$REF            <- main$REF[hit]
+  out$ALT            <- main$ALT[hit]
+  out$Risk_Allele    <- main$Risk_Allele_main[hit]
+  out$Nonrisk_Allele <- main$Nonrisk_Allele_main[hit]
+  out$PVALUE_main    <- main$PVALUE_main[hit]
+  out$BETA_main      <- main$BETA_main[hit]
+  out$SE_main        <- main$SE_main[hit]
+
+  # The proxy allele that travels with the sentinel's risk allele, per LDlink.
+  sentinel_risk <- sentinels$Risk_Allele[match(out$VAR_ID, sentinels$VAR_ID)]
+  corr <- if ("Correlated_Alleles" %in% names(out)) out$Correlated_Alleles else rep(NA_character_, nrow(out))
+  expected_risk <- vapply(seq_len(nrow(out)), function(i) {
+    if (is.na(corr[i]) || is.na(sentinel_risk[i])) return(NA_character_)
+    pairs <- strsplit(strsplit(corr[i], ",", fixed = TRUE)[[1]], "=", fixed = TRUE)
+    pairs <- pairs[vapply(pairs, length, integer(1)) == 2L]
+    if (length(pairs) == 0L) return(NA_character_)
+    from <- vapply(pairs, `[`, character(1), 1L)
+    to   <- vapply(pairs, `[`, character(1), 2L)
+    matched <- to[match(sentinel_risk[i], from)]
+    if (is.na(matched) || !grepl("^[ACGT]$", matched)) NA_character_ else matched
+  }, character(1))
+  opposes <- require_phase_consistency & !is.na(expected_risk) &
+    !is.na(out$Risk_Allele) & expected_risk != out$Risk_Allele
+
+  sentinel_parts <- data.table::tstrsplit(sentinels$VAR_ID, "_", fixed = TRUE)
+  sentinel_chrpos <- paste(sentinel_parts[[1]], sentinel_parts[[2]], sep = ":")
+  palindromic <- paste0(out$proxy_A1, out$proxy_A2) %in% c("AT", "TA", "CG", "GC")
+
+  out$status <- dplyr::case_when(
+    out$proxy_ChrPos %in% sentinel_chrpos                      ~ "is_a_sentinel",
+    palindromic                                                ~ "strand_ambiguous",
+    is.na(out$proxy_VAR_ID)                                    ~ "not_in_main_gwas",
+    is.na(out$Risk_Allele)                                     ~ "no_main_direction",
+    is.na(out$PVALUE_main)                                     ~ "main_pvalue_missing",
+    out$PVALUE_main > main_pval_cutoff                         ~ "main_pvalue_above_cutoff",
+    opposes                                                    ~ "risk_allele_opposes_sentinel",
+    TRUE                                                       ~ "qualified"
+  )
+
+  out <- out[, c("VAR_ID", intersect("query_snp", names(out)), "proxy_rsID", "proxy_ChrPos",
+                 "proxy_VAR_ID", "CHR", "POS", "REF", "ALT", "r2", "Risk_Allele",
+                 "Nonrisk_Allele", "PVALUE_main", "BETA_main", "SE_main", "status"),
+             drop = FALSE]
+  if (nrow(out) > 0L) {
+    counts <- table(out$status)
+    message("Proxy candidates against the primary GWAS: ",
+            paste(sprintf("%s = %d", names(counts), as.integer(counts)), collapse = "; "))
+  }
+  attr(out, "unanswered") <- if (is.null(unanswered)) character(0) else unanswered
+  out
+}
+
+select_proxies <- function(need_proxies, qualified, z_candidates,
+                           min_nonmissing = 0.8,
+                           unanswered = attr(qualified, "unanswered")) {
+  # Step 3 of the proxy stage: choose one proxy per flagged sentinel.
+  #
+  # need_proxies : the flagged sentinels (VAR_ID; PVALUE_main if available)
+  # qualified    : output of qualify_proxy_candidates()
+  # z_candidates : z-scores for the qualified candidates over the retained
+  #                traits (rows named "Chr:Pos"), from a second
+  #                fetch_summary_stats() call
+  #
+  # A candidate must be qualified and have data for at least `min_nonmissing`
+  # of the traits. Among those, the one in strongest LD with the sentinel is
+  # chosen (then most trait data, then lowest primary-GWAS P). A variant is the
+  # proxy for at most one sentinel; sentinels choose in order of primary-GWAS P.
+  # A flagged sentinel with no proxy is dropped: there is no rescue.
+  #
+  # Returns a list:
+  #   chosen     one row per sentinel that got a proxy
+  #   no_proxy   flagged sentinels with no proxy, with the reason
+  #   candidates every candidate with its final status
+
+  if (!"VAR_ID" %in% names(need_proxies)) stop("need_proxies must have a VAR_ID column.")
+  if (is.null(unanswered)) unanswered <- character(0)
+  audit <- as.data.frame(qualified, stringsAsFactors = FALSE)
+  if (!"status" %in% names(audit)) stop("qualified must be the output of qualify_proxy_candidates().")
+
+  coverage <- if (is.null(z_candidates) || nrow(z_candidates) == 0L) {
+    numeric(0)
+  } else {
+    rowMeans(!is.na(as.matrix(z_candidates)))
+  }
+  audit$coverage <- unname(coverage[audit$proxy_ChrPos])
+  too_sparse <- audit$status == "qualified" &
+    (is.na(audit$coverage) | audit$coverage < min_nonmissing)
+  audit$status[too_sparse] <- "insufficient_trait_data"
+
+  p_main <- if ("PVALUE_main" %in% names(audit)) audit$PVALUE_main else rep(0, nrow(audit))
+  sentinel_order <- if ("PVALUE_main" %in% names(need_proxies)) {
+    need_proxies$VAR_ID[order(need_proxies$PVALUE_main)]
+  } else {
+    need_proxies$VAR_ID
+  }
+
+  used <- character(0)
+  blocked <- character(0)
+  chosen_rows <- integer(0)
+  for (sentinel in sentinel_order) {
+    idx <- which(audit$VAR_ID == sentinel & audit$status == "qualified")
+    if (length(idx) == 0L) next
+    idx <- idx[order(-audit$r2[idx], -audit$coverage[idx], p_main[idx], audit$proxy_ChrPos[idx])]
+    free <- idx[!audit$proxy_ChrPos[idx] %in% used]
+    if (length(free) == 0L) {
+      blocked <- c(blocked, sentinel)
+      next
+    }
+    chosen_rows <- c(chosen_rows, free[1])
+    used <- c(used, audit$proxy_ChrPos[free[1]])
+  }
+  audit$status[chosen_rows] <- "chosen"
+  audit$status[audit$status == "qualified"] <- "qualified_not_chosen"
+
+  chosen <- audit[chosen_rows, , drop = FALSE]
+  names(chosen)[names(chosen) == "VAR_ID"] <- "original_SNP"
+  chosen <- chosen[, intersect(c("original_SNP", "proxy_VAR_ID", "proxy_ChrPos", "proxy_rsID",
+                                 "r2", "coverage", "CHR", "POS", "REF", "ALT", "Risk_Allele",
+                                 "Nonrisk_Allele", "PVALUE_main", "BETA_main", "SE_main"),
+                               names(chosen)), drop = FALSE]
+  rownames(chosen) <- NULL
+
+  without <- setdiff(need_proxies$VAR_ID, chosen$original_SNP)
+  no_proxy <- data.frame(
+    VAR_ID = without,
+    reason = vapply(without, function(sentinel) {
+      rows <- audit[audit$VAR_ID == sentinel, , drop = FALSE]
+      if (sentinel %in% unanswered) {
+        "ldlink_no_answer"
+      } else if (nrow(rows) == 0L) {
+        "no_ld_candidate"
+      } else if (sentinel %in% blocked) {
+        "candidate_used_by_another_sentinel"
+      } else if (any(rows$status == "insufficient_trait_data")) {
+        "no_candidate_with_enough_trait_data"
+      } else {
+        "no_candidate_passed_primary_filters"
+      }
+    }, character(1)),
+    stringsAsFactors = FALSE
+  )
+  rownames(no_proxy) <- NULL
+
+  message(sprintf("Proxies: %d flagged sentinel(s); proxy chosen for %d; %d dropped with no proxy.",
+                  nrow(need_proxies), nrow(chosen), nrow(no_proxy)))
+  if (nrow(no_proxy) > 0L) {
+    counts <- table(no_proxy$reason)
+    message("  No proxy because: ",
+            paste(sprintf("%s = %d", names(counts), as.integer(counts)), collapse = "; "))
+  }
+
+  list(chosen = chosen, no_proxy = no_proxy, candidates = audit)
+}
+
+# Legacy single-call proxy search, kept for run scripts that pre-fetch a pool of
+# proxy candidates (zmat_fullset must already hold every candidate). New run
+# scripts should use the three functions above. Like them, it does not rescue:
+# a flagged sentinel with no proxy is dropped.
 choose_proxies <- function(need_proxies,
                            rsid_map_dir = "rsid_maps_by_chr",
                            pruned_variants,
@@ -1535,87 +1929,18 @@ choose_proxies <- function(need_proxies,
   }
 
   # ==========================================================
-  # FINAL SELECTION LOGIC: FALLBACK WITH GUARDRAILS (FIXED)
+  # FINAL SETS
   # ==========================================================
-  
-  # 1. Identify who got a proxy
-  if (!is.null(final_proxy_df) && nrow(final_proxy_df) > 0) {
-    replaced_originals <- unique(final_proxy_df$VAR_ID)
-  } else {
-    replaced_originals <- character(0)
-  }
-  
-  # 2. Identify who FAILED to get a proxy
-  failed_search_vars <- setdiff(need_proxies$VAR_ID, replaced_originals)
-  
-  # 3. Assess "Rescue" Potential for Failed Variants
-  rescued_vars <- character(0)
-  
-  if (length(failed_search_vars) > 0) {
-    message("Assessing failed variants for rescue (Strict QC)...")
-    
-    check_df <- data.frame(VAR_ID = failed_search_vars, stringsAsFactors = FALSE) %>%
-      separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"), sep = "_", remove = FALSE) %>%
-      mutate(
-        ChrPos_prefix = paste0("chr", CHR, ":", POS),  # Format: chr1:100
-        ChrPos_noprefix = paste0(CHR, ":", POS)        # Format: 1:100
-      )
-    
-    # Calculate missingness using BOTH formats to be safe
-    if (!is.null(zmat_fullset)) {
-      z_mat <- as.matrix(zmat_fullset)
-      
-      # Check which format matches the Z-matrix keys
-      keys_prefix <- intersect(check_df$ChrPos_prefix, rownames(z_mat))
-      keys_noprefix <- intersect(check_df$ChrPos_noprefix, rownames(z_mat))
-      
-      # Decide which key column to use
-      if (length(keys_prefix) >= length(keys_noprefix)) {
-        use_col <- "ChrPos_prefix"
-        valid_keys <- keys_prefix
-      } else {
-        use_col <- "ChrPos_noprefix"
-        valid_keys <- keys_noprefix
-      }
-      # message(sprintf("Matching Z-matrix using format: %s (Matches: %d)", use_col, length(valid_keys)))
-      
-      # Calculate fractions
-      miss_stats <- rowSums(!is.na(z_mat[valid_keys, , drop=FALSE])) / ncol(z_mat)
-      
-      check_df$frac_nonmissing <- 0 
-      match_idx <- match(check_df[[use_col]], names(miss_stats))
-      check_df$frac_nonmissing[!is.na(match_idx)] <- miss_stats[na.omit(match_idx)]
-      
-    } else {
-      warning("zmat_fullset missing; cannot calculate missingness for rescue. Defaulting to 0.")
-      check_df$frac_nonmissing <- 0
-    }
-    
-    # APPLY THE FILTERS
-    rescue_candidates <- check_df %>%
-      mutate(
-        is_ambiguous = paste0(REF, ALT) %in% c("AT", "TA", "GC", "CG"),
-        is_multiallelic = grepl(",", ALT),
-        is_missing_too_high = frac_nonmissing < 0.5
-      ) 
-    
-    # Corrected Logging: Use 'rescue_candidates' (the mutated df), not 'check_df'
-    message(sprintf("  - Dropped %d ambiguous variants", sum(rescue_candidates$is_ambiguous)))
-    message(sprintf("  - Dropped %d multi-allelic variants", sum(rescue_candidates$is_multiallelic)))
-    message(sprintf("  - Dropped %d variants with <50%% data", sum(rescue_candidates$is_missing_too_high)))
-    
-    # Final Selection
-    rescued_final <- rescue_candidates %>%
-      filter(!is_ambiguous & !is_multiallelic & !is_missing_too_high)
-    
-    rescued_vars <- rescued_final$VAR_ID
-    message(sprintf("  - RESCUED %d variants (Clean & >50%% data)", length(rescued_vars)))
-  }
-  
-  # 4. Construct Final Sets
-  vars_never_needed_proxy <- setdiff(pruned_variants$VAR_ID, need_proxies$VAR_ID)
-  final_originals_to_keep <- c(vars_never_needed_proxy, rescued_vars)
-  
+  # Originals that never needed a proxy are kept. A flagged sentinel is kept
+  # only through a proxy; one with no acceptable proxy is dropped (no rescue).
+  final_originals_to_keep <- setdiff(pruned_variants$VAR_ID, need_proxies$VAR_ID)
+  dropped_without_proxy <- setdiff(
+    need_proxies$VAR_ID,
+    if (!is.null(final_proxy_df) && nrow(final_proxy_df) > 0) final_proxy_df$VAR_ID else character(0)
+  )
+  message(sprintf("Dropped %d flagged variant(s) with no acceptable proxy.",
+                  length(dropped_without_proxy)))
+
   final_variant_set <- list(
     final_originals_to_keep,  # 1. Originals
     final_proxy_df           # 2. Proxies

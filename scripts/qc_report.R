@@ -38,6 +38,10 @@
 #   nonmissing_cutoff        threshold below which a sentinel needs a proxy
 #   proxies_needed           data frame with VAR_ID and reason
 #   proxies_found            data frame with original_SNP (and the proxy chosen)
+#   proxies_not_found        select_proxies()$no_proxy: VAR_ID and why no proxy
+#   proxy_candidates         select_proxies()$candidates: every LD candidate
+#                            with its final status
+#   proxy_unanswered         sentinels LDlink gave no answer for
 #   final_variants           data frame with VAR_ID and Variant_Type
 #   bnmf_run_summary         data frame with K per repetition
 #   comparison               list(label, previous, current): character vectors
@@ -323,20 +327,47 @@ write_qc_report <- function(qc, file,
       parts <- c(parts, "<h3>Sentinels needing a proxy, by reason</h3>",
                  qc_html_table(reason_counts))
     }
+    if (has("proxy_unanswered")) {
+      flags <- c(flags, sprintf(
+        "LDlink returned no answer for %d flagged sentinel(s): %s. They got no proxy in this run; rerun to ask again.",
+        length(qc$proxy_unanswered), qc_name_list(qc$proxy_unanswered)))
+    }
     if (nrow(needed) > 0L && "VAR_ID" %in% names(needed)) {
       found_ids <- if ("original_SNP" %in% names(found)) found$original_SNP else character(0)
       not_found <- setdiff(needed$VAR_ID, found_ids)
       parts <- c(parts, para(sprintf(
-        "%d sentinel(s) needed a proxy; a proxy was found for %d and not for %d.",
+        "%d sentinel(s) needed a proxy; a proxy was found for %d and not for %d. A flagged sentinel with no proxy is dropped.",
         nrow(needed), length(intersect(needed$VAR_ID, found_ids)), length(not_found))))
       if (length(not_found) > 0L) {
         flags <- c(flags, sprintf(
-          "%d sentinel(s) needed a proxy and no proxy was found: %s.",
+          "%d sentinel(s) needed a proxy and no proxy was found, so they were dropped: %s.",
           length(not_found), qc_name_list(not_found)))
-        without <- needed[needed$VAR_ID %in% not_found, , drop = FALSE]
+        # Prefer the proxy stage's own account of why (select_proxies()$no_proxy).
+        without <- if (has_rows("proxies_not_found")) {
+          names(qc$proxies_not_found)[names(qc$proxies_not_found) == "reason"] <- "why_no_proxy"
+          merge(needed[needed$VAR_ID %in% not_found, , drop = FALSE],
+                qc$proxies_not_found, by = "VAR_ID", all.x = TRUE, sort = FALSE)
+        } else {
+          needed[needed$VAR_ID %in% not_found, , drop = FALSE]
+        }
+        if ("why_no_proxy" %in% names(without)) {
+          why_counts <- as.data.frame(table(why_no_proxy = without$why_no_proxy),
+                                      stringsAsFactors = FALSE)
+          names(why_counts)[2] <- "n_sentinels"
+          parts <- c(parts, "<h3>Why no proxy was found</h3>", qc_html_table(why_counts))
+        }
         parts <- c(parts, "<h3>Sentinels with no proxy found</h3>",
                    qc_html_table(without, max_rows = 500L))
       }
+    }
+    if (has_rows("proxy_candidates") && "status" %in% names(qc$proxy_candidates)) {
+      outcome_counts <- as.data.frame(table(outcome = qc$proxy_candidates$status),
+                                      stringsAsFactors = FALSE)
+      names(outcome_counts)[2] <- "n_candidates"
+      outcome_counts <- outcome_counts[order(-outcome_counts$n_candidates), , drop = FALSE]
+      parts <- c(parts, "<h3>Proxy candidates by outcome</h3>",
+                 para("Every LD partner LDlink returned at or above the r2 threshold, and what became of it."),
+                 qc_html_table(outcome_counts))
     }
     if (nrow(found) > 0L) {
       parts <- c(parts, "<h3>Proxies chosen</h3>", qc_html_table(found, max_rows = 500L))

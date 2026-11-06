@@ -112,3 +112,23 @@ test_that("text from the data is escaped", {
   odd_html <- paste(readLines(odd_file, warn = FALSE), collapse = "\n")
   expect_match(odd_html, "HDL&lt;C&gt; &amp; friends", fixed = TRUE)
 })
+
+test_that("proxy candidate outcomes and unanswered LDlink queries appear in the report", {
+  with_proxy_audit <- full_qc
+  with_proxy_audit$proxy_candidates <- data.frame(
+    VAR_ID = c("1_2000_C_T", "1_2000_C_T", "2_5000_A_C"),
+    proxy_ChrPos = c("1:2100", "1:2200", "2:5100"),
+    status = c("chosen", "main_pvalue_above_cutoff", "not_in_main_gwas")
+  )
+  with_proxy_audit$proxies_not_found <- data.frame(
+    VAR_ID = "2_5000_A_C", reason = "no_candidate_passed_primary_filters"
+  )
+  with_proxy_audit$proxy_unanswered <- "3_7000_A_G"
+  audit_file <- tempfile(fileext = ".html")
+  audit_flags <- quietly(write_qc_report(with_proxy_audit, audit_file))
+  audit_html <- paste(readLines(audit_file, warn = FALSE), collapse = "\n")
+  expect_match(audit_html, "Proxy candidates by outcome", fixed = TRUE)
+  expect_match(audit_html, "main_pvalue_above_cutoff", fixed = TRUE)
+  expect_match(audit_html, "no_candidate_passed_primary_filters", fixed = TRUE)
+  expect_true(any(grepl("LDlink returned no answer", audit_flags)))
+})

@@ -469,7 +469,8 @@ read_single_trait_dt <- function(trait,
 fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
                                 trait_ss_size = NULL, pval_cutoff = 1,
                                 pval_bonf = NULL, checkpoint_dir = NULL,
-                                trait_effect_allele = NULL) {
+                                trait_effect_allele = NULL,
+                                n_workers = 1L) {
 
   # GOAL: Fetch trait summary statistics for a set of variants and return
   # z-scores oriented to each variant's risk allele, keyed by "Chr:Pos".
@@ -496,6 +497,13 @@ fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
   # trait_ss_size       : named vector of trait sample sizes (optional)
   # trait_effect_allele : optional named vector overriding the effect-allele
   #                       rule for individual traits ("ALT", "REF", or a column)
+  # n_workers           : number of trait files to read at the same time
+  #                       (default 1). Each trait file is decompressed and
+  #                       scanned in full, so this step's time is set by the
+  #                       number and size of the trait files, not by how many
+  #                       variants are requested. Workers are forked processes
+  #                       (parallel::mclapply); on Windows the fetch is serial.
+  #                       Results and checkpoints are identical for any value.
   #
   # OUTPUT: a list with
   #   df_z     z-scores, one row for EVERY variant that passed the primary
@@ -661,15 +669,23 @@ fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
   if (!is.null(checkpoint_dir))
     dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
 
+  # Temporary files carry the process id: forked workers share one temporary
+  # directory and must never pick the same file name.
   object_md5 <- function(object) {
-    hash_file <- tempfile("checkpoint_signature_", fileext = ".bin")
+    hash_file <- tempfile(sprintf("checkpoint_signature_%d_", Sys.getpid()), fileext = ".bin")
     on.exit(unlink(hash_file), add = TRUE)
     writeBin(serialize(object, NULL, version = 3), hash_file)
     unname(tools::md5sum(hash_file))
   }
 
-  # 1. Run lapply on the trait names. This creates an UNNAMED list.
-  list_of_results <- lapply(names(trait_ss_files), function(trait) {
+  # Fetch one trait: reuse its checkpoint when valid, otherwise read the file.
+  # Self-contained, so traits can be processed one at a time or in parallel.
+  process_trait <- function(trait) {
+    # Each trait writes its own search-term file (the terms depend on the
+    # trait file's ID format), so nothing is shared between workers.
+    trait_tmp_file <- tempfile(sprintf("variants_to_query_%d_", Sys.getpid()), fileext = ".tmp")
+    on.exit(unlink(trait_tmp_file), add = TRUE)
+
     cp_file <- if (!is.null(checkpoint_dir))
       file.path(checkpoint_dir, paste0(gsub("[^A-Za-z0-9_.-]", "_", trait), ".rds"))
     else NULL
@@ -713,7 +729,7 @@ fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
         read_trait_input = df_read_trait_input,
         trait_ss_files = trait_ss_files,
         trait_ss_size = trait_ss_size,
-        tmp_var_file = tmp_var_file,
+        tmp_var_file = trait_tmp_file,
         effect_allele = trait_override
       ),
       error = function(e) {
@@ -730,8 +746,59 @@ fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
     }
 
     result
-  })
-  
+  }
+
+  # 1. Process every trait. This creates an UNNAMED list in trait order.
+  trait_names <- names(trait_ss_files)
+  n_workers <- suppressWarnings(as.integer(n_workers))
+  if (length(n_workers) != 1L || is.na(n_workers) || n_workers < 1L) {
+    stop("n_workers must be one positive whole number.")
+  }
+  n_workers <- min(n_workers, length(trait_names))
+
+  if (n_workers > 1L && .Platform$OS.type != "windows") {
+    message(sprintf("Fetching %d traits with %d parallel workers...",
+                    length(trait_names), n_workers))
+    # One forked process per trait (no pre-scheduling), so a slow file does not
+    # hold up the traits queued behind it. An error is captured in the worker
+    # and raised below with the trait's name.
+    list_of_results <- parallel::mclapply(
+      trait_names,
+      function(trait) {
+        tryCatch(
+          process_trait(trait),
+          error = function(e) {
+            structure(list(message = conditionMessage(e)), class = "trait_fetch_error")
+          }
+        )
+      },
+      mc.cores = n_workers,
+      mc.preschedule = FALSE
+    )
+
+    failure_message <- vapply(seq_along(list_of_results), function(i) {
+      res <- list_of_results[[i]]
+      if (inherits(res, "trait_fetch_error")) {
+        res$message
+      } else if (inherits(res, "try-error")) {
+        sprintf("Trait %s failed: %s", trait_names[i], as.character(res))
+      } else if (is.null(res)) {
+        sprintf("Trait %s: the worker process ended without a result (out of memory or killed?).",
+                trait_names[i])
+      } else {
+        NA_character_
+      }
+    }, character(1))
+    if (any(!is.na(failure_message))) {
+      stop(sprintf("Trait fetch failed for %d of %d trait(s):\n  %s",
+                   sum(!is.na(failure_message)), length(trait_names),
+                   paste(failure_message[!is.na(failure_message)], collapse = "\n  ")),
+           call. = FALSE)
+    }
+  } else {
+    list_of_results <- lapply(trait_names, process_trait)
+  }
+
   # 2. *** THE FIX: Immediately set the names of the list ***
   #    This ensures the list is correctly named before any other step.
   names(list_of_results) <- names(trait_ss_files)

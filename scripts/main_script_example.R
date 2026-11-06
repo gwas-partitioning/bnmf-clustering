@@ -13,8 +13,7 @@
 # or external LD-pruning step. Projects may instead choose position-based
 # clumping with snp_clump() or LD-based pruning with LDlink SNPclip; these are
 # distinct strategies and should be selected deliberately. LDlink pruning and
-# proxy replacement require an LDlink token and, for proxies, a current
-# per-chromosome rsID map. The toy data can run without either external input.
+# proxy replacement require an LDlink token. The toy data can run without it.
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -55,13 +54,10 @@ dir.create(main_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Variant-selection settings.
 #   PVCUTOFF        discovery-GWAS P a variant needs to be a sentinel
-#   PVCUTOFF_PROXY  discovery-GWAS P for the wider pool of possible proxies
 #   MAIN_PVCUTOFF   primary-GWAS P every variant needs to stay in. It must also
 #                   have the same risk allele in the discovery and primary GWAS.
 PVCUTOFF <- 5e-8
-PVCUTOFF_PROXY <- 5e-6
 MAIN_PVCUTOFF <- 0.05
-PROXY_WINDOW_KB <- 500
 
 # Which variant leads each locus when clumping or LD pruning: the strongest in
 # the primary GWAS, with the discovery P as tiebreaker.
@@ -75,9 +71,9 @@ LD_R2 <- 0.05
 LD_MAF <- 0.001
 LDLINK_TOKEN <- Sys.getenv("LDLINK_TOKEN", unset = "")
 
-# Proxy search additionally requires files named chrN.txt with four columns:
-# hg19 position (chrN:position), rsID, reference allele, alternate allele.
-RSID_MAP_DIR <- file.path(example_dir, "rsid_maps_by_chr")
+# Proxy settings: a sentinel needs a proxy when it is strand-ambiguous or has
+# data for less than PROXY_MIN_NONMISSING of the retained traits. A proxy must
+# reach PROXY_MIN_R2 with its sentinel and the same trait coverage.
 PROXY_MIN_NONMISSING <- 0.8
 PROXY_MIN_R2 <- 0.8
 
@@ -95,15 +91,15 @@ BNMF_TOLERANCE <- 1e-6
 BNMF_PHI <- 1
 BNMF_WORKERS <- max(1L, min(2L, parallelly::availableCores()))
 
+# Number of trait files read at the same time by fetch_summary_stats(). On a
+# cluster, set this to the number of slots the job was given.
+TRAIT_FETCH_WORKERS <- max(1L, min(2L, parallelly::availableCores()))
+
 if (RUN_PROXY_SEARCH && !RUN_LDLINK_PRUNING) {
   stop("RUN_PROXY_SEARCH requires RUN_LDLINK_PRUNING so original rsIDs are available.")
 }
 if ((RUN_LDLINK_PRUNING || RUN_PROXY_SEARCH) && !nzchar(LDLINK_TOKEN)) {
   stop("Set the LDLINK_TOKEN environment variable before enabling LDlink steps.")
-}
-if (RUN_PROXY_SEARCH && !dir.exists(RSID_MAP_DIR)) {
-  stop("Proxy search requires a current per-chromosome rsID map directory: ",
-       RSID_MAP_DIR)
 }
 
 # =============================================================================
@@ -162,10 +158,8 @@ qc <- list(
   run_name = version,
   settings = list(
     PVCUTOFF = PVCUTOFF,
-    PVCUTOFF_PROXY = PVCUTOFF_PROXY,
     MAIN_PVCUTOFF = MAIN_PVCUTOFF,
     LOCUS_ORDER_BY = LOCUS_ORDER_BY,
-    PROXY_WINDOW_KB = PROXY_WINDOW_KB,
     RUN_LDLINK_PRUNING = RUN_LDLINK_PRUNING,
     RUN_PROXY_SEARCH = RUN_PROXY_SEARCH,
     MIN_MEDIAN_N = MIN_MEDIAN_N,
@@ -182,13 +176,14 @@ qc <- list(
 # 2. Select sentinel variants
 # =============================================================================
 
-# Collect every variant below the broad cutoff from each discovery GWAS. This
-# pool supplies the sentinels and their possible proxies. Files do not need to
-# share one REF/ALT order: variants are matched on position and allele pair.
+# Collect every variant below the sentinel cutoff from each discovery GWAS.
+# Files do not need to share one REF/ALT order: variants are matched on
+# position and allele pair. (Proxies are not drawn from this set; they come
+# from LDlink in section 5 and are fetched separately.)
 vars_sig <- get_sig_snps(
   gwas = gwas,
   rename_cols = NULL,
-  PVCUTOFF = PVCUTOFF_PROXY
+  PVCUTOFF = PVCUTOFF
 )
 write_tsv(attr(vars_sig, "input_qc"),
           file.path(main_dir, "input_qc_discovery_gwas.txt"))
@@ -232,10 +227,7 @@ if (nrow(sentinel_candidates) == 0L) {
 # here and subset sentinel_candidates to the returned IDs. For LD-based pruning, enable the
 # SNPclip step below instead; position-based clumping is not a substitute for LD.
 
-message(sprintf(
-  "Variant selection: %d broad candidates and %d sentinel-level variants.",
-  nrow(vars_no_hla), nrow(sentinel_candidates)
-))
+message(sprintf("Variant selection: %d sentinel candidates.", nrow(sentinel_candidates)))
 
 # =============================================================================
 # 3. Optional LDlink pruning
@@ -297,61 +289,31 @@ if (nrow(pruned_vars) == 0L) {
 }
 
 # =============================================================================
-# 4. Fetch and harmonize the multi-trait summary statistics
+# 4. Fetch trait summary statistics for the sentinels
 # =============================================================================
-
-# Trait data are matched by position, so keep one variant per position. A
-# sentinel always keeps its own position; otherwise the locus order decides.
-fetch_input <- window_to_sentinels(
-  candidates = vars_no_hla,
-  sentinels = pruned_vars,
-  window_kb = PROXY_WINDOW_KB
-) %>%
-  mutate(SNP = ChrPos,
-         is_sentinel = VAR_ID %in% pruned_vars$VAR_ID) %>%
-  arrange(desc(is_sentinel), across(all_of(LOCUS_ORDER_BY))) %>%
-  distinct(SNP, .keep_all = TRUE) %>%
-  select(-is_sentinel)
 
 trait_checkpoint_dir <- file.path(main_dir, "trait_checkpoints")
 
-# fetch_input already carries the primary-GWAS risk alleles and has passed the
+# The sentinels already carry the primary-GWAS risk alleles and have passed the
 # primary-GWAS filters, so the primary file is not read again and nothing is
-# filtered here. The z-matrix has one row for every variant in fetch_input.
+# filtered here. The z-matrix has one row for every sentinel.
 z_n_mats <- fetch_summary_stats(
-  df_input = fetch_input,
+  df_input = pruned_vars %>% mutate(SNP = ChrPos),
   trait_ss_files = trait_ss_files,
   trait_ss_size = trait_ss_size,
   checkpoint_dir = trait_checkpoint_dir,
-  trait_effect_allele = trait_effect_allele
+  trait_effect_allele = trait_effect_allele,
+  # Each trait file is read in full, so this step scales with the number and
+  # size of trait files. Reading several at once is the main way to speed it up.
+  n_workers = TRAIT_FETCH_WORKERS
 )
 write_tsv(z_n_mats$trait_qc, file.path(main_dir, "input_qc_trait_gwas.txt"))
 qc$trait_qc <- z_n_mats$trait_qc
 
-zmat_fullset <- as.matrix(z_n_mats$df_z)
-Nmat_fullset <- as.matrix(z_n_mats$df_N)
+zmat_pruned <- as.matrix(z_n_mats$df_z)[pruned_vars$ChrPos, , drop = FALSE]
+Nmat_pruned <- as.matrix(z_n_mats$df_N)[pruned_vars$ChrPos, , drop = FALSE]
 
-missing_sentinels <- setdiff(pruned_vars$ChrPos, rownames(zmat_fullset))
-if (length(missing_sentinels) > 0L) {
-  stop("No z-matrix row was created for sentinel(s): ",
-       paste(missing_sentinels, collapse = ", "))
-}
-
-# A sentinel with no data in any trait file is a real missingness problem. With
-# the proxy search on it is flagged below and replaced or dropped; with it off
-# there is nothing to cluster it on, so stop.
-sentinels_without_trait_data <- pruned_vars$ChrPos[
-  rowSums(!is.na(zmat_fullset[pruned_vars$ChrPos, , drop = FALSE])) == 0L
-]
-if (length(sentinels_without_trait_data) > 0L && !RUN_PROXY_SEARCH) {
-  stop("Sentinel(s) with no data in any trait file: ",
-       paste(sentinels_without_trait_data, collapse = ", "),
-       ". Enable the proxy search or remove them.")
-}
-
-zmat_pruned <- zmat_fullset[pruned_vars$ChrPos, , drop = FALSE]
-Nmat_pruned <- Nmat_fullset[pruned_vars$ChrPos, , drop = FALSE]
-
+# Trait filters, judged on the sentinels: median sample size and missingness.
 median_N <- apply(Nmat_pruned, 2, median, na.rm = TRUE)
 traits_high_N <- names(median_N)[is.finite(median_N) & median_N >= MIN_MEDIAN_N]
 trait_missingness <- colMeans(is.na(zmat_pruned[, traits_high_N, drop = FALSE]))
@@ -364,18 +326,50 @@ if (length(traits_final) < 2L) {
 traits_removed_low_N <- setdiff(colnames(zmat_pruned), traits_high_N)
 traits_removed_missing <- setdiff(traits_high_N, traits_final)
 
+# Fraction of the retained traits with data, for every sentinel.
 variant_nonmissingness <- rowMeans(!is.na(zmat_pruned[, traits_final, drop = FALSE]))
 variant_nonmissingness <- setNames(variant_nonmissingness, pruned_vars$VAR_ID)
 qc$sentinel_nonmissingness <- variant_nonmissingness
 
+# A sentinel with no data in any trait file is a real missingness problem. With
+# the proxy search on it is flagged below and replaced or dropped; with it off
+# there is nothing to cluster it on, so stop.
+sentinels_without_trait_data <- names(variant_nonmissingness)[variant_nonmissingness == 0]
+if (length(sentinels_without_trait_data) > 0L && !RUN_PROXY_SEARCH) {
+  stop("Sentinel(s) with no data in any trait file: ",
+       paste(sentinels_without_trait_data, collapse = ", "),
+       ". Enable the proxy search or remove them.")
+}
+
 # =============================================================================
 # 5. Optional proxy search and final variant assembly
 # =============================================================================
+# A sentinel that is strand-ambiguous or has too little trait data is replaced
+# by a variant in strong LD with it, or dropped if none qualifies. It is never
+# kept as itself. The steps:
+#   a. flag the sentinels that need a proxy
+#   b. ask LDlink for their LD partners (the only step that needs a network)
+#   c. judge each partner against the primary GWAS, as a sentinel was judged
+#   d. fetch trait data for the partners that qualify (a second trait fetch)
+#   e. choose one proxy per sentinel
+
+final_originals <- pruned_vars %>%
+  transmute(
+    VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
+    original_SNP = VAR_ID, REF, ALT, Risk_Allele,
+    PVALUE_discovery, PVALUE_main, BETA_main, SE_main, proxy_r2 = NA_real_
+  )
+final_proxies <- final_originals[0, ]
+zmat_proxies <- NULL
+Nmat_proxies <- NULL
+n_proxies_needed <- NA_integer_
 
 if (RUN_PROXY_SEARCH) {
+  # a. Errors if any sentinel has no non-missingness value.
   proxies_needed <- find_variants_needing_proxies(
     gwas_variant_df = pruned_vars,
-    var_nonmissingness = variant_nonmissingness
+    var_nonmissingness = variant_nonmissingness,
+    missing_cutoff = PROXY_MIN_NONMISSING
   ) %>%
     inner_join(pruned_vars %>% select(VAR_ID, Population), by = "VAR_ID") %>%
     mutate(
@@ -385,101 +379,102 @@ if (RUN_PROXY_SEARCH) {
         TRUE ~ Population
       )
     )
+  n_proxies_needed <- nrow(proxies_needed)
+  qc$proxies_needed <- proxies_needed
 
-  pruned_by_search_pop <- pruned_vars %>%
-    mutate(
-      search_population = case_when(
-        Population %in% c("EUR", "TA", "MA") ~ "EUR",
-        Population == "SA" ~ "SAS",
-        TRUE ~ Population
-      )
-    )
-
-  supported_pops <- c("EUR", "EAS", "AFR", "AMR", "SAS")
-  proxy_pops <- unique(pruned_by_search_pop$search_population)
-  unsupported_pops <- setdiff(proxy_pops, supported_pops)
+  unsupported_pops <- setdiff(unique(proxies_needed$search_population),
+                              c("EUR", "EAS", "AFR", "AMR", "SAS"))
   if (length(unsupported_pops) > 0L) {
     stop("Unsupported LDlink proxy population(s): ",
          paste(unsupported_pops, collapse = ", "))
   }
 
-  proxy_sets <- lapply(proxy_pops, function(pop) {
-    needed_pop <- proxies_needed %>%
-      filter(search_population == pop) %>%
-      select(-search_population)
-    pruned_pop <- pruned_by_search_pop %>%
-      filter(search_population == pop) %>%
-      select(-search_population)
+  if (nrow(proxies_needed) > 0L) {
+    # b. LD partners, searched in the population each sentinel was found in.
+    #    Answers are kept on disk; a rerun only asks for what is missing.
+    candidate_sets <- lapply(unique(proxies_needed$search_population), function(pop) {
+      find_proxy_candidates(
+        need_proxies = proxies_needed %>% filter(search_population == pop),
+        token = LDLINK_TOKEN,
+        population = pop,
+        output_dir = file.path(main_dir, "proxy_search", pop),
+        r2_min = PROXY_MIN_R2
+      )
+    })
+    proxy_candidates <- bind_rows(candidate_sets)
+    attr(proxy_candidates, "unanswered") <- unlist(lapply(candidate_sets, attr, "unanswered"))
 
-    if (nrow(needed_pop) == 0L) {
-      return(list(pruned_pop$VAR_ID, NULL))
+    # c. The same primary-GWAS rules a sentinel had to pass, plus: the proxy's
+    #    risk allele must travel with the sentinel's risk allele.
+    proxy_qualified <- qualify_proxy_candidates(
+      candidates = proxy_candidates,
+      main_ss_filepath = main_ss_filepath,
+      sentinels = pruned_vars,
+      main_pval_cutoff = MAIN_PVCUTOFF
+    )
+
+    # d. Second trait fetch, for the qualified candidates only.
+    candidates_to_fetch <- proxy_qualified %>%
+      filter(status == "qualified") %>%
+      distinct(proxy_ChrPos, .keep_all = TRUE) %>%
+      transmute(SNP = proxy_ChrPos, VAR_ID = proxy_VAR_ID, REF, ALT,
+                Risk_Allele, Nonrisk_Allele, PVALUE_main, BETA_main, SE_main)
+    if (nrow(candidates_to_fetch) > 0L) {
+      candidate_mats <- fetch_summary_stats(
+        df_input = candidates_to_fetch,
+        trait_ss_files = trait_ss_files[traits_final],
+        trait_ss_size = trait_ss_size[traits_final],
+        checkpoint_dir = file.path(main_dir, "trait_checkpoints_proxy_candidates"),
+        trait_effect_allele = trait_effect_allele,
+        n_workers = TRAIT_FETCH_WORKERS
+      )
+      zmat_proxies <- as.matrix(candidate_mats$df_z)[, traits_final, drop = FALSE]
+      Nmat_proxies <- as.matrix(candidate_mats$df_N)[, traits_final, drop = FALSE]
     }
 
-    choose_proxies(
-      need_proxies = needed_pop,
-      rsid_map_dir = RSID_MAP_DIR,
-      pruned_variants = pruned_pop,
-      zmat_fullset = zmat_fullset[, traits_final, drop = FALSE],
-      token = LDLINK_TOKEN,
-      population = pop,
-      frac_nonmissing_num = PROXY_MIN_NONMISSING,
-      r2_num = PROXY_MIN_R2,
-      variant_metadata = fetch_input,
-      output_dir = file.path(main_dir, "proxy_search", pop)
+    # e. Strongest LD first among candidates with enough trait data.
+    proxy_selection <- select_proxies(
+      need_proxies = proxies_needed,
+      qualified = proxy_qualified,
+      z_candidates = zmat_proxies,
+      min_nonmissing = PROXY_MIN_NONMISSING
     )
-  })
-  names(proxy_sets) <- proxy_pops
+    write_tsv(proxy_selection$candidates,
+              file.path(main_dir, "proxy_candidates_audit.txt"))
 
-  original_ids <- unique(unlist(lapply(proxy_sets, `[[`, 1L)))
-  proxy_rows <- bind_rows(lapply(proxy_sets, `[[`, 2L))
-
-  final_originals <- pruned_vars %>%
-    filter(VAR_ID %in% original_ids) %>%
-    transmute(
-      VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
-      original_SNP = VAR_ID, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population
-    )
-
-  if (nrow(proxy_rows) > 0L) {
-    proxy_metadata <- fetch_input %>%
-      select(VAR_ID, SNP, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population) %>%
-      distinct(SNP, .keep_all = TRUE)
-
-    final_proxies <- proxy_rows %>%
+    final_proxies <- proxy_selection$chosen %>%
+      left_join(pruned_vars %>% select(original_SNP = VAR_ID, PVALUE_discovery),
+                by = "original_SNP") %>%
       transmute(
-        original_SNP = VAR_ID,
-        ChrPos = proxy_ChrPos,
-        rsID = proxy_rsID,
-        Variant_Type = "proxy"
-      ) %>%
-      inner_join(proxy_metadata, by = c("ChrPos" = "SNP")) %>%
-      select(VAR_ID, ChrPos, rsID, Variant_Type, original_SNP,
-             REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population)
-  } else {
-    final_proxies <- final_originals[0, ]
+        VAR_ID = proxy_VAR_ID, ChrPos = proxy_ChrPos, rsID = proxy_rsID,
+        Variant_Type = "proxy", original_SNP, REF, ALT, Risk_Allele,
+        PVALUE_discovery, PVALUE_main, BETA_main, SE_main, proxy_r2 = r2
+      )
+
+    qc$proxies_found <- proxy_selection$chosen %>%
+      select(original_SNP, proxy = proxy_VAR_ID, rsID = proxy_rsID, r2, coverage)
+    qc$proxies_not_found <- proxy_selection$no_proxy
+    qc$proxy_candidates <- proxy_selection$candidates
+    qc$proxy_unanswered <- attr(proxy_qualified, "unanswered")
   }
 
-  final_snps <- bind_rows(final_originals, final_proxies)
-  qc$proxies_needed <- proxies_needed
-  qc$proxies_found <- proxy_rows
+  # A flagged sentinel stays in only through its proxy. There is no rescue.
+  final_originals <- final_originals %>%
+    filter(!VAR_ID %in% proxies_needed$VAR_ID)
 } else {
   message("Proxy search is disabled; retaining all position/LD-pruned originals.")
-  final_snps <- pruned_vars %>%
-    transmute(
-      VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
-      original_SNP = VAR_ID, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population
-    )
 }
 
+final_snps <- bind_rows(final_originals, final_proxies)
+
+if (nrow(final_snps) == 0L) {
+  stop("No variants remain after the proxy stage.")
+}
 if (anyDuplicated(final_snps$original_SNP)) {
   stop("Final assembly produced more than one retained variant for an original sentinel.")
 }
-if (!setequal(final_snps$original_SNP, pruned_vars$VAR_ID)) {
-  stop("Final assembly did not account for every pruned sentinel exactly once.")
-}
 if (anyDuplicated(final_snps$ChrPos)) {
-  stop("Final assembly contains the same position more than once (a proxy ",
-       "coincides with another retained variant).")
+  stop("Final assembly contains the same position more than once.")
 }
 
 write_tsv(
@@ -491,51 +486,46 @@ write_tsv(
 # 6. Primary-GWAS alignment and final matrices
 # =============================================================================
 
-# df_gwas holds the primary-GWAS statistics for every fetched variant. BETA is
-# the primary-GWAS effect of ALT (BETA_main from get_biggest_gwas()).
-gwas_alignment_source <- z_n_mats$df_gwas %>%
-  transmute(
-    ChrPos = SNP,
-    primary_REF = REF,
-    primary_ALT = ALT,
-    primary_Risk_Allele = Risk_Allele,
-    P_VALUE,
-    BETA,
-    SE
-  )
-
+# BETA is the primary-GWAS effect of ALT; BETA_aligned is the effect of the
+# risk allele, which must be positive for every variant.
 gwas_final <- final_snps %>%
-  inner_join(gwas_alignment_source, by = "ChrPos") %>%
-  mutate(
+  transmute(
+    VAR_ID, ChrPos, rsID, Variant_Type, original_SNP, REF, ALT, Risk_Allele,
+    PVALUE_discovery, proxy_r2,
+    P_VALUE = PVALUE_main, SE = SE_main, BETA = BETA_main,
     BETA_aligned = case_when(
-      primary_ALT == primary_Risk_Allele ~ BETA,
-      primary_REF == primary_Risk_Allele ~ -BETA,
+      ALT == Risk_Allele ~ BETA_main,
+      REF == Risk_Allele ~ -BETA_main,
       TRUE ~ NA_real_
     )
   )
 
-# Audit: every final variant has primary-GWAS statistics, the risk allele used
-# for trait alignment is the one carried from variant selection, and the effect
-# of that risk allele is positive.
-if (nrow(gwas_final) != nrow(final_snps) || anyNA(gwas_final$BETA_aligned) ||
-    any(gwas_final$Risk_Allele != gwas_final$primary_Risk_Allele) ||
-    any(gwas_final$BETA_aligned <= 0)) {
+if (anyNA(gwas_final$BETA_aligned) || any(gwas_final$BETA_aligned <= 0)) {
   stop("One or more final variants failed the primary-GWAS alignment audit.")
 }
 
 write_csv(gwas_final, file.path(main_dir, "alignment_GWAS_summStats.csv"))
+
+# Originals come from the sentinel fetch, proxies from the candidate fetch.
+zmat_pre_imputed <- zmat_pruned[final_originals$ChrPos, traits_final, drop = FALSE]
+Nmat_pre_imputed <- Nmat_pruned[final_originals$ChrPos, traits_final, drop = FALSE]
+if (nrow(final_proxies) > 0L) {
+  zmat_pre_imputed <- rbind(zmat_pre_imputed,
+                            zmat_proxies[final_proxies$ChrPos, , drop = FALSE])
+  Nmat_pre_imputed <- rbind(Nmat_pre_imputed,
+                            Nmat_proxies[final_proxies$ChrPos, , drop = FALSE])
+}
+stopifnot(identical(rownames(zmat_pre_imputed), gwas_final$ChrPos))
 
 # First write of the QC report: everything about the inputs and the variant
 # set is known at this point.
 qc$final_variants <- final_snps
 qc$funnel <- tibble(
   stage = c(
-    "Variants below the pool cutoff in any discovery GWAS",
+    "Variants below the sentinel cutoff in any discovery GWAS",
     "Kept by the primary-GWAS filters",
-    "After removing the HLA region",
-    "Sentinel candidates (discovery P below the sentinel cutoff)",
+    "After removing the HLA region (sentinel candidates)",
     "Sentinels after clumping / LD pruning",
-    "Variants fetched for traits (sentinels plus proxy candidates)",
     "Sentinels needing a proxy",
     "Proxies found",
     "Final variant set"
@@ -543,12 +533,10 @@ qc$funnel <- tibble(
   n = c(
     n_distinct(vars_sig$VAR_KEY),
     nrow(vars_main),
-    nrow(vars_no_hla),
     nrow(sentinel_candidates),
     nrow(pruned_vars),
-    nrow(fetch_input),
-    if (RUN_PROXY_SEARCH) nrow(proxies_needed) else NA_integer_,
-    if (RUN_PROXY_SEARCH) sum(final_snps$Variant_Type == "proxy") else NA_integer_,
+    n_proxies_needed,
+    if (RUN_PROXY_SEARCH) nrow(final_proxies) else NA_integer_,
     nrow(final_snps)
   )
 )
@@ -559,9 +547,6 @@ if (!RUN_PROXY_SEARCH) {
   qc$notes <- c(qc$notes, "The proxy search was disabled: no sentinel was replaced or dropped for missingness or strand ambiguity.")
 }
 write_qc_report(qc, qc_report_file)
-
-zmat_pre_imputed <- zmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
-Nmat_pre_imputed <- Nmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
 
 # =============================================================================
 # 7. Impute missing z-scores and sample sizes
