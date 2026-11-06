@@ -4,8 +4,11 @@
 # Helper functions for GWAS variant selection, LD clumping, and proxy search.
 #
 # Functions:
-#   get_sig_snps()               — Extract genome-wide significant SNPs across GWAS files
-#   get_biggest_gwas()           — Cross-reference hits against a large reference GWAS
+#   standardize_gwas_variants()  — Put one GWAS table into the internal variant
+#                                  representation (variant key, effect allele, risk allele)
+#   get_sig_snps()               — Collect variants below a P cutoff from each discovery GWAS
+#   get_biggest_gwas()           — Cross-reference them against the primary GWAS and apply
+#                                  the primary-GWAS filters (P and risk-allele agreement)
 #   snp_clump()                  — Position-based clumping (no external API required)
 #   ld_pruning_SNP.clip()        — LD pruning via LDlink SNPclip (multi-population)
 #   prune()                      — Single-chromosome LD pruning via LDlinkR or curl
@@ -19,8 +22,17 @@
 #
 # Assumptions:
 #   - Genome build: hg19/GRCh37
-#   - Variant IDs formatted as: CHR_POS_REF_ALT
-#   - Summary stat files are whitespace-delimited with at minimum: VAR_ID, BETA, SE
+#   - Biallelic autosomal SNPs only
+#   - Each GWAS file locates variants by VAR_ID (CHR_POS_REF_ALT), by CHR + POS,
+#     or by SNP (chr:pos), and gives BETA (or ODDS_RATIO) and P_VALUE
+#   - Files do NOT need to share one REF/ALT order; see the allele helpers below
+#
+# P-value columns:
+#   PVALUE_discovery — lowest P across the discovery GWAS. Decides whether a
+#                      variant is eligible to be a sentinel.
+#   PVALUE_main      — P in the primary GWAS. Must be <= main_pval_cutoff for a
+#                      variant to stay in, and orders variants within a locus.
+#   There is deliberately no bare PVALUE column after get_sig_snps().
 # =============================================================================
 
 library(tidyverse)
@@ -29,135 +41,566 @@ library(LDlinkR)
 library(future)
 library(future.apply)
 
+# -----------------------------------------------------------------------------
+# Allele and variant-key helpers
+# -----------------------------------------------------------------------------
+# The pipeline does not require input files to share one REF/ALT order. Every
+# variant is keyed internally by position plus its allele pair in a fixed
+# (alphabetical) order, and the effect allele is tracked explicitly, so two
+# files that list the same variant as A_G and G_A meet on one key.
+
+# Column names accepted as the effect allele / other allele, in priority order.
+# (prep_bNMF_2025.R keeps an identical copy so each script can be sourced alone.)
+bnmf_effect_allele_names <- function() {
+  c("EA", "Effect_Allele", "Effect_Allele_PH", "effect_allele", "A1")
+}
+bnmf_other_allele_names <- function() {
+  c("NEA", "Other_Allele", "other_allele", "Non_Effect_Allele", "A2")
+}
+
+canonical_variant_key <- function(chr, pos, a1, a2) {
+  # "CHR:POS:A:B" with the two alleles in alphabetical order.
+  chr <- sub("^chr", "", as.character(chr), ignore.case = TRUE)
+  pos <- as.integer(pos)
+  a1 <- toupper(as.character(a1))
+  a2 <- toupper(as.character(a2))
+  paste(chr, pos, pmin(a1, a2), pmax(a1, a2), sep = ":")
+}
+
+standardize_gwas_variants <- function(df, effect_allele = NULL) {
+  # Put one GWAS table into the pipeline's internal variant representation.
+  #
+  # Accepted layouts:
+  #   - VAR_ID (CHR_POS_REF_ALT), optionally with an effect-allele column
+  #   - CHR + POS (or SNP as chr:pos) with effect- and other-allele columns,
+  #     or with REF + ALT columns
+  # plus BETA (or ODDS_RATIO).
+  #
+  # Effect-allele rule:
+  #   1. `effect_allele` override, when given: "ALT", "REF", or a column name
+  #   2. else the first column found among bnmf_effect_allele_names()
+  #   3. else ALT (the second allele of CHR_POS_REF_ALT) is assumed
+  #
+  # Only biallelic autosomal SNPs with A/C/G/T alleles are kept.
+  #
+  # Returns the retained rows with standardized columns (VAR_KEY, VAR_ID, CHR,
+  # POS, REF, ALT, EA, NEA, BETA, Risk_Allele, Nonrisk_Allele) followed by the
+  # file's remaining columns. attr(, "qc") records what was dropped and which
+  # effect-allele rule was used.
+
+  df <- as.data.frame(df, stringsAsFactors = FALSE)
+  cols <- names(df)
+  n_in <- nrow(df)
+
+  # --- effect-allele rule (decided from the header, so it is known even for
+  #     an empty table) -------------------------------------------------------
+  ea_col <- NULL
+  ea_rule <- NULL
+  has_override <- !is.null(effect_allele) && length(effect_allele) == 1L &&
+    !is.na(effect_allele) && nzchar(trimws(as.character(effect_allele)))
+  if (has_override) {
+    effect_allele <- trimws(as.character(effect_allele))
+    if (toupper(effect_allele) %in% c("ALT", "REF")) {
+      ea_rule <- toupper(effect_allele)
+      ea_label <- paste0(ea_rule, " (manifest override)")
+    } else if (effect_allele %in% cols) {
+      ea_col <- effect_allele
+      ea_label <- paste0("column ", ea_col, " (manifest override)")
+    } else {
+      stop("effect_allele override '", effect_allele,
+           "' is neither ALT, REF, nor a column in the file.")
+    }
+  } else {
+    hit <- intersect(bnmf_effect_allele_names(), cols)
+    if (length(hit) > 0L) {
+      ea_col <- hit[1]
+      ea_label <- paste0("column ", ea_col)
+    } else {
+      ea_rule <- "ALT"
+      ea_label <- "assumed ALT (no effect-allele column)"
+    }
+  }
+
+  # --- position and the file's own allele order -----------------------------
+  has_varid <- "VAR_ID" %in% cols
+  has_ref_alt <- all(c("REF", "ALT") %in% cols)
+  nea_col <- intersect(bnmf_other_allele_names(), cols)
+  nea_col <- if (length(nea_col) > 0L) nea_col[1] else NULL
+
+  if (has_varid) {
+    var_id <- toupper(as.character(df$VAR_ID))
+    valid_id <- !is.na(var_id) & grepl("^[0-9]+_[0-9]+_[ACGT]_[ACGT]$", var_id)
+    parts <- data.table::tstrsplit(var_id[valid_id], "_", fixed = TRUE)
+    if (length(parts) < 4L) parts <- rep(list(character(0)), 4L)
+    chr <- parts[[1]]; pos <- parts[[2]]; ref <- parts[[3]]; alt <- parts[[4]]
+  } else {
+    if (all(c("CHR", "POS") %in% cols)) {
+      chr_all <- sub("^chr", "", as.character(df$CHR), ignore.case = TRUE)
+      pos_all <- as.character(df$POS)
+    } else if ("SNP" %in% cols) {
+      snp_parts <- data.table::tstrsplit(
+        sub("^chr", "", as.character(df$SNP), ignore.case = TRUE), ":", fixed = TRUE
+      )
+      if (length(snp_parts) < 2L) snp_parts <- list(rep(NA_character_, n_in),
+                                                    rep(NA_character_, n_in))
+      chr_all <- snp_parts[[1]]
+      pos_all <- snp_parts[[2]]
+    } else {
+      stop("A GWAS file needs VAR_ID (CHR_POS_REF_ALT), or CHR and POS columns, ",
+           "or a SNP column in chr:pos form. Columns found: ",
+           paste(cols, collapse = ", "))
+    }
+    valid_id <- !is.na(chr_all) & !is.na(pos_all) &
+      grepl("^[0-9]+$", chr_all) & grepl("^[0-9]+$", pos_all)
+    chr <- chr_all[valid_id]
+    pos <- pos_all[valid_id]
+    if (has_ref_alt) {
+      ref <- toupper(trimws(as.character(df$REF[valid_id])))
+      alt <- toupper(trimws(as.character(df$ALT[valid_id])))
+    } else {
+      ref <- NULL
+      alt <- NULL
+    }
+  }
+  df <- df[valid_id, , drop = FALSE]
+  n_invalid_id <- n_in - nrow(df)
+
+  # --- effect and other allele ----------------------------------------------
+  if (!is.null(ea_col)) {
+    ea <- toupper(trimws(as.character(df[[ea_col]])))
+  } else {
+    if (is.null(ref)) {
+      stop("The file has no effect-allele column and no REF/ALT (or VAR_ID) to ",
+           "fall back on. Accepted effect-allele columns: ",
+           paste(bnmf_effect_allele_names(), collapse = ", "), ".")
+    }
+    ea <- if (ea_rule == "ALT") alt else ref
+  }
+
+  if (!is.null(ref)) {
+    nea <- ifelse(ea == alt, ref, ifelse(ea == ref, alt, NA_character_))
+  } else if (!is.null(nea_col)) {
+    nea <- toupper(trimws(as.character(df[[nea_col]])))
+    ref <- nea
+    alt <- ea
+  } else {
+    stop("The file has an effect-allele column but no other-allele column and ",
+         "no REF/ALT (or VAR_ID) to derive it from. Accepted other-allele columns: ",
+         paste(bnmf_other_allele_names(), collapse = ", "), ".")
+  }
+
+  valid_alleles <- !is.na(ea) & !is.na(nea) &
+    grepl("^[ACGT]$", ea) & grepl("^[ACGT]$", nea) & ea != nea &
+    !is.na(ref) & !is.na(alt) & grepl("^[ACGT]$", ref) & grepl("^[ACGT]$", alt)
+  n_invalid_alleles <- sum(!valid_alleles)
+  df <- df[valid_alleles, , drop = FALSE]
+  chr <- chr[valid_alleles]; pos <- pos[valid_alleles]
+  ref <- ref[valid_alleles]; alt <- alt[valid_alleles]
+  ea <- ea[valid_alleles];   nea <- nea[valid_alleles]
+
+  # --- effect size and risk allele ------------------------------------------
+  if ("BETA" %in% cols) {
+    beta <- suppressWarnings(as.numeric(df$BETA))
+  } else if ("ODDS_RATIO" %in% cols) {
+    beta <- suppressWarnings(log(as.numeric(df$ODDS_RATIO)))
+  } else {
+    stop("A GWAS file needs a BETA or ODDS_RATIO column. Columns found: ",
+         paste(cols, collapse = ", "))
+  }
+  beta[!is.finite(beta)] <- NA_real_
+  # A missing or exactly-zero effect gives no direction; the risk allele is NA
+  # and the variant is removed when risk alleles are compared.
+  has_direction <- !is.na(beta) & beta != 0
+  risk <- ifelse(has_direction, ifelse(beta > 0, ea, nea), NA_character_)
+  nonrisk <- ifelse(has_direction, ifelse(beta > 0, nea, ea), NA_character_)
+
+  chr <- as.integer(chr)
+  pos <- as.integer(pos)
+  standardized <- data.frame(
+    VAR_KEY = canonical_variant_key(chr, pos, ea, nea),
+    VAR_ID = paste(chr, pos, ref, alt, sep = "_"),
+    CHR = chr, POS = pos, REF = ref, ALT = alt, EA = ea, NEA = nea,
+    BETA = beta, Risk_Allele = risk, Nonrisk_Allele = nonrisk,
+    stringsAsFactors = FALSE
+  )
+  if (nrow(standardized) == 0L) {
+    standardized$VAR_KEY <- character(0)
+    standardized$VAR_ID <- character(0)
+  }
+  other_cols <- setdiff(names(df), names(standardized))
+  out <- cbind(standardized, df[, other_cols, drop = FALSE])
+  rownames(out) <- NULL
+
+  attr(out, "qc") <- list(
+    n_rows = n_in,
+    n_invalid_id = n_invalid_id,
+    n_invalid_alleles = n_invalid_alleles,
+    n_no_direction = sum(!has_direction),
+    effect_allele_rule = ea_label
+  )
+  out
+}
+
+read_gwas_rows_at_positions <- function(filepath, positions, rename_cols = NULL) {
+  # Read only the rows of a (possibly gzipped) summary-statistics file whose
+  # chromosome:position is in `positions` ("1:12345"). Matching is exact and
+  # does not depend on allele order. All columns are returned as character.
+
+  header <- names(fread(filepath, nrows = 0L))
+  header_std <- header
+  if (!is.null(rename_cols) && length(rename_cols) > 0L) {
+    hit <- match(header_std, unname(rename_cols))
+    header_std[!is.na(hit)] <- names(rename_cols)[hit[!is.na(hit)]]
+  }
+  empty <- as.data.frame(
+    matrix(character(0), nrow = 0L, ncol = length(header_std),
+           dimnames = list(NULL, header_std)),
+    stringsAsFactors = FALSE
+  )
+  positions <- unique(positions[!is.na(positions)])
+  if (length(positions) == 0L) return(empty)
+
+  is_gz <- endsWith(filepath, ".gz")
+  con <- if (is_gz) gzfile(filepath) else file(filepath)
+  first_line <- tryCatch(readLines(con, n = 1L), finally = close(con))
+  tab_delimited <- grepl("\t", first_line, fixed = TRUE)
+
+  strip_chr <- 'sub(/^[Cc][Hh][Rr]/, "", %s)'
+  if ("VAR_ID" %in% header_std) {
+    rule <- sprintf('{ split($%d, a, "_"); if ((a[1] ":" a[2]) in k) print }',
+                    match("VAR_ID", header_std))
+  } else if (all(c("CHR", "POS") %in% header_std)) {
+    rule <- sprintf('{ ch = $%d; %s; if ((ch ":" $%d) in k) print }',
+                    match("CHR", header_std), sprintf(strip_chr, "ch"),
+                    match("POS", header_std))
+  } else if ("SNP" %in% header_std) {
+    rule <- sprintf('{ s = $%d; %s; split(s, a, ":"); if ((a[1] ":" a[2]) in k) print }',
+                    match("SNP", header_std), sprintf(strip_chr, "s"))
+  } else {
+    stop("Cannot locate variants in ", filepath, ": it needs VAR_ID, or CHR and ",
+         "POS, or a SNP (chr:pos) column. Columns found: ",
+         paste(header, collapse = ", "))
+  }
+
+  key_file <- tempfile("positions_", fileext = ".tmp")
+  on.exit(unlink(key_file), add = TRUE)
+  writeLines(positions, key_file)
+
+  awk_program <- paste("NR == FNR { k[$1] = 1; next }", rule)
+  awk_call <- paste(
+    "awk", if (tab_delimited) "-F'\\t'" else "", shQuote(awk_program), shQuote(key_file)
+  )
+  cmd <- if (is_gz) {
+    sprintf("gzip -cd %s | %s -", shQuote(filepath), awk_call)
+  } else {
+    sprintf("%s %s", awk_call, shQuote(filepath))
+  }
+
+  rows <- tryCatch(
+    fread(cmd = cmd, header = FALSE, col.names = header_std,
+          sep = if (tab_delimited) "\t" else "auto",
+          colClasses = "character", data.table = FALSE, showProgress = FALSE),
+    error = function(e) empty
+  )
+  rows
+}
+
 get_sig_snps <- function(gwas, PVCUTOFF = 5e-8, rename_cols = NULL) {
-  # Prepare an empty list to store per-population results
+  # Collect every variant with P <= PVCUTOFF from each discovery GWAS.
+  #
+  # gwas: manifest data frame with columns ID, population, full_path and,
+  #       optionally, effect_allele (per-file override of the effect-allele
+  #       rule: "ALT", "REF", or a column name; blank = detect).
+  #
+  # Returns one row per variant per population (the lowest-P record within a
+  # population), keyed by VAR_KEY, with the discovery P in PVALUE_discovery and
+  # the risk allele taken from the sign of the effect on the effect allele.
+  # attr(, "input_qc") is a per-file table of what was read and dropped.
+
+  missing_cols <- setdiff(c("ID", "population", "full_path"), names(gwas))
+  if (length(missing_cols) > 0L) {
+    stop("The GWAS manifest is missing column(s): ",
+         paste(missing_cols, collapse = ", "))
+  }
+  has_override_col <- "effect_allele" %in% names(gwas)
+
+  output_cols <- c("VAR_KEY", "VAR_ID", "CHR", "POS", "REF", "ALT",
+                   "PVALUE_discovery", "Risk_Allele", "Nonrisk_Allele",
+                   "GWAS", "Population")
   vars_sig_list <- list()
-  my_gwas_populations <- unique(gwas$population)
-  
-  for (cur_pop in my_gwas_populations) {
-    
+  qc_list <- list()
+
+  for (cur_pop in unique(gwas$population)) {
     message(sprintf("Pulling significant SNPs from %s GWAS...", cur_pop))
-    
-    # Filter metadata for current population
-    gwas_pop <- gwas %>% filter(population == cur_pop)
-    gwas_ss_files_pop <- setNames(gwas_pop$full_path, gwas_pop$ID)
-    
-    # Process each file in parallel
-    vars_pop_list <- lapply(seq_along(gwas_ss_files_pop), function(i) {
-      cur_id <- names(gwas_ss_files_pop)[i]
+    gwas_pop <- gwas[gwas$population == cur_pop, , drop = FALSE]
+
+    vars_pop_list <- lapply(seq_len(nrow(gwas_pop)), function(i) {
+      cur_id <- gwas_pop$ID[i]
+      cur_file <- gwas_pop$full_path[i]
+      cur_override <- if (has_override_col) gwas_pop$effect_allele[i] else NULL
       message(sprintf("...Reading %s...", cur_id))
 
-      # Read summary stats and rename columns if necessary
-      vars <- fread(gwas_ss_files_pop[i],
-                    stringsAsFactors = FALSE,
-                    data.table = FALSE) %>%
+      vars <- fread(cur_file, stringsAsFactors = FALSE, data.table = FALSE) %>%
         dplyr::rename(any_of(rename_cols))
-      
-      # If BETA is missing, convert OR to log(OR)
-      if (!"BETA" %in% colnames(vars)) {
-        message("Converting Odds Ratio to Log Odds Ratio...")
-        vars <- vars %>%
-          mutate(BETA = log(as.numeric(ODDS_RATIO)))
+      if (!"P_VALUE" %in% names(vars)) {
+        stop(cur_id, ": no P_VALUE column. Map your column with rename_cols, ",
+             "e.g. rename_cols = c(P_VALUE = \"P\"). Columns found: ",
+             paste(names(vars), collapse = ", "))
       }
-      
-      # Process variant data:
-      # 1. Convert BETA and P_VALUE to numeric.
-      # 2. Filter well-formed VAR_ID and by p-value cutoff.
-      # 3. Separate VAR_ID once (keeping REF and ALT).
-      # 4. Compute Risk_Allele and add metadata.
-      vars <- vars %>%
-        mutate(across(c(BETA, P_VALUE), as.numeric)) %>%
-        filter(grepl("^[0-9]+_[0-9]+_[ACGT]+_[ACGT]", VAR_ID),
-               P_VALUE <= PVCUTOFF) %>%
-        separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"), sep = "_", remove = FALSE) %>%
-        mutate(Risk_Allele = if_else(BETA >= 0, ALT, REF),
-               Population = cur_pop,
-               GWAS = cur_id) %>%
-        select(VAR_ID, P_VALUE, Risk_Allele, GWAS, Population, REF, ALT)
-      
-      message(sprintf("...%s: %i significant SNPs...", cur_id, nrow(vars)))
-      return(vars)
+      n_read <- nrow(vars)
+      vars$P_VALUE <- suppressWarnings(as.numeric(vars$P_VALUE))
+      vars <- vars[!is.na(vars$P_VALUE) & vars$P_VALUE <= PVCUTOFF, , drop = FALSE]
+      n_pass <- nrow(vars)
+
+      std <- standardize_gwas_variants(vars, effect_allele = cur_override)
+      qc <- attr(std, "qc")
+
+      out <- std %>%
+        mutate(PVALUE_discovery = if_else(P_VALUE == 0, .Machine$double.xmin, P_VALUE),
+               GWAS = cur_id,
+               Population = cur_pop) %>%
+        select(all_of(output_cols))
+
+      qc_list[[cur_id]] <<- data.frame(
+        GWAS = cur_id, Population = cur_pop,
+        n_rows_read = n_read,
+        n_pass_pvalue = n_pass,
+        n_invalid_id = qc$n_invalid_id,
+        n_invalid_alleles = qc$n_invalid_alleles,
+        n_no_direction = qc$n_no_direction,
+        n_kept = nrow(out),
+        effect_allele_rule = qc$effect_allele_rule,
+        stringsAsFactors = FALSE
+      )
+      message(sprintf(
+        "...%s: %i variants with P <= %.1e (%i dropped as not biallelic autosomal SNPs); effect allele: %s",
+        cur_id, nrow(out), PVCUTOFF,
+        qc$n_invalid_id + qc$n_invalid_alleles, qc$effect_allele_rule
+      ))
+      out
     })
-    
-    message(sprintf("Combining GWAS summary stats for %s...", cur_pop))
-    vars_pop <- bind_rows(vars_pop_list)
-    
-    # Remove duplicates: keep the record with the smallest p-value per VAR_ID
-    vars_pop <- vars_pop %>%
-      arrange(VAR_ID, P_VALUE) %>%
-      distinct(VAR_ID, .keep_all = TRUE) %>%
-      dplyr::rename(PVALUE = P_VALUE)
-    
-    # Remove indels using REF and ALT columns
-    vars_pop <- vars_pop %>%
-      mutate(alleles = paste0(REF, ALT)) %>%
-      filter(!(nchar(alleles) > 2 & !str_detect(ALT, ","))) %>%
-      # Include REF and ALT in the final output if desired.
-      select(VAR_ID, PVALUE, Risk_Allele, GWAS, Population, REF, ALT)
-    
+
+    # Within a population keep the lowest-P record per variant
+    vars_pop <- bind_rows(vars_pop_list) %>%
+      arrange(VAR_KEY, PVALUE_discovery) %>%
+      distinct(VAR_KEY, .keep_all = TRUE)
+
     message(sprintf("Final # SNPs for %s: %i", cur_pop, nrow(vars_pop)))
-    
     vars_sig_list[[cur_pop]] <- vars_pop
   }
-  
-  # Combine results from all populations
+
   vars_sig <- bind_rows(vars_sig_list)
   message(sprintf("Final total # SNPs: %i", nrow(vars_sig)))
-  
-  return(vars_sig)
+
+  attr(vars_sig, "input_qc") <- bind_rows(qc_list)
+  vars_sig
 }
 
 
-get_biggest_gwas <- function(main_ss_filepath, vars_sig) {
-  
-  # Ensure that main_ss_filepath exists
+get_biggest_gwas <- function(main_ss_filepath, vars_sig,
+                             main_pval_cutoff = 0.05,
+                             rename_cols = NULL,
+                             effect_allele = NULL,
+                             concordance_warn = 0.8,
+                             concordance_min_n = 20L) {
+  # Cross-reference the discovery variants against the primary (largest) GWAS
+  # and apply the primary-GWAS filters, BEFORE any clumping or LD pruning.
+  #
+  # A variant is kept when all of these hold:
+  #   - it is present in the primary GWAS (matched on position + allele pair,
+  #     whatever allele order either file uses)
+  #   - both GWAS give it a direction (effect is not missing or zero)
+  #   - its primary-GWAS P is <= main_pval_cutoff
+  #   - the discovery and primary GWAS agree on the risk allele
+  #
+  # Returns one row per kept variant with two P columns:
+  #   PVALUE_discovery : lowest P across the discovery GWAS (sentinel eligibility)
+  #   PVALUE_main      : P in the primary GWAS
+  # VAR_ID, REF and ALT follow the primary GWAS's allele order, and BETA_main is
+  # the primary-GWAS effect of ALT. Risk_Allele / Nonrisk_Allele are the
+  # primary's (equal to the discovery GWAS's, since mismatches are removed).
+  #
+  # Attributes:
+  #   "dropped"      one row per removed variant, with the reason
+  #   "drop_summary" removed-variant counts by discovery GWAS and reason
+  #   "concordance"  per discovery GWAS: agreement with the primary GWAS on the
+  #                  risk allele, and how many variants use the opposite allele
+  #                  order to the primary
+
   if (!file.exists(main_ss_filepath)) {
     stop("The primary summary stats file does not exist at: ", main_ss_filepath)
   }
-  
-  # Prepare a variant data frame with separated columns and unique VAR_IDs
-  vars_sig2 <- vars_sig %>%
-    separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"), sep = "_", remove = FALSE) %>%
-    mutate(ChrPos = paste0("chr", CHR, ":", POS)) %>%
-    arrange(PVALUE) %>%
-    distinct(VAR_ID, .keep_all = TRUE)
-  
-  message("Getting p-values from largest GWAS...")
-  
-  # Write the list of VAR_IDs to a temporary file
-  tmp_file <- tempfile("all_varid_", fileext = ".tmp")
-  on.exit(unlink(tmp_file), add = TRUE)
-  write_lines(vars_sig2$VAR_ID, tmp_file)
-  
-  header_line <- names(fread(main_ss_filepath, nrows = 0L))
-  
-  # Grep for VAR_IDs in the GWAS file using fgrep
-  message("Grepping for VAR_IDs...")
-  rename_cols <- c(PVALUE="P_VALUE")
-
-  grep_command <- if (endsWith(main_ss_filepath, ".gz")) {
-    sprintf("gzip -cd %s | grep -Fwf %s", shQuote(main_ss_filepath), shQuote(tmp_file))
-  } else {
-    sprintf("grep -Fwf %s %s", shQuote(tmp_file), shQuote(main_ss_filepath))
+  needed <- c("VAR_KEY", "CHR", "POS", "PVALUE_discovery", "Risk_Allele",
+              "GWAS", "Population")
+  if (!all(needed %in% names(vars_sig))) {
+    stop("vars_sig must be the output of get_sig_snps(); missing column(s): ",
+         paste(setdiff(needed, names(vars_sig)), collapse = ", "))
   }
-  main_gwas <- fread(cmd = grep_command,
-                        header = FALSE,
-                        data.table = FALSE,
-                        stringsAsFactors = FALSE,
-                        col.names = header_line) %>%
-    dplyr::rename(any_of(rename_cols))
-  
-  # Merge the p-values from MVP into our variant data frame
-  vars_sig_with_big_gwas <- vars_sig2 %>%
-    dplyr::rename(PVALUE.Pop = PVALUE) %>%
-    inner_join(main_gwas[, c("VAR_ID", "PVALUE")], by = "VAR_ID") %>%
-    mutate(PVALUE = as.numeric(PVALUE),
-           PVALUE = if_else(PVALUE == 0, 1e-300, PVALUE))
-  
-  message(sprintf("%i of %i vars_sig found in primary GWAS...",
-                  nrow(vars_sig_with_big_gwas), nrow(vars_sig2)))
-  return(vars_sig_with_big_gwas)
-  
+  if (!is.numeric(main_pval_cutoff) || length(main_pval_cutoff) != 1L ||
+      is.na(main_pval_cutoff) || main_pval_cutoff <= 0 || main_pval_cutoff > 1) {
+    stop("main_pval_cutoff must be one number in (0, 1].")
+  }
+
+  # ---- 1. Primary-GWAS rows at the candidate positions ----
+  message("Reading candidate positions from the primary GWAS...")
+  positions <- unique(paste(vars_sig$CHR, vars_sig$POS, sep = ":"))
+  main_raw <- read_gwas_rows_at_positions(main_ss_filepath, positions, rename_cols)
+  if (!"P_VALUE" %in% names(main_raw) && "PVALUE" %in% names(main_raw)) {
+    names(main_raw)[names(main_raw) == "PVALUE"] <- "P_VALUE"
+  }
+  if (!"P_VALUE" %in% names(main_raw)) {
+    stop("The primary GWAS has no P_VALUE column. Map your column with ",
+         "rename_cols, e.g. rename_cols = c(P_VALUE = \"P\"). Columns found: ",
+         paste(names(main_raw), collapse = ", "))
+  }
+  main_std <- standardize_gwas_variants(main_raw, effect_allele = effect_allele)
+  message(sprintf("  Primary GWAS effect allele: %s",
+                  attr(main_std, "qc")$effect_allele_rule))
+
+  p_main <- suppressWarnings(as.numeric(main_std$P_VALUE))
+  p_main[!is.na(p_main) & p_main == 0] <- .Machine$double.xmin
+  if ("SE" %in% names(main_std)) {
+    se_main <- suppressWarnings(as.numeric(main_std$SE))
+  } else {
+    message("  Primary GWAS has no SE column; deriving SE from BETA and P.")
+    se_main <- abs(main_std$BETA / qnorm(p_main / 2))
+  }
+
+  main <- data.frame(
+    VAR_KEY = main_std$VAR_KEY,
+    VAR_ID = main_std$VAR_ID,
+    REF = main_std$REF,
+    ALT = main_std$ALT,
+    # Reported as the effect of ALT, whichever allele the file calls the effect
+    # allele, so BETA_main always pairs with the REF/ALT columns returned here.
+    BETA_main = ifelse(main_std$EA == main_std$ALT, main_std$BETA, -main_std$BETA),
+    SE_main = se_main,
+    PVALUE_main = p_main,
+    Risk_Allele_main = main_std$Risk_Allele,
+    Nonrisk_Allele_main = main_std$Nonrisk_Allele,
+    stringsAsFactors = FALSE
+  )
+  n_main_dup <- sum(duplicated(main$VAR_KEY))
+  if (n_main_dup > 0L) {
+    message(sprintf("  %i duplicated variant(s) in the primary GWAS; keeping the lowest-P row of each.",
+                    n_main_dup))
+    main <- main[order(main$PVALUE_main), , drop = FALSE]
+    main <- main[!duplicated(main$VAR_KEY), , drop = FALSE]
+  }
+
+  # ---- 2. Join every discovery record to the primary ----
+  records <- vars_sig %>%
+    as.data.frame() %>%
+    dplyr::rename(any_of(c(VAR_ID_discovery = "VAR_ID",
+                           REF_discovery = "REF",
+                           ALT_discovery = "ALT",
+                           Risk_Allele_discovery = "Risk_Allele",
+                           Nonrisk_Allele_discovery = "Nonrisk_Allele"))) %>%
+    left_join(main, by = "VAR_KEY") %>%
+    mutate(
+      reason = case_when(
+        is.na(VAR_ID)                  ~ "not_in_main_gwas",
+        is.na(Risk_Allele_discovery)   ~ "no_discovery_direction",
+        is.na(Risk_Allele_main)        ~ "no_main_direction",
+        is.na(PVALUE_main)             ~ "main_pvalue_missing",
+        PVALUE_main > main_pval_cutoff ~ "main_pvalue_above_cutoff",
+        Risk_Allele_discovery != Risk_Allele_main ~ "risk_allele_mismatch",
+        TRUE                           ~ NA_character_
+      )
+    )
+
+  # ---- 3. Per-file agreement with the primary (all records, before dedup) ----
+  concordance <- records %>%
+    group_by(GWAS, Population) %>%
+    summarise(
+      n_variants = n(),
+      n_in_main = sum(!is.na(VAR_ID)),
+      n_flipped_order = if ("REF_discovery" %in% names(records)) {
+        sum(!is.na(VAR_ID) & REF_discovery != REF)
+      } else {
+        NA_integer_
+      },
+      n_testable = sum(!is.na(Risk_Allele_discovery) & !is.na(Risk_Allele_main) &
+                         !is.na(PVALUE_main) & PVALUE_main <= main_pval_cutoff),
+      n_concordant = sum(!is.na(Risk_Allele_discovery) & !is.na(Risk_Allele_main) &
+                           !is.na(PVALUE_main) & PVALUE_main <= main_pval_cutoff &
+                           Risk_Allele_discovery == Risk_Allele_main),
+      .groups = "drop"
+    ) %>%
+    mutate(concordance = if_else(n_testable > 0L, n_concordant / n_testable, NA_real_)) %>%
+    as.data.frame()
+
+  message("Risk-allele agreement with the primary GWAS, by discovery GWAS:")
+  for (i in seq_len(nrow(concordance))) {
+    message(sprintf(
+      "  %-30s %5d variants | %5d in primary | %5d listed in the opposite allele order | agreement %s (%d of %d testable)",
+      concordance$GWAS[i], concordance$n_variants[i], concordance$n_in_main[i],
+      concordance$n_flipped_order[i],
+      if (is.na(concordance$concordance[i])) "n/a" else sprintf("%.1f%%", 100 * concordance$concordance[i]),
+      concordance$n_concordant[i], concordance$n_testable[i]
+    ))
+  }
+  suspicious <- concordance[!is.na(concordance$concordance) &
+                              concordance$n_testable >= concordance_min_n &
+                              concordance$concordance < concordance_warn, , drop = FALSE]
+  if (nrow(suspicious) > 0L) {
+    warning(
+      "Low risk-allele agreement with the primary GWAS for: ",
+      paste(sprintf("%s (%.0f%%)", suspicious$GWAS, 100 * suspicious$concordance),
+            collapse = ", "),
+      ". Agreement near 0% usually means that file's effect allele is the ",
+      "opposite of what was assumed; agreement near 50% suggests a build or ",
+      "allele-labelling problem. Check the effect-allele rule reported for the file.",
+      call. = FALSE
+    )
+  }
+
+  # ---- 4. One record per variant: the strongest discovery record ----
+  best <- records %>%
+    arrange(PVALUE_discovery) %>%
+    distinct(VAR_KEY, .keep_all = TRUE)
+
+  dropped <- best %>%
+    filter(!is.na(reason)) %>%
+    transmute(VAR_KEY, CHR, POS,
+              VAR_ID_discovery = if ("VAR_ID_discovery" %in% names(best)) VAR_ID_discovery else NA_character_,
+              GWAS, Population, PVALUE_discovery, PVALUE_main,
+              Risk_Allele_discovery, Risk_Allele_main, reason) %>%
+    as.data.frame()
+
+  drop_summary <- dropped %>%
+    dplyr::count(GWAS, Population, reason, name = "n") %>%
+    as.data.frame()
+
+  kept <- best %>%
+    filter(is.na(reason)) %>%
+    transmute(
+      VAR_KEY, VAR_ID,
+      CHR = as.integer(CHR), POS = as.integer(POS), REF, ALT,
+      ChrPos = paste(CHR, POS, sep = ":"),
+      ChrPos_LDlink = paste0("chr", ChrPos),
+      PVALUE_discovery, PVALUE_main, BETA_main, SE_main,
+      Risk_Allele = Risk_Allele_main,
+      Nonrisk_Allele = Nonrisk_Allele_main,
+      GWAS, Population
+    ) %>%
+    as.data.frame()
+
+  message(sprintf(
+    "%i of %i discovery variants kept after the primary-GWAS filters (P <= %g and the same risk allele).",
+    nrow(kept), nrow(best), main_pval_cutoff
+  ))
+  if (nrow(dropped) > 0L) {
+    reason_counts <- table(dropped$reason)
+    message("  Removed: ",
+            paste(sprintf("%s = %d", names(reason_counts), as.integer(reason_counts)),
+                  collapse = "; "))
+  }
+
+  attr(kept, "dropped") <- dropped
+  attr(kept, "drop_summary") <- drop_summary
+  attr(kept, "concordance") <- concordance
+  kept
 }
 
 
@@ -387,19 +830,38 @@ ld_pruning_topLD_api <-  function(gwas_variants, api_path, rsID_map_file, r2=0.1
   return(pruned_variants)
 }
 
+check_order_by <- function(df, order_by, caller) {
+  # The variant kept at each locus is the first one under `order_by`, so the
+  # caller must say which P-value column(s) decide it. There is no default.
+  if (missing(order_by) || is.null(order_by) || length(order_by) == 0L) {
+    stop(caller, "() needs order_by: the column(s) that decide which variant ",
+         "leads each locus, most important first, e.g. ",
+         "order_by = c(\"PVALUE_main\", \"PVALUE_discovery\").", call. = FALSE)
+  }
+  missing_cols <- setdiff(order_by, names(df))
+  if (length(missing_cols) > 0L) {
+    stop(caller, "(): order_by column(s) not found in the input: ",
+         paste(missing_cols, collapse = ", "), call. = FALSE)
+  }
+  invisible(order_by)
+}
+
 snp_clump <- function(df_snps,
                       id="rsID",
                       window=500000,
                       chr=c(1:22),
-                      pos_range=c(1,Inf)) {
-  
+                      pos_range=c(1,Inf),
+                      order_by) {
+
+  check_order_by(df_snps, if (missing(order_by)) NULL else order_by, "snp_clump")
+
   clumped_snps <- c()
   uniq_chr <- sort(as.integer(unique(df_snps$CHR)))
-  
+
   for (i in uniq_chr) {
     tmp <- df_snps %>%
       filter(CHR==i) %>%
-      arrange(PVALUE) %>%
+      arrange(across(all_of(order_by))) %>%
       mutate(POS = as.integer(POS)) %>%
       data.frame()
     
@@ -447,23 +909,30 @@ ld_pruning_SNP.clip <- function(df_snps,
                                 chr = 1:22,
                                 output_dir = "./",
                                 token,
-                                parallel = FALSE) {
+                                parallel = FALSE,
+                                order_by) {
+
+  # SNPclip keeps the first variant of each LD block in input order, so the
+  # caller must name the column(s) that decide the order. Checked before any
+  # request is sent to LDlink.
+  check_order_by(df_snps, if (missing(order_by)) NULL else order_by,
+                 "ld_pruning_SNP.clip")
 
   if (parallel) library(future.apply)
-  
-  #— 0) PREP: ensure VAR_ID, split into fields, add ChrPos & order by P
+
+  #— 0) PREP: ensure VAR_ID, split into fields, add ChrPos & order
   if (!"VAR_ID" %in% colnames(df_snps)) {
     stop("df_snps must contain a VAR_ID column.")
   }
-  
+
+  var_id_parts <- data.table::tstrsplit(df_snps$VAR_ID, "_", fixed = TRUE)
   snp_clip_input <- df_snps %>%
-    separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"), sep = "_", remove = FALSE) %>%
     mutate(
-      ChrPos = paste0("chr", CHR, ":", POS),
-      CHR = as.integer(CHR),
-      POS = as.integer(POS)
+      CHR = as.integer(var_id_parts[[1]]),
+      POS = as.integer(var_id_parts[[2]]),
+      ChrPos = paste0("chr", CHR, ":", POS)
     ) %>%
-    arrange(PVALUE)
+    arrange(across(all_of(order_by)))
   
   #— 1) Find which chr‐files are already done
   pattern <- sprintf("^snpClip_results_%s_chr([0-9]+)\\.txt$", pop)
@@ -825,9 +1294,26 @@ find_variants_needing_proxies <- function(gwas_variant_df,
     proxy_reasons_list[["multiallelic"]] <- data.frame(VAR_ID = multi_allelic, reason = "multiallelic", stringsAsFactors = FALSE)
   }
 
-  # Find variants with excessive missingness
-  low_cnt <- with(gwas_variant_df, VAR_ID[!(VAR_ID %in% names(var_nonmissingness)) |
-                                            var_nonmissingness[VAR_ID] < missing_cutoff])
+  # Every sentinel must have a non-missingness value. fetch_summary_stats()
+  # returns a z-matrix row for every variant it was given (all NA when no trait
+  # has data), so a sentinel with no value here was lost upstream. Treating that
+  # as "high missingness" would send a rejected variant to the proxy search.
+  no_value <- setdiff(gwas_variant_df$VAR_ID, names(var_nonmissingness))
+  no_value <- union(no_value,
+                    names(var_nonmissingness)[is.na(var_nonmissingness) &
+                                                names(var_nonmissingness) %in% gwas_variant_df$VAR_ID])
+  if (length(no_value) > 0L) {
+    stop(sprintf(
+      paste0("%d sentinel variant(s) have no non-missingness value (first: %s). ",
+             "Every sentinel should have a row in the z-matrix; a missing one was ",
+             "dropped between variant selection and the trait fetch and must be ",
+             "investigated, not sent to the proxy search."),
+      length(no_value), paste(head(no_value, 5), collapse = ", ")
+    ), call. = FALSE)
+  }
+
+  # Find variants with excessive missingness (non-missing fraction below cutoff)
+  low_cnt <- with(gwas_variant_df, VAR_ID[var_nonmissingness[VAR_ID] < missing_cutoff])
   print(paste0("...", length(low_cnt), " variants with excessive missingness"))
   if (length(low_cnt) > 0) {
     proxy_reasons_list[["high_missingness"]] <- data.frame(VAR_ID = low_cnt, reason = "high_missingness", stringsAsFactors = FALSE)
@@ -854,7 +1340,8 @@ find_variants_needing_proxies <- function(gwas_variant_df,
   result <- gwas_variant_df %>%
     filter(VAR_ID %in% need_proxies_varid) %>%
     left_join(reasons_summary, by = "VAR_ID") %>%
-    select(VAR_ID, rsID = RS_Number, reason, PVALUE)
+    select(VAR_ID, rsID = RS_Number, reason,
+           any_of(c("PVALUE_main", "PVALUE_discovery", "PVALUE")))
   
   return(result)
 }

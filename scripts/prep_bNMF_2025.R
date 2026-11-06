@@ -6,14 +6,21 @@
 #
 # Functions:
 #   peek_headers()          — Read column names from the first line of a file (gz-aware)
-#   read_single_trait_dt()  — Fetch and align summary stats for one trait via grep/tabix
-#   fetch_summary_stats()   — Fetch and align summary stats across all traits; returns z- and N-matrices
+#   read_single_trait_dt()  — Fetch one trait at the requested positions and orient
+#                             z-scores to the risk allele (either strand)
+#   fetch_summary_stats()   — Fetch all traits; returns z- and N-matrices with one
+#                             row per input variant, plus per-trait QC
 #   prep_z_matrix()         — Filter traits, prune by correlation, scale z-scores, expand to non-negative form
 #   fill_missing_zscores()  — (legacy) Fill missing z-scores using proxy variants
 #
 # Assumptions:
-#   - Input variants use "Chr:Pos" (colon-separated) as the standard SNP key
-#   - Trait summary stat files contain at minimum: a SNP ID column, BETA, SE
+#   - Input variants use "Chr:Pos" (colon-separated) as the standard SNP key,
+#     one variant per position
+#   - Trait summary stat files contain a SNP (chr:pos) or VAR_ID (CHR_POS_REF_ALT)
+#     column, BETA and SE. The effect allele comes from an effect-allele column
+#     when there is one, otherwise ALT of VAR_ID is assumed (and reported)
+#   - Variants handed to fetch_summary_stats() have already passed the
+#     primary-GWAS filters in get_biggest_gwas()
 #   - Genome build: hg19/GRCh37
 # =============================================================================
 
@@ -32,13 +39,37 @@ peek_headers <- function(filepath) {
   strsplit(trimws(hdr), "\\s+")[[1]]
 }
 
-# Rewritten, robust read_single_trait_dt
+# Column names accepted as the effect allele / other allele, in priority order.
+# Identical to the copy in choose_variants_2025.R, repeated here so that either
+# script can be sourced on its own.
+bnmf_effect_allele_names <- function() {
+  c("EA", "Effect_Allele", "Effect_Allele_PH", "effect_allele", "A1")
+}
+bnmf_other_allele_names <- function() {
+  c("NEA", "Other_Allele", "other_allele", "Non_Effect_Allele", "A2")
+}
+
+# Read one trait file at the requested positions and return z-scores oriented
+# to the risk allele.
+#
+# Effect-allele rule (the same rule get_sig_snps() applies to discovery files):
+#   1. `effect_allele` override, when given: "ALT", "REF", or a column name
+#   2. else the first column found among bnmf_effect_allele_names()
+#   3. else ALT (the second allele of a CHR_POS_REF_ALT VAR_ID) is assumed
+#
+# Allele matching: a trait row is used when its allele pair equals the
+# risk/non-risk pair, or, for non-palindromic variants, when its complement
+# does (the trait file is on the opposite strand). Palindromic variants
+# (A/T, C/G) cannot be strand-resolved and are used as reported.
+#
+# attr(, "qc") on the result records the rule used and the match counts.
 read_single_trait_dt <- function(trait,
                                  read_trait_input,
                                  trait_ss_files,
                                  trait_ss_size = NULL,
-                                 tmp_var_file = "variants_to_query.tmp") {
-  
+                                 tmp_var_file = "variants_to_query.tmp",
+                                 effect_allele = NULL) {
+
   message(sprintf("Processing %s...", trait))
   
   # ---- 0. Basic checks ----
@@ -142,8 +173,11 @@ read_single_trait_dt <- function(trait,
   }
   
   dt <- tryCatch({
-    # read with names from header (we already peeked headers)
-    fread(cmd = cmd_str, header = FALSE, col.names = headers, data.table = TRUE, showProgress = FALSE)
+    # read with names from header (we already peeked headers). Everything is
+    # read as text: a handful of matched rows whose alleles are all "T" would
+    # otherwise be parsed as logical TRUE. Numeric columns are converted below.
+    fread(cmd = cmd_str, header = FALSE, col.names = headers, data.table = TRUE,
+          colClasses = "character", showProgress = FALSE)
   }, error = function(e) {
     message("  Grep returned no results or fread failed: ", e$message)
     return(data.table())
@@ -156,18 +190,52 @@ read_single_trait_dt <- function(trait,
   message(sprintf("  Found %d rows after grep", nrow(dt)))
   
   # ---- 5. Harmonize column names EARLY ----
-  # Standard allele column canonicalization: use EA and NEA internally
-  if ("Effect_Allele_PH" %in% names(dt)) setnames(dt, "Effect_Allele_PH", "EA")
-  if ("Effect_Allele"    %in% names(dt)) setnames(dt, "Effect_Allele", "EA")
-  if ("effect_allele"    %in% names(dt)) setnames(dt, "effect_allele", "EA")
-  if ("A1" %in% names(dt) && !("EA" %in% names(dt))) setnames(dt, "A1", "EA")
-  
-  if ("NEA" %in% names(dt)) {
-    # ok
-  } else if ("A2" %in% names(dt)) {
-    setnames(dt, "A2", "NEA")
+  # Standard allele column canonicalization: use EA and NEA internally.
+  # Decide where the effect allele comes from (see the rule above the function).
+  ea_source  <- NULL   # column holding the effect allele, if one is used
+  ea_from_id <- NULL   # "ALT" or "REF" when the effect allele is read from VAR_ID
+  has_override <- !is.null(effect_allele) && length(effect_allele) == 1L &&
+    !is.na(effect_allele) && nzchar(trimws(as.character(effect_allele)))
+  if (has_override) {
+    effect_allele <- trimws(as.character(effect_allele))
+    if (toupper(effect_allele) %in% c("ALT", "REF")) {
+      ea_from_id <- toupper(effect_allele)
+    } else if (effect_allele %in% names(dt)) {
+      ea_source <- effect_allele
+    } else {
+      stop(sprintf("%s: effect-allele override '%s' is neither ALT, REF, nor a column in the file.",
+                   trait, effect_allele))
+    }
+  } else {
+    ea_hit <- intersect(bnmf_effect_allele_names(), names(dt))
+    if (length(ea_hit) > 0L) ea_source <- ea_hit[1] else ea_from_id <- "ALT"
   }
-  
+
+  if (!is.null(ea_source)) {
+    if (ea_source != "EA") {
+      if ("EA" %in% names(dt)) dt[, EA := NULL]
+      setnames(dt, ea_source, "EA")
+    }
+    ea_rule_label <- paste0("column ", ea_source, if (has_override) " (override)" else "")
+    nea_hit <- intersect(bnmf_other_allele_names(), names(dt))
+    if (length(nea_hit) > 0L && nea_hit[1] != "NEA") setnames(dt, nea_hit[1], "NEA")
+  } else {
+    if (!"VAR_ID" %in% names(dt)) {
+      stop(sprintf(paste0("%s: no effect-allele column and no VAR_ID (CHR_POS_REF_ALT) to take ",
+                          "the effect allele from. Accepted effect-allele columns: %s."),
+                   trait, paste(bnmf_effect_allele_names(), collapse = ", ")))
+    }
+    # Both alleles come from VAR_ID below; ignore any allele columns.
+    drop_cols <- intersect(c("EA", "NEA"), names(dt))
+    if (length(drop_cols) > 0L) dt[, (drop_cols) := NULL]
+    ea_rule_label <- if (has_override) {
+      paste0(ea_from_id, " (override)")
+    } else {
+      "assumed ALT (no effect-allele column)"
+    }
+  }
+  message(sprintf("  Effect allele for %s: %s", trait, ea_rule_label))
+
   # Standardize P/BETA/SE names
   if ("p" %in% names(dt)) setnames(dt, "p", "P_VALUE")
   if ("pval" %in% names(dt)) setnames(dt, "pval", "P_VALUE")
@@ -190,15 +258,16 @@ read_single_trait_dt <- function(trait,
       dt[, pos_from_varid := tmp_cols[[2]]]
       dt[, ref_from_varid := tmp_cols[[3]]]
       dt[, alt_from_varid := tmp_cols[[4]]]
-      
-      # assign NEA based on EA vs ref/alt
-      if ("EA" %in% names(dt)) {
-        dt[, NEA := fifelse(toupper(EA) == toupper(ref_from_varid), alt_from_varid,
-                            fifelse(toupper(EA) == toupper(alt_from_varid), ref_from_varid, NA_character_))]
-      } else {
-        dt[, NEA := alt_from_varid]
+
+      # No effect-allele column in use: take it from VAR_ID (ALT unless overridden)
+      if (!is.null(ea_from_id)) {
+        dt[, EA := if (ea_from_id == "ALT") alt_from_varid else ref_from_varid]
       }
-      
+
+      # assign NEA as whichever VAR_ID allele is not the effect allele
+      dt[, NEA := fifelse(toupper(EA) == toupper(ref_from_varid), alt_from_varid,
+                          fifelse(toupper(EA) == toupper(alt_from_varid), ref_from_varid, NA_character_))]
+
       # chr_pos key
       dt[, varid_chrpos_us := paste0(chr_from_varid, "_", pos_from_varid)]
     } else {
@@ -233,15 +302,6 @@ read_single_trait_dt <- function(trait,
   dt_merged <- dt[snp_mapping, on = .(match_key = search_snp), nomatch = 0]
   dt <- copy(dt_merged)
   setnames(dt, "original_snp", "SNP")
-  
-  # ───── SPECIAL HANDLING: GLGC / older consortia with no EA/NEA columns ─────
-  if (!"EA" %in% names(dt) && "VAR_ID" %in% names(dt)) {
-    message("  No EA column found → assuming GLGC/old-consortium format (effect = 2nd allele in VAR_ID)")
-    dt[, c("ref_glgc", "alt_glgc") := tstrsplit(sub("^[^_]+_[^_]+_", "", VAR_ID), "_", fixed = FALSE)]
-    dt[, EA  := alt_glgc]
-    dt[, NEA := ref_glgc]
-    dt[, c("ref_glgc", "alt_glgc") := NULL]
-  }
   
   # Check row count using dt, not dt_merged
   if (nrow(dt) == 0) {
@@ -329,17 +389,35 @@ read_single_trait_dt <- function(trait,
   }
   message(sprintf("  %d SNPs after joining with input", nrow(dt)))
   
-  # ---- 11. Allele matching (unordered pair equality) ----
-  dt[, trait_alleles := paste0(pmin(toupper(EA), toupper(NEA)), "_", pmax(toupper(EA), toupper(NEA)))]
-  dt[, gwas_alleles  := paste0(pmin(toupper(Risk_Allele), toupper(Nonrisk_Allele)), "_", pmax(toupper(Risk_Allele), toupper(Nonrisk_Allele)))]
-  
-  message(sprintf("  Before allele matching: %d SNPs", nrow(dt)))
-  message(sprintf("  Sample trait_alleles: %s", dt$trait_alleles[1]))
-  message(sprintf("  Sample gwas_alleles: %s", dt$gwas_alleles[1]))
-  matches <- sum(dt$trait_alleles == dt$gwas_alleles, na.rm = TRUE)
-  message(sprintf("  Allele matches: %d", matches))
-  
-  dt <- dt[trait_alleles == gwas_alleles]
+  # ---- 11. Allele matching (unordered pair equality, on either strand) ----
+  complement_allele <- function(x) chartr("ACGT", "TGCA", x)
+  allele_pair <- function(a, b) paste0(pmin(a, b), "_", pmax(a, b))
+
+  dt[, `:=`(EA = toupper(trimws(EA)), NEA = toupper(trimws(NEA)))]
+  dt[, trait_alleles := allele_pair(EA, NEA)]
+  dt[, gwas_alleles  := allele_pair(toupper(Risk_Allele), toupper(Nonrisk_Allele))]
+
+  # As reported: the trait's allele pair is the risk/non-risk pair.
+  dt[, match_direct := !is.na(EA) & !is.na(NEA) & trait_alleles == gwas_alleles]
+  # Opposite strand: the complemented pair is the risk/non-risk pair. This can
+  # only be true for non-palindromic variants; a palindromic pair is its own
+  # complement, so it already matched as reported.
+  dt[, match_complement := !match_direct & !is.na(EA) & !is.na(NEA) &
+       allele_pair(complement_allele(EA), complement_allele(NEA)) == gwas_alleles]
+
+  n_position_matched <- nrow(dt)
+  n_direct <- sum(dt$match_direct)
+  n_complemented <- sum(dt$match_complement)
+  n_allele_mismatch <- n_position_matched - n_direct - n_complemented
+  message(sprintf(
+    "  Allele matching: %d rows at requested positions | %d as reported | %d by strand complement | %d rejected",
+    n_position_matched, n_direct, n_complemented, n_allele_mismatch
+  ))
+
+  dt[match_complement == TRUE, `:=`(EA = complement_allele(EA), NEA = complement_allele(NEA))]
+  dt <- dt[match_direct | match_complement]
+  # If a position appears more than once, prefer the row matched as reported.
+  dt <- dt[order(!match_direct)]
   if (nrow(dt) == 0) {
     message(sprintf("  No SNPs with matching alleles found for %s", trait))
     return(NULL)
@@ -374,115 +452,211 @@ read_single_trait_dt <- function(trait,
   # Clean up temporaries if present
   cols_to_drop <- intersect(c("ref_from_varid", "alt_from_varid", "chr_from_varid", "pos_from_varid", "varid_chrpos_us", "trait_alleles", "gwas_alleles"), names(dt))
   if (length(cols_to_drop)) dt[, (cols_to_drop) := NULL]
-  
+
+  setattr(dt, "qc", list(
+    trait = trait,
+    effect_allele_rule = ea_rule_label,
+    n_position_matched = n_position_matched,
+    n_direct = n_direct,
+    n_complemented = n_complemented,
+    n_allele_mismatch = n_allele_mismatch,
+    n_final = nrow(dt)
+  ))
+
   return(dt)
 }
 
-fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
+fetch_summary_stats <- function(df_input, gwas_ss_file = NULL, trait_ss_files,
                                 trait_ss_size = NULL, pval_cutoff = 1,
-                                pval_bonf = NULL, checkpoint_dir = NULL) {
-  
-  # GOAL: Fetches and aligns summary statistics using "Chr:Pos" as the standard SNP identifier.
-  #
-  # ASSUMPTIONS:
-  #   - df_input: A data frame with 'SNP' (Chr:Pos format), 'Risk_Allele', 'REF', and 'ALT' columns.
-  #   - gwas_ss_file: Can be a file path or a data frame.
-  #     - If a data frame, it must contain 'SNP', 'REF', 'ALT', 'BETA', and 'P_VALUE' columns.
-  #     - If a file, it must be searchable by 'SNP' (Chr:Pos) and contain the same required columns.
-  #   - trait_ss_files: A named vector of filepaths. Each file must have 'SNP', 'EA', 'NEA', 'BETA', etc.
-  #
-  # OUTPUT: A list containing:
-  #   - df_z: A data frame of aligned Z-scores (SNPs x Traits).
-  #   - df_N: A data frame of sample sizes (SNPs x Traits).
-  #   - df_gwas: The filtered and formatted data from the primary GWAS.
-  
+                                pval_bonf = NULL, checkpoint_dir = NULL,
+                                trait_effect_allele = NULL) {
 
-  # -------------------------------------------------------------------------- #
-  # Main Function Body
-  # -------------------------------------------------------------------------- #
-  
-  # --- 1. Process Primary GWAS ---
-  
-  print("Writing SNP list (chr:pos) to file for grepping...")
+  # GOAL: Fetch trait summary statistics for a set of variants and return
+  # z-scores oriented to each variant's risk allele, keyed by "Chr:Pos".
+  #
+  # RECOMMENDED USE (gwas_ss_file = NULL):
+  #   df_input is the output of get_biggest_gwas() (with SNP = ChrPos), which has
+  #   already applied the primary-GWAS filters. It must contain:
+  #     SNP ("Chr:Pos"), Risk_Allele, Nonrisk_Allele
+  #   and normally also VAR_ID, REF, ALT, PVALUE_main, BETA_main, SE_main.
+  #   Nothing is filtered here. Input that is not clean (a missing risk allele,
+  #   two variants at one position) is an error.
+  #
+  # LEGACY USE (gwas_ss_file supplied):
+  #   df_input needs SNP and Risk_Allele (from the discovery GWAS). gwas_ss_file
+  #   is the primary GWAS as a file path or data frame with SNP, REF, ALT, BETA
+  #   (or ODDS_RATIO) and P_VALUE. The primary-GWAS filters are applied here:
+  #   a variant is removed if it is absent from the primary GWAS, has no
+  #   direction there (BETA missing or zero), has P above pval_cutoff, or has a
+  #   different risk allele in the two GWAS. Every removal is reported in
+  #   $dropped. The former Bonferroni band (pval_bonf), which kept strongly
+  #   significant mismatches, has been removed.
+  #
+  # trait_ss_files      : named vector of trait file paths
+  # trait_ss_size       : named vector of trait sample sizes (optional)
+  # trait_effect_allele : optional named vector overriding the effect-allele
+  #                       rule for individual traits ("ALT", "REF", or a column)
+  #
+  # OUTPUT: a list with
+  #   df_z     z-scores, one row for EVERY variant that passed the primary
+  #            filters (all NA when no trait file has the variant)
+  #   df_N     sample sizes, same shape
+  #   df_gwas  the variants with their primary-GWAS alleles and statistics
+  #   dropped  variants removed by the primary-GWAS filters, with the reason
+  #            (always empty in the recommended use)
+  #   trait_qc per-trait effect-allele rule and allele-matching counts
+
+  df_input <- as.data.frame(df_input, stringsAsFactors = FALSE)
+  if (!"SNP" %in% names(df_input)) {
+    stop("df_input must have a SNP column in Chr:Pos form (e.g. SNP = ChrPos).")
+  }
+  if (!is.null(pval_bonf)) {
+    warning("pval_bonf is no longer used: every risk-allele mismatch is now ",
+            "removed, whatever its primary-GWAS P.", call. = FALSE)
+  }
+
   tmp_var_file <- tempfile("variants_to_query_", fileext = ".tmp")
   on.exit(unlink(tmp_var_file), add = TRUE)
-  writeLines(df_input$SNP, tmp_var_file)
-  
-  if (is.character(gwas_ss_file)) {
-    print("Reading primary GWAS summary statistics from file...")
-    headers <- as.character(fread(gwas_ss_file, nrows = 1, data.table = F, header = F))
-    cmd_grep <- if (endsWith(gwas_ss_file, ".gz")) {
-      sprintf("gzip -cd %s | grep -Fwf %s", shQuote(gwas_ss_file), shQuote(tmp_var_file))
-    } else {
-      sprintf("grep -Fwf %s %s", shQuote(tmp_var_file), shQuote(gwas_ss_file))
+
+  dropped <- data.frame(SNP = character(0), reason = character(0),
+                        stringsAsFactors = FALSE)
+
+  if (is.null(gwas_ss_file)) {
+    # --- 1a. Input already filtered against the primary GWAS ------------------
+    required_cols <- c("Risk_Allele", "Nonrisk_Allele")
+    if (!all(required_cols %in% names(df_input))) {
+      stop("df_input must contain Risk_Allele and Nonrisk_Allele (the output of ",
+           "get_biggest_gwas()), or supply gwas_ss_file to use the legacy path. ",
+           "Missing: ", paste(setdiff(required_cols, names(df_input)), collapse = ", "))
     }
-    gwas_ss <- fread(cmd = cmd_grep, header = F, col.names = headers, data.table = FALSE, stringsAsFactors = FALSE)
+    bad_allele <- is.na(df_input$Risk_Allele) | is.na(df_input$Nonrisk_Allele) |
+      !nzchar(df_input$Risk_Allele) | !nzchar(df_input$Nonrisk_Allele)
+    if (any(bad_allele)) {
+      stop(sprintf(
+        "%d variant(s) in df_input have no Risk_Allele/Nonrisk_Allele (first: %s). They should have been removed by get_biggest_gwas().",
+        sum(bad_allele), paste(head(df_input$SNP[bad_allele], 5), collapse = ", ")
+      ))
+    }
+    duplicated_snps <- unique(df_input$SNP[duplicated(df_input$SNP)])
+    if (length(duplicated_snps) > 0L) {
+      stop(sprintf(
+        "df_input has duplicate positions (%d; first: %s). Trait data are matched by Chr:Pos, so keep one variant per position before calling fetch_summary_stats().",
+        length(duplicated_snps), paste(head(duplicated_snps, 5), collapse = ", ")
+      ))
+    }
+
+    df_gwas <- df_input
+    # Standard column names used by downstream alignment code
+    for (pair in list(c("P_VALUE", "PVALUE_main"), c("BETA", "BETA_main"), c("SE", "SE_main"))) {
+      if (!pair[1] %in% names(df_gwas) && pair[2] %in% names(df_gwas)) {
+        df_gwas[[pair[1]]] <- df_gwas[[pair[2]]]
+      }
+    }
+    message(sprintf("%i variants supplied with primary-GWAS risk alleles; no filtering applied here.",
+                    nrow(df_gwas)))
+
   } else {
-    print("Filtering pre-loaded primary GWAS data frame...")
-    gwas_ss <- gwas_ss_file %>% filter(SNP %in% df_input$SNP)
-    
-  }
+    # --- 1b. Legacy: read the primary GWAS and filter here --------------------
+    if (!"Risk_Allele" %in% names(df_input)) {
+      stop("With gwas_ss_file supplied, df_input must have a Risk_Allele column from the discovery GWAS.")
+    }
+    writeLines(df_input$SNP, tmp_var_file)
 
-  print(sprintf("%i of %i SNPs found in primary GWAS.", nrow(gwas_ss), nrow(df_input)))
+    if (is.character(gwas_ss_file)) {
+      print("Reading primary GWAS summary statistics from file...")
+      headers <- as.character(fread(gwas_ss_file, nrows = 1, data.table = F, header = F))
+      cmd_grep <- if (endsWith(gwas_ss_file, ".gz")) {
+        sprintf("gzip -cd %s | grep -Fwf %s", shQuote(gwas_ss_file), shQuote(tmp_var_file))
+      } else {
+        sprintf("grep -Fwf %s %s", shQuote(tmp_var_file), shQuote(gwas_ss_file))
+      }
+      gwas_ss <- fread(cmd = cmd_grep, header = F, col.names = headers, data.table = FALSE, stringsAsFactors = FALSE)
+    } else {
+      print("Filtering pre-loaded primary GWAS data frame...")
+      gwas_ss <- gwas_ss_file %>% filter(SNP %in% df_input$SNP)
+    }
+    print(sprintf("%i of %i SNPs found in primary GWAS.",
+                  length(unique(gwas_ss$SNP)), nrow(df_input)))
 
-  # Standardize primary GWAS: Derive Risk/Non-risk Alleles from BETA, REF, and ALT
-  if (!all(c("Risk_Allele", "Nonrisk_Allele") %in% names(gwas_ss))) {
-    print("Standardizing primary GWAS: Deriving Risk/Non-risk Alleles...")
-    if (!"BETA" %in% colnames(gwas_ss) && "ODDS_RATIO" %in% colnames(gwas_ss)) {
-      gwas_ss <- gwas_ss %>% mutate(BETA = log(ODDS_RATIO))
+    # Derive risk / non-risk alleles from the sign of BETA on ALT. A missing or
+    # zero BETA gives no direction (NA), which removes the variant below.
+    if (!all(c("Risk_Allele", "Nonrisk_Allele") %in% names(gwas_ss))) {
+      print("Standardizing primary GWAS: Deriving Risk/Non-risk Alleles...")
+      if (!"BETA" %in% colnames(gwas_ss) && "ODDS_RATIO" %in% colnames(gwas_ss)) {
+        gwas_ss <- gwas_ss %>% mutate(BETA = log(as.numeric(ODDS_RATIO)))
+      }
+      required_cols <- c("REF", "ALT", "BETA")
+      if (!all(required_cols %in% names(gwas_ss))) {
+        stop(paste("Primary GWAS is missing required columns for standardization:",
+                   paste(setdiff(required_cols, names(gwas_ss)), collapse = ", ")))
+      }
+      gwas_ss <- gwas_ss %>%
+        mutate(
+          BETA = suppressWarnings(as.numeric(BETA)),
+          Risk_Allele = case_when(BETA > 0 ~ ALT, BETA < 0 ~ REF, TRUE ~ NA_character_),
+          Nonrisk_Allele = case_when(BETA > 0 ~ REF, BETA < 0 ~ ALT, TRUE ~ NA_character_)
+        )
+    }
+    if (!"P_VALUE" %in% names(gwas_ss)) gwas_ss$P_VALUE <- NA_real_
+
+    df_joined <- df_input %>%
+      dplyr::rename(Risk_Allele_Orig = Risk_Allele) %>%
+      dplyr::select(SNP, Risk_Allele_Orig) %>%
+      inner_join(gwas_ss, by = "SNP") %>%
+      mutate(P_VALUE = suppressWarnings(as.numeric(P_VALUE)),
+             P_VALUE = if_else(!is.na(P_VALUE) & P_VALUE == 0, .Machine$double.xmin, P_VALUE)) %>%
+      mutate(reason = case_when(
+        is.na(Risk_Allele)                         ~ "no_main_direction",
+        is.na(Risk_Allele_Orig)                    ~ "no_discovery_direction",
+        pval_cutoff < 1 & is.na(P_VALUE)           ~ "main_pvalue_missing",
+        !is.na(P_VALUE) & P_VALUE > pval_cutoff    ~ "main_pvalue_above_cutoff",
+        Risk_Allele != Risk_Allele_Orig            ~ "risk_allele_mismatch",
+        TRUE                                       ~ NA_character_
+      ))
+
+    dropped <- bind_rows(
+      data.frame(SNP = setdiff(df_input$SNP, gwas_ss$SNP),
+                 reason = rep("not_in_main_gwas", length(setdiff(df_input$SNP, gwas_ss$SNP))),
+                 stringsAsFactors = FALSE),
+      df_joined %>%
+        filter(!is.na(reason)) %>%
+        dplyr::select(SNP, reason, any_of(c("P_VALUE", "Risk_Allele_Orig", "Risk_Allele")))
+    ) %>%
+      distinct(SNP, .keep_all = TRUE) %>%
+      as.data.frame()
+
+    df_gwas <- df_joined %>%
+      filter(is.na(reason)) %>%
+      dplyr::select(-reason)
+
+    n_dup <- sum(duplicated(df_gwas$SNP))
+    if (n_dup > 0L) {
+      warning(sprintf(
+        "%d position(s) have more than one primary-GWAS row; keeping the lowest-P row of each.",
+        n_dup), call. = FALSE)
+      df_gwas <- df_gwas %>% arrange(P_VALUE) %>% distinct(SNP, .keep_all = TRUE)
     }
 
-
-    required_cols <- c("REF", "ALT", "BETA")
-    if(!all(required_cols %in% names(gwas_ss))){
-      stop(paste("Primary GWAS is missing required columns for standardization:", paste(setdiff(required_cols, names(gwas_ss)), collapse=", ")))
+    print(sprintf("%i of %i variants remain after the primary-GWAS filters.",
+                  nrow(df_gwas), nrow(df_input)))
+    if (nrow(dropped) > 0L) {
+      reason_counts <- table(dropped$reason)
+      message("  Removed: ",
+              paste(sprintf("%s = %d", names(reason_counts), as.integer(reason_counts)),
+                    collapse = "; "))
     }
-    
-    gwas_ss <- gwas_ss %>%
-      mutate(
-        Risk_Allele = if_else(BETA > 0, ALT, REF),
-        Nonrisk_Allele = if_else(BETA > 0, REF, ALT)
-      )
   }
-  
-  # --- 2. Merge with Input and Filter SNPs ---
-  df_input_wGWAS <- df_input %>%
-    dplyr::rename(Risk_Allele_Orig = Risk_Allele) %>%
-    select(SNP, Risk_Allele_Orig) %>%
-    inner_join(gwas_ss, by = "SNP") %>%
-    mutate(across(any_of("P_VALUE"), as.numeric)) %>%
-    mutate(P_VALUE = if_else(P_VALUE == 0, .Machine$double.xmin, P_VALUE))
-  
-  print(paste0(nrow(df_input_wGWAS), " variants available after merging with primary GWAS."))
-  
-  # Legacy callers receive the original behavior: Bonferroni is based on all
-  # input variants available in the primary GWAS.  Proxy-enabled pipelines can
-  # instead supply a threshold based on their independent sentinel count, so a
-  # widened proxy candidate field does not make this directionality check
-  # artificially stringent.
-  if (is.null(pval_bonf)) {
-    pval_bonf <- 0.05 / nrow(df_input_wGWAS)
+
+  if (nrow(df_gwas) == 0L) {
+    stop("No variants remain to fetch trait data for.")
   }
-  if (!is.numeric(pval_bonf) || length(pval_bonf) != 1 ||
-      is.na(pval_bonf) || pval_bonf <= 0 || pval_bonf > 1) {
-    stop("pval_bonf must be one numeric probability in (0, 1].")
-  }
-  message(sprintf("Primary-GWAS Bonferroni cutoff: %.3e", pval_bonf))
-  opp_risk <- df_input_wGWAS %>% filter(between(P_VALUE, pval_bonf, pval_cutoff) & Risk_Allele != Risk_Allele_Orig)
-  high_pval <- df_input_wGWAS %>% filter(P_VALUE > pval_cutoff)
-  uniq_to_drop <- unique(c(opp_risk$SNP, high_pval$SNP))
-  
-  df_input_wGWAS_filtered <- df_input_wGWAS %>%
-    filter(!SNP %in% uniq_to_drop)
-  
-  print(sprintf("%i variants remain after p-value and risk allele filtering.", nrow(df_input_wGWAS_filtered)))
-  
-  df_read_trait_input <- df_input_wGWAS_filtered %>%
+
+  df_read_trait_input <- df_gwas %>%
     dplyr::select(SNP, Risk_Allele, Nonrisk_Allele) %>%
     as.data.table()
-  
+
   writeLines(df_read_trait_input$SNP, tmp_var_file)
-  
+
   # --- 3. Process All Trait Files ---
   if (!is.null(checkpoint_dir))
     dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
@@ -502,8 +676,17 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
 
     trait_file <- trait_ss_files[[trait]]
     trait_info <- file.info(trait_file)
+    trait_override <- if (!is.null(trait_effect_allele) &&
+                          trait %in% names(trait_effect_allele)) {
+      unname(trait_effect_allele[[trait]])
+    } else {
+      NULL
+    }
+    # format_version 2: strand-complement allele matching and the shared
+    # effect-allele rule. Checkpoints written by version 1 are recomputed.
     cp_signature <- object_md5(list(
-      format_version = 1L,
+      format_version = 2L,
+      effect_allele_override = trait_override,
       trait = trait,
       trait_file = normalizePath(trait_file, mustWork = TRUE),
       file_size = trait_info$size,
@@ -530,7 +713,8 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
         read_trait_input = df_read_trait_input,
         trait_ss_files = trait_ss_files,
         trait_ss_size = trait_ss_size,
-        tmp_var_file = tmp_var_file
+        tmp_var_file = tmp_var_file,
+        effect_allele = trait_override
       ),
       error = function(e) {
         stop(sprintf("Trait %s failed: %s", trait, conditionMessage(e)),
@@ -556,14 +740,41 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
   #    Filter out any NULL results from failed traits.
   valid_results_list <- Filter(Negate(is.null), list_of_results)
   
+  # Per-trait record of the effect-allele rule used and the allele-match counts
+  trait_qc <- bind_rows(lapply(names(valid_results_list), function(trait) {
+    qc <- attr(valid_results_list[[trait]], "qc")
+    if (is.null(qc)) {
+      data.frame(trait = trait, stringsAsFactors = FALSE)
+    } else {
+      as.data.frame(qc, stringsAsFactors = FALSE)
+    }
+  }))
+  complemented <- trait_qc[!is.na(trait_qc$n_complemented) & trait_qc$n_complemented > 0, , drop = FALSE]
+  if ("n_complemented" %in% names(trait_qc) && nrow(complemented) > 0L) {
+    message(sprintf("%d trait file(s) had variants matched by strand complement: %s",
+                    nrow(complemented), paste(complemented$trait, collapse = ", ")))
+  }
+
   # 4. Bind the rows. It now receives a named list.
   trait_df_list <- bind_rows(valid_results_list, .id = "trait")
-  
+
   print(head(trait_df_list))
   # --- 4. Consolidate and Return Output ---
-  if (nrow(trait_df_list) > 0) {
+  # One row per variant that passed the primary-GWAS filters, in input order,
+  # whether or not any trait file has it. A variant with no trait data gets a
+  # row of NA, so "missing from the matrix" can never be confused with "no data".
+  all_snps <- df_read_trait_input$SNP
+  trait_order <- unique(names(trait_ss_files))
+  reindex_to_all_snps <- function(mat) {
+    full <- matrix(NA_real_, nrow = length(all_snps), ncol = length(trait_order),
+                   dimnames = list(all_snps, trait_order))
+    shared_rows <- intersect(all_snps, rownames(mat))
+    shared_cols <- intersect(trait_order, colnames(mat))
+    full[shared_rows, shared_cols] <- mat[shared_rows, shared_cols, drop = FALSE]
+    full
+  }
 
-    trait_order <- unique(names(trait_ss_files))
+  if (nrow(trait_df_list) > 0) {
 
     # Use data.table dcast — much faster than pivot_wider on large matrices
     message("Expanding using dcast!")
@@ -581,17 +792,27 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
     N_mat <- as.matrix(N_df_wide[, -1, with = FALSE])
     rownames(N_mat) <- N_df_wide$SNP
 
-    df_z <- as.data.frame(z_mat)
-    df_N <- as.data.frame(N_mat)
-    
+    z_mat <- reindex_to_all_snps(z_mat)
+    N_mat <- reindex_to_all_snps(N_mat)
+
   } else {
-    print("No overlapping SNPs with matching alleles found in any trait files. Returning empty data frames.")
-    df_z <- data.frame(matrix(ncol = length(trait_ss_files), nrow = 0, dimnames = list(NULL, names(trait_ss_files))))
-    df_N <- data.frame(matrix(ncol = length(trait_ss_files), nrow = 0, dimnames = list(NULL, names(trait_ss_files))))
+    print("No overlapping SNPs with matching alleles found in any trait files. Returning all-NA matrices.")
+    z_mat <- reindex_to_all_snps(matrix(NA_real_, nrow = 0, ncol = 0))
+    N_mat <- z_mat
   }
-  
+
+  n_no_trait_data <- sum(rowSums(!is.na(z_mat)) == 0L)
+  if (n_no_trait_data > 0L) {
+    message(sprintf("%d of %d variants have no data in any trait file (kept as all-NA rows).",
+                    n_no_trait_data, nrow(z_mat)))
+  }
+
+  df_z <- as.data.frame(z_mat)
+  df_N <- as.data.frame(N_mat)
+
   print("Done!")
-  return(list(df_z = df_z, df_N = df_N, df_gwas = df_input_wGWAS_filtered))
+  return(list(df_z = df_z, df_N = df_N, df_gwas = df_gwas,
+              dropped = dropped, trait_qc = trait_qc))
 }
 
 

@@ -54,9 +54,18 @@ main_dir <- file.path(repo_dir, paste0(version, "_results"))
 dir.create(main_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Variant-selection settings.
+#   PVCUTOFF        discovery-GWAS P a variant needs to be a sentinel
+#   PVCUTOFF_PROXY  discovery-GWAS P for the wider pool of possible proxies
+#   MAIN_PVCUTOFF   primary-GWAS P every variant needs to stay in. It must also
+#                   have the same risk allele in the discovery and primary GWAS.
 PVCUTOFF <- 5e-8
 PVCUTOFF_PROXY <- 5e-6
+MAIN_PVCUTOFF <- 0.05
 PROXY_WINDOW_KB <- 500
+
+# Which variant leads each locus when clumping or LD pruning: the strongest in
+# the primary GWAS, with the discovery P as tiebreaker.
+LOCUS_ORDER_BY <- c("PVALUE_main", "PVALUE_discovery")
 
 # External LD operations are disabled for the self-contained toy run.
 RUN_LDLINK_PRUNING <- FALSE
@@ -134,70 +143,64 @@ main_ss_filepath <- gwas$full_path[main_rows]
 trait_ss_files <- setNames(gwas_traits$full_path, gwas_traits$trait)
 trait_ss_size <- setNames(as.numeric(gwas_traits$sample_size), gwas_traits$trait)
 
+# Optional per-trait override of the effect-allele rule: an `effect_allele`
+# column in the trait_gwas sheet holding "ALT", "REF", or a column name. Leave
+# it out (or blank) to let the pipeline detect the effect allele.
+trait_effect_allele <- NULL
+if ("effect_allele" %in% names(gwas_traits)) {
+  has_override <- !is.na(gwas_traits$effect_allele) & nzchar(gwas_traits$effect_allele)
+  trait_effect_allele <- setNames(gwas_traits$effect_allele[has_override],
+                                  gwas_traits$trait[has_override])
+}
+
 # =============================================================================
 # 2. Select sentinel variants
 # =============================================================================
 
-# The broad set supplies possible proxy candidates. Sentinel eligibility is
-# still determined using each discovery GWAS's p-value and PVCUTOFF below.
+# Collect every variant below the broad cutoff from each discovery GWAS. This
+# pool supplies the sentinels and their possible proxies. Files do not need to
+# share one REF/ALT order: variants are matched on position and allele pair.
 vars_sig <- get_sig_snps(
   gwas = gwas,
   rename_cols = NULL,
   PVCUTOFF = PVCUTOFF_PROXY
-) %>%
-  mutate(PVALUE = if_else(PVALUE == 0, 1e-300, PVALUE))
+)
+write_tsv(attr(vars_sig, "input_qc"),
+          file.path(main_dir, "input_qc_discovery_gwas.txt"))
 
-# Normalize the designated primary GWAS in memory. This works for both the
-# uncompressed toy file and real data supplied as a data frame to
-# fetch_summary_stats().
-gwas_primary <- fread(main_ss_filepath, data.table = FALSE)
-if (!"BETA" %in% names(gwas_primary)) {
-  gwas_primary <- gwas_primary %>%
-    mutate(BETA = log(as.numeric(ODDS_RATIO)))
-}
-if (!"SE" %in% names(gwas_primary)) {
-  gwas_primary <- gwas_primary %>%
-    mutate(SE = abs(BETA / qnorm(pmax(as.numeric(P_VALUE),
-                                     .Machine$double.xmin) / 2)))
-}
-gwas_primary <- gwas_primary %>%
-  mutate(P_VALUE = as.numeric(P_VALUE), BETA = as.numeric(BETA), SE = as.numeric(SE)) %>%
-  separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"),
-           sep = "_", remove = FALSE, convert = TRUE) %>%
-  mutate(SNP = paste(CHR, POS, sep = ":"))
-
-primary_pvalues <- gwas_primary %>%
-  transmute(VAR_ID, PVALUE = P_VALUE)
-
-# Mirror get_biggest_gwas(): retain the strongest discovery record for each
-# variant, then require the variant to be represented in the primary GWAS.
-vars_main <- vars_sig %>%
-  arrange(PVALUE) %>%
-  distinct(VAR_ID, .keep_all = TRUE) %>%
-  rename(PVALUE.Pop = PVALUE) %>%
-  inner_join(primary_pvalues, by = "VAR_ID") %>%
-  separate(VAR_ID, into = c("CHR", "POS", "REF.primary", "ALT.primary"),
-           sep = "_", remove = FALSE, convert = TRUE) %>%
-  mutate(
-    REF = REF.primary,
-    ALT = ALT.primary,
-    ChrPos = paste(CHR, POS, sep = ":"),
-    ChrPos_LDlink = paste0("chr", ChrPos)
-  ) %>%
-  select(-REF.primary, -ALT.primary)
+# Cross-reference against the primary GWAS and apply its filters now, before
+# any clumping or pruning: each variant must be present in the primary GWAS,
+# reach MAIN_PVCUTOFF there, and have the same risk allele in both. Removing
+# failures here means a locus can fall back to its next-best variant, and no
+# sentinel is lost after pruning.
+vars_main <- get_biggest_gwas(
+  main_ss_filepath = main_ss_filepath,
+  vars_sig = vars_sig,
+  main_pval_cutoff = MAIN_PVCUTOFF
+)
+# Keep the reports before any dplyr step (which may drop attributes).
+write_tsv(attr(vars_main, "dropped"),
+          file.path(main_dir, "variants_removed_by_primary_gwas.txt"))
+write_tsv(attr(vars_main, "drop_summary"),
+          file.path(main_dir, "variants_removed_by_primary_gwas_summary.txt"))
+write_tsv(attr(vars_main, "concordance"),
+          file.path(main_dir, "discovery_vs_primary_agreement.txt"))
 
 vars_no_hla <- vars_main %>%
   filter(!(CHR == 6 & between(POS, 28477797, 33448354)))
 
+# Sentinel eligibility is decided by the discovery P. (The primary-GWAS
+# requirement, MAIN_PVCUTOFF, has already been applied to every variant.)
 sentinel_candidates <- vars_no_hla %>%
-  filter(PVALUE.Pop < PVCUTOFF)
+  filter(PVALUE_discovery < PVCUTOFF)
 if (nrow(sentinel_candidates) == 0L) {
   stop("No sentinel variants passed PVCUTOFF.")
 }
 
 # This example leaves the significant candidates unclumped. For projects where
-# physical-distance clumping is intended, call snp_clump() here and subset
-# sentinel_candidates to the returned IDs. For LD-based pruning, enable the
+# physical-distance clumping is intended, call
+#   snp_clump(sentinel_candidates, id = "VAR_ID", window = ..., order_by = LOCUS_ORDER_BY)
+# here and subset sentinel_candidates to the returned IDs. For LD-based pruning, enable the
 # SNPclip step below instead; position-based clumping is not a substitute for LD.
 
 message(sprintf(
@@ -221,7 +224,8 @@ if (RUN_LDLINK_PRUNING) {
       r2 = LD_R2,
       maf = LD_MAF,
       chr = 1:22,
-      token = LDLINK_TOKEN
+      token = LDLINK_TOKEN,
+      order_by = LOCUS_ORDER_BY
     )
   }
 
@@ -267,27 +271,32 @@ if (nrow(pruned_vars) == 0L) {
 # 4. Fetch and harmonize the multi-trait summary statistics
 # =============================================================================
 
+# Trait data are matched by position, so keep one variant per position. A
+# sentinel always keeps its own position; otherwise the locus order decides.
 fetch_input <- window_to_sentinels(
   candidates = vars_no_hla,
   sentinels = pruned_vars,
   window_kb = PROXY_WINDOW_KB
 ) %>%
-  mutate(SNP = ChrPos) %>%
-  arrange(PVALUE) %>%
-  distinct(SNP, .keep_all = TRUE)
+  mutate(SNP = ChrPos,
+         is_sentinel = VAR_ID %in% pruned_vars$VAR_ID) %>%
+  arrange(desc(is_sentinel), across(all_of(LOCUS_ORDER_BY))) %>%
+  distinct(SNP, .keep_all = TRUE) %>%
+  select(-is_sentinel)
 
-pval_bonf_sentinel <- 0.05 / nrow(pruned_vars)
 trait_checkpoint_dir <- file.path(main_dir, "trait_checkpoints")
 
+# fetch_input already carries the primary-GWAS risk alleles and has passed the
+# primary-GWAS filters, so the primary file is not read again and nothing is
+# filtered here. The z-matrix has one row for every variant in fetch_input.
 z_n_mats <- fetch_summary_stats(
   df_input = fetch_input,
-  gwas_ss_file = gwas_primary,
   trait_ss_files = trait_ss_files,
   trait_ss_size = trait_ss_size,
-  pval_cutoff = 0.05,
-  pval_bonf = pval_bonf_sentinel,
-  checkpoint_dir = trait_checkpoint_dir
+  checkpoint_dir = trait_checkpoint_dir,
+  trait_effect_allele = trait_effect_allele
 )
+write_tsv(z_n_mats$trait_qc, file.path(main_dir, "input_qc_trait_gwas.txt"))
 
 zmat_fullset <- as.matrix(z_n_mats$df_z)
 Nmat_fullset <- as.matrix(z_n_mats$df_N)
@@ -296,6 +305,18 @@ missing_sentinels <- setdiff(pruned_vars$ChrPos, rownames(zmat_fullset))
 if (length(missing_sentinels) > 0L) {
   stop("No z-matrix row was created for sentinel(s): ",
        paste(missing_sentinels, collapse = ", "))
+}
+
+# A sentinel with no data in any trait file is a real missingness problem. With
+# the proxy search on it is flagged below and replaced or dropped; with it off
+# there is nothing to cluster it on, so stop.
+sentinels_without_trait_data <- pruned_vars$ChrPos[
+  rowSums(!is.na(zmat_fullset[pruned_vars$ChrPos, , drop = FALSE])) == 0L
+]
+if (length(sentinels_without_trait_data) > 0L && !RUN_PROXY_SEARCH) {
+  stop("Sentinel(s) with no data in any trait file: ",
+       paste(sentinels_without_trait_data, collapse = ", "),
+       ". Enable the proxy search or remove them.")
 }
 
 zmat_pruned <- zmat_fullset[pruned_vars$ChrPos, , drop = FALSE]
@@ -385,12 +406,12 @@ if (RUN_PROXY_SEARCH) {
     filter(VAR_ID %in% original_ids) %>%
     transmute(
       VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
-      original_SNP = VAR_ID, REF, ALT, PVALUE, Risk_Allele, GWAS, Population
+      original_SNP = VAR_ID, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population
     )
 
   if (nrow(proxy_rows) > 0L) {
     proxy_metadata <- fetch_input %>%
-      select(VAR_ID, SNP, REF, ALT, PVALUE, Risk_Allele, GWAS, Population) %>%
+      select(VAR_ID, SNP, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population) %>%
       distinct(SNP, .keep_all = TRUE)
 
     final_proxies <- proxy_rows %>%
@@ -402,7 +423,7 @@ if (RUN_PROXY_SEARCH) {
       ) %>%
       inner_join(proxy_metadata, by = c("ChrPos" = "SNP")) %>%
       select(VAR_ID, ChrPos, rsID, Variant_Type, original_SNP,
-             REF, ALT, PVALUE, Risk_Allele, GWAS, Population)
+             REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population)
   } else {
     final_proxies <- final_originals[0, ]
   }
@@ -413,7 +434,7 @@ if (RUN_PROXY_SEARCH) {
   final_snps <- pruned_vars %>%
     transmute(
       VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
-      original_SNP = VAR_ID, REF, ALT, PVALUE, Risk_Allele, GWAS, Population
+      original_SNP = VAR_ID, REF, ALT, PVALUE_discovery, PVALUE_main, Risk_Allele, GWAS, Population
     )
 }
 
@@ -422,6 +443,10 @@ if (anyDuplicated(final_snps$original_SNP)) {
 }
 if (!setequal(final_snps$original_SNP, pruned_vars$VAR_ID)) {
   stop("Final assembly did not account for every pruned sentinel exactly once.")
+}
+if (anyDuplicated(final_snps$ChrPos)) {
+  stop("Final assembly contains the same position more than once (a proxy ",
+       "coincides with another retained variant).")
 }
 
 write_tsv(
@@ -433,6 +458,8 @@ write_tsv(
 # 6. Primary-GWAS alignment and final matrices
 # =============================================================================
 
+# df_gwas holds the primary-GWAS statistics for every fetched variant. BETA is
+# the primary-GWAS effect of ALT (BETA_main from get_biggest_gwas()).
 gwas_alignment_source <- z_n_mats$df_gwas %>%
   transmute(
     ChrPos = SNP,
@@ -454,7 +481,12 @@ gwas_final <- final_snps %>%
     )
   )
 
-if (nrow(gwas_final) != nrow(final_snps) || anyNA(gwas_final$BETA_aligned)) {
+# Audit: every final variant has primary-GWAS statistics, the risk allele used
+# for trait alignment is the one carried from variant selection, and the effect
+# of that risk allele is positive.
+if (nrow(gwas_final) != nrow(final_snps) || anyNA(gwas_final$BETA_aligned) ||
+    any(gwas_final$Risk_Allele != gwas_final$primary_Risk_Allele) ||
+    any(gwas_final$BETA_aligned <= 0)) {
   stop("One or more final variants failed the primary-GWAS alignment audit.")
 }
 
