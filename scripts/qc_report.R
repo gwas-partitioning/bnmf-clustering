@@ -27,6 +27,9 @@
 #   settings                 named list or vector of thresholds and options
 #   input_qc                 attr(get_sig_snps(), "input_qc")
 #   concordance              attr(get_biggest_gwas(), "concordance")
+#   sentinels, main_pvalue_cutoff
+#                            final sentinel table (VAR_ID, PVALUE_discovery, PVALUE_main,
+#                            Risk_Allele, Risk_Allele_discovery) and the MAIN_PVCUTOFF used
 #   dropped, drop_summary    attr(get_biggest_gwas(), "dropped" / "drop_summary")
 #                            (or fetch_summary_stats()$dropped on the legacy path)
 #   sentinel_pvalue_cutoff   discovery P that defines a sentinel; used to list
@@ -65,7 +68,8 @@ qc_format_column <- function(v) {
   if (is.numeric(v)) {
     out <- rep("", length(v))
     ok <- !is.na(v)
-    whole <- ok & abs(v - round(v)) < 1e-9 & abs(v) < 1e15
+    # Tiny non-zero values (P-values) must not be mistaken for whole numbers.
+    whole <- ok & abs(v - round(v)) < 1e-9 & abs(v) < 1e15 & (v == 0 | abs(v) >= 0.5)
     out[whole] <- format(round(v[whole]), big.mark = ",", scientific = FALSE, trim = TRUE)
     frac <- ok & !whole
     out[frac] <- formatC(v[frac], digits = 3, format = "g")
@@ -227,6 +231,56 @@ write_qc_report <- function(qc, file,
     add_section("Variants removed by the primary-GWAS filters", parts)
   }
 
+  # ---- Sentinel checks --------------------------------------------------------
+  # Independent re-check of the final sentinel list (whatever its source),
+  # so a bad list or a regression in the selection code cannot pass silently.
+  if (has_rows("sentinels") && has("sentinel_pvalue_cutoff") && has("main_pvalue_cutoff")) {
+    sen <- qc$sentinels
+    n_sen <- nrow(sen)
+    col_or_na <- function(name, na) if (name %in% names(sen)) sen[[name]] else rep(na, n_sen)
+    p_disc <- suppressWarnings(as.numeric(col_or_na("PVALUE_discovery", NA_real_)))
+    p_main <- suppressWarnings(as.numeric(col_or_na("PVALUE_main", NA_real_)))
+    ra_disc <- as.character(col_or_na("Risk_Allele_discovery", NA_character_))
+    ra_main <- as.character(col_or_na("Risk_Allele", NA_character_))
+    # Missing values count as failures, never as passes.
+    ok_disc <- !is.na(p_disc) & p_disc < qc$sentinel_pvalue_cutoff
+    ok_main <- !is.na(p_main) & p_main <= qc$main_pvalue_cutoff
+    ok_allele <- !is.na(ra_disc) & !is.na(ra_main) & ra_disc == ra_main
+    checks <- data.frame(
+      check = c(sprintf("Discovery P < %s in at least one discovery GWAS",
+                        format(qc$sentinel_pvalue_cutoff, scientific = TRUE)),
+                sprintf("Primary-GWAS P <= %s", format(qc$main_pvalue_cutoff)),
+                "Same risk allele in the discovery and primary GWAS"),
+      n_sentinels = n_sen,
+      n_pass = c(sum(ok_disc), sum(ok_main), sum(ok_allele)),
+      stringsAsFactors = FALSE
+    )
+    checks$n_fail <- checks$n_sentinels - checks$n_pass
+    checks$result <- ifelse(checks$n_fail == 0L, "all pass", "FAIL")
+    parts <- c(
+      para(sprintf("Re-checked on the final list of %s sentinels (before any proxy replacement). ",
+                   format(n_sen, big.mark = ",")),
+           "The discovery P is the lowest P across the discovery GWAS. A missing value counts as a failure."),
+      qc_html_table(checks)
+    )
+    failed <- !(ok_disc & ok_main & ok_allele)
+    if (any(failed)) {
+      id <- if ("VAR_ID" %in% names(sen)) as.character(sen$VAR_ID) else seq_len(n_sen)
+      flags <- c(flags, sprintf(
+        "%d sentinel(s) fail at least one of the sentinel checks (discovery P, primary-GWAS P, shared risk allele): %s. See the Sentinel checks section.",
+        sum(failed), qc_name_list(id[failed])))
+      bad <- data.frame(VAR_ID = id[failed],
+                        PVALUE_discovery = p_disc[failed], PVALUE_main = p_main[failed],
+                        Risk_Allele_discovery = ra_disc[failed], Risk_Allele_main = ra_main[failed],
+                        discovery_P_ok = ok_disc[failed], main_P_ok = ok_main[failed],
+                        allele_ok = ok_allele[failed], stringsAsFactors = FALSE)
+      parts <- c(parts, "<h3>Sentinels failing a check</h3>", qc_html_table(bad))
+    } else {
+      parts <- c(parts, para("Every sentinel passes all three checks."))
+    }
+    add_section("Sentinel checks", parts)
+  }
+
   # ---- Variant counts by stage ----------------------------------------------
   if (has_rows("funnel")) {
     add_section("Variant counts by stage", qc_html_table(qc$funnel))
@@ -385,6 +439,27 @@ write_qc_report <- function(qc, file,
                                    stringsAsFactors = FALSE)
       names(type_counts)[2] <- "n_variants"
       parts <- c(parts, qc_html_table(type_counts))
+    }
+    # Per-variant p-values. For a proxy, PVALUE_discovery is the replaced
+    # sentinel's discovery P and PVALUE_main is the proxy's own main-GWAS P.
+    p_cols <- intersect(c("PVALUE_discovery", "PVALUE_main"), names(final_variants))
+    if (length(p_cols) > 0L) {
+      range_lines <- vapply(p_cols, function(col) {
+        p <- suppressWarnings(as.numeric(final_variants[[col]]))
+        if (all(is.na(p))) return(sprintf("%s: no values", col))
+        sprintf("%s: min %s, median %s, max %s", col,
+                format(min(p, na.rm = TRUE), digits = 3, scientific = TRUE),
+                format(stats::median(p, na.rm = TRUE), digits = 3, scientific = TRUE),
+                format(max(p, na.rm = TRUE), digits = 3, scientific = TRUE))
+      }, character(1))
+      parts <- c(parts, para(paste(qc_html_escape(range_lines), collapse = "<br>")))
+      id_cols <- intersect(c("VAR_ID", "rsID", "Variant_Type", "original_SNP"),
+                           names(final_variants))
+      p_table <- final_variants[, c(id_cols, p_cols), drop = FALSE]
+      if ("PVALUE_main" %in% p_cols) {
+        p_table <- p_table[order(p_table$PVALUE_main), , drop = FALSE]
+      }
+      parts <- c(parts, qc_html_table(p_table, max_rows = nrow(p_table)))
     }
     add_section("Final variant set", parts)
   }

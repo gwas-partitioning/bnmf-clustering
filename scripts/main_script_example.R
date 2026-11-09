@@ -170,6 +170,7 @@ qc <- list(
     primary_gwas = basename(main_ss_filepath)
   ),
   sentinel_pvalue_cutoff = PVCUTOFF,
+  main_pvalue_cutoff = MAIN_PVCUTOFF,
   nonmissing_cutoff = PROXY_MIN_NONMISSING
 )
 
@@ -288,6 +289,7 @@ if (RUN_LDLINK_PRUNING) {
 if (nrow(pruned_vars) == 0L) {
   stop("No variants remain after pruning.")
 }
+qc$sentinels <- pruned_vars
 
 # =============================================================================
 # 4. Fetch trait summary statistics for the sentinels

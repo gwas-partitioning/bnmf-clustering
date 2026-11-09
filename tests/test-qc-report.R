@@ -37,7 +37,9 @@ full_qc <- list(
                               reason = c("high_missingness", "high_missingness")),
   proxies_found = data.frame(original_SNP = "1_2000_C_T", VAR_ID = "1_2100_A_G", r2 = 0.93),
   final_variants = data.frame(VAR_ID = c("1_1000_A_G", "1_2100_A_G"),
-                              Variant_Type = c("original", "proxy")),
+                              Variant_Type = c("original", "proxy"),
+                              PVALUE_discovery = c(1e-12, 3e-9),
+                              PVALUE_main = c(2e-15, 4e-7)),
   bnmf_run_summary = data.frame(run = 1:4, K = c(5, 5, 6, 5), evid = c(-1, -2, -3, -4))
 )
 
@@ -131,4 +133,44 @@ test_that("proxy candidate outcomes and unanswered LDlink queries appear in the 
   expect_match(audit_html, "main_pvalue_above_cutoff", fixed = TRUE)
   expect_match(audit_html, "no_candidate_passed_primary_filters", fixed = TRUE)
   expect_true(any(grepl("LDlink returned no answer", audit_flags)))
+})
+
+test_that("the final variant set lists discovery and main-GWAS P per variant", {
+  expect_match(html, "PVALUE_discovery: min", fixed = TRUE)
+  expect_match(html, "PVALUE_main: min 2e-15", fixed = TRUE)
+  expect_match(html, "<th class=\"num\">PVALUE_main</th>", fixed = TRUE)
+  expect_match(html, "1_2100_A_G", fixed = TRUE)
+})
+
+test_that("get_biggest_gwas keeps the discovery risk allele for the sentinel check", {
+  expect_true("Risk_Allele_discovery" %in% names(vars_main_qc))
+  expect_identical(vars_main_qc$Risk_Allele_discovery, vars_main_qc$Risk_Allele)
+})
+
+test_that("sentinel checks pass for real selection output and fail loudly otherwise", {
+  sen_qc <- list(sentinels = vars_main_qc, sentinel_pvalue_cutoff = 1e-6,
+                 main_pvalue_cutoff = 0.05)
+  ok_file <- tempfile(fileext = ".html")
+  ok_flags <- quietly(write_qc_report(sen_qc, ok_file))
+  ok_html <- paste(readLines(ok_file, warn = FALSE), collapse = "\n")
+  expect_match(ok_html, "<h2>Sentinel checks</h2>", fixed = TRUE)
+  expect_match(ok_html, "Every sentinel passes all three checks.", fixed = TRUE)
+  expect_false(any(grepl("fail at least one", ok_flags)))
+
+  bad <- vars_main_qc
+  bad$PVALUE_discovery[1] <- 1e-3                      # not below the sentinel cutoff
+  bad$PVALUE_main[2] <- 0.2                            # above the primary cutoff
+  bad$Risk_Allele_discovery[3] <- "N"                  # disagrees with the primary
+  bad$PVALUE_main[4] <- NA                             # missing counts as a failure
+  bad_file <- tempfile(fileext = ".html")
+  bad_flags <- quietly(write_qc_report(within(sen_qc, sentinels <- bad), bad_file))
+  bad_html <- paste(readLines(bad_file, warn = FALSE), collapse = "\n")
+  expect_true(any(grepl("4 sentinel\\(s\\) fail at least one", bad_flags)))
+  expect_match(bad_html, "Sentinels failing a check", fixed = TRUE)
+
+  # An older table without the discovery allele cannot confirm the allele check.
+  no_allele <- vars_main_qc[, setdiff(names(vars_main_qc), "Risk_Allele_discovery")]
+  na_flags <- quietly(write_qc_report(within(sen_qc, sentinels <- no_allele),
+                                      tempfile(fileext = ".html")))
+  expect_true(any(grepl("fail at least one", na_flags)))
 })

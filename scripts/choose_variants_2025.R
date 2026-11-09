@@ -607,6 +607,8 @@ get_biggest_gwas <- function(main_ss_filepath, vars_sig,
       PVALUE_discovery, PVALUE_main, BETA_main, SE_main,
       Risk_Allele = Risk_Allele_main,
       Nonrisk_Allele = Nonrisk_Allele_main,
+      # Kept so the QC report can re-check that the two GWAS agree.
+      Risk_Allele_discovery,
       GWAS, Population
     ) %>%
     as.data.frame()
