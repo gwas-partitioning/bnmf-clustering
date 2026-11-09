@@ -1,7 +1,7 @@
 ## T2D Multi-ancestry Partitioned Polygenic Scores
 Cluster weights are available from the [Smith, Deutsch et al Nature Medicine 2024](https://www.nature.com/articles/s41591-024-02865-3) paper in the "Smith_Deutsch_NatureMedicine_2024" folder. Partitioned polygenic scores (pPS) can be generated using the enclosed variant cluster weights. We have included weights for ancestry-specific and multi-ancestry clusters:
 
-* In the weights files, the "Effect_Allele" column denotes the T2D risk-increasing allele.
+* In the weights files, the "Risk_Allele" column denotes the T2D risk-increasing allele.
 * When generating the pPS, all genotypes should be aligned to this allele!
 * Weights have been provided in hg38, however a liftover map (hg19 to hg38) is included in each subfolder.
 
@@ -17,27 +17,38 @@ The bNMF procedure, as applied here, detects clusters of GWAS variants for some 
 
 1. Run `Rscript scripts/main_script_example.R` from the repository checkout. It
    uses the supplied toy summary statistics and does not require an LDlink token.
+   Results are written to `toy_bnmf_example_results/`; open `QC_report.html`
+   there first. On the toy data the report raises two items, both expected: one
+   discovery file has no effect-allele column, and many variants are "not in the
+   primary GWAS" because each toy file is a small random sample.
 2. To adapt the example for a project, copy the driver and manifest, replace the
    input paths, and review the thresholds in the configuration section.
 3. Choose a pruning strategy if needed. The example supports LD-based pruning
    through LDlink SNPclip after setting the `LDLINK_TOKEN` environment variable;
    `snp_clump()` is also available for deliberate position-based clumping. These
    are distinct approaches, and the self-contained toy run applies neither by
-   default. Proxy replacement additionally requires the per-chromosome rsID maps
-   described below.
+   default. Proxy replacement needs the same token and nothing else.
 
 The public example ends after `summarize_bNMF()`. Project-specific annotation,
 reporting, and post-hoc analysis should be added in a separate project driver.
 
-Sample input files are provided in `example_data/` to illustrate the expected formats.
+Sample input files are provided in `example_data/` to illustrate the expected formats: the manifest workbook, three discovery GWAS in two layouts, and the trait files. `example_data/rsID_map_example.txt` shows the two-column `VAR_ID`, `rsID` map that `scripts/format_gwas_input.R` can optionally use; the pipeline itself does not read it.
 
 ### Requirements
 
-**R packages:** `data.table`, `dplyr`, `tidyverse`, `magrittr`, `readxl`, `LDlinkR`, `furrr`, `future`, `parallelly`, `progressr`, `progress`, `softImpute`, `strex`, `GenomicRanges`, `rtracklayer`, `Rsamtools`, `openxlsx`, `Homo.sapiens`, `vroom`. Stability analysis additionally requires `ggplot2`, `pheatmap`, and `clue`.
+**System:** a Unix-like shell with `gzip`, `grep` and `awk` (Linux or macOS). The trait fetch reads files in parallel with forked processes; on Windows it falls back to one at a time.
+
+**R packages:**
+* Core pipeline and the example: `data.table`, `tidyverse` (including `dplyr`, `tidyr`, `readr`, `stringr`), `magrittr`, `readxl`, `LDlinkR`, `future`, `future.apply`, `furrr`, `parallelly`, `softImpute`, and `R.utils` (lets `data.table` read `.gz` files).
+* Optimized bNMF runner: `progressr`, `progress`.
+* Post-hoc analysis: `GenomicRanges`, `IRanges`, `rtracklayer`, `openxlsx`, `Homo.sapiens`, `vroom`, `scales`.
+* Stability analysis: `ggplot2`, `pheatmap`, `clue`.
+* Tests: `testthat`.
+* Optional helpers: `curl` (rsID map generator); `S4Vectors` (liftover in the formatter); `strex` (one legacy function).
 
 **LDlink API token:** Several steps use the [LDlinkR](https://cran.r-project.org/package=LDlinkR) package for LD-based operations. Request a free token at https://ldlink.nih.gov/?tab=apiaccess and store it as the environment variable `LDLINK_TOKEN`.
 
-**rsID map (optional):** The proxy search no longer needs one. `scripts/format_gwas_input.R` can use a per-chromosome file mapping `VAR_ID → rsID` to align raw files to reference alleles, and the legacy `choose_proxies()` still reads one. Generate it from 1000 Genomes Phase 3 using `scripts/generate_varid_to_rsid_map_file.R`, which downloads per-chromosome VCFs from Ensembl and writes one map file per chromosome to a local directory. Pass the directory path as `my_rsid_map_dir` in the USER CONFIGURATION section.
+**rsID map (optional):** The proxy search no longer needs one. `scripts/format_gwas_input.R` can use a per-chromosome file mapping `VAR_ID → rsID` to align raw files to reference alleles, and the legacy `choose_proxies()` still reads one. Generate it from 1000 Genomes Phase 3 using `scripts/generate_varid_to_rsid_map_file.R`, which downloads per-chromosome VCFs from Ensembl and writes one map file per chromosome to a local directory. Give that directory to the formatter as `RSID_MAP_DIR`.
 
 ### Input data format
 
@@ -103,7 +114,7 @@ Two P-values are carried for every variant, in separately named columns. There i
 Rscript tests/run_tests.R
 ```
 
-The tests build small synthetic summary statistics files and need no network access or LDlink token. They cover the effect-allele rule, matching across allele orders and strands, the primary-GWAS filters and their reasons, and the trait fetch.
+The tests build small synthetic summary statistics files and need no network access or LDlink token (LDlink is replaced by a stand-in that writes the same file format). They cover the effect-allele rule, matching across allele orders and strands, the primary-GWAS filters and their reasons, the trait fetch with one or several workers, the proxy stage, and the QC report.
 
 ### Upgrading a run script written for an earlier version
 
@@ -149,8 +160,11 @@ The tests build small synthetic summary statistics files and need no network acc
 * **`v2g()`** — Variant-to-gene mapping using Open Targets V2G scores (requires local V2G database files)
 * **`do_post_analysis()`** — Full post-hoc pipeline: nearest-gene annotation, Excel workbook export, hg19→hg38 liftover, PRS score file generation, and optional V2G mapping
 
-#### `format_bNMF_results.Rmd` — Results visualization
-Generates an HTML report with heatmaps, cluster summary tables, and an optimal weight threshold calculation.
+#### `assess_bNMF_stability.R` — Stability analysis
+Command-line script; see "Stability analysis" below.
+
+#### `format_gwas_input.R` and `generate_varid_to_rsid_map_file.R` — Optional input helpers
+Format raw downloaded summary statistics into a layout the pipeline reads, and build the per-chromosome rsID map the formatter can use.
 
 ---
 
@@ -160,7 +174,9 @@ Most pipeline steps print progress messages. Key output files written to the res
 | File | Description |
 |---|---|
 | `run_summary.txt` | Chosen K and negative log-likelihood for each bNMF replicate |
-| `z_score_mat.rds` | Final N × M z-score matrix after all preprocessing |
+| `z_score_mat.rds` | The matrix given to bNMF: N variants × 2M columns, each retained trait split into a non-negative `_pos` and `_neg` column |
+| `zmat_preImputed.rds`, `zmat_imputed.rds` | Risk-allele-oriented z-scores for the final variants and retained traits, before and after imputation |
+| `df_traits.csv` | Every trait and whether it was kept or why it was removed |
 | `bnmf_out.rds` | All bNMF replicate outputs, retained for stability analysis |
 | `bnmf_checkpoints/` | Per-repetition checkpoints when the optional optimized runner is used |
 | `L2EU.W.mat.[K].txt` | Variant weight matrix (variants × clusters) for cluster count K |
@@ -171,10 +187,9 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `input_qc_discovery_gwas.txt` | Per discovery GWAS: rows read, rows dropped as not biallelic autosomal SNPs, and the effect-allele rule used |
 | `discovery_vs_primary_agreement.txt` | Per discovery GWAS: variants found in the primary GWAS, variants listed in the opposite allele order, and risk-allele agreement |
 | `variants_removed_by_primary_gwas.txt` | Every variant removed by the primary-GWAS filters, with the reason (a `_summary` file gives counts per GWAS) |
-| `proxy_candidates_audit.txt` | Every LD partner returned for a flagged sentinel and what became of it (chosen, or the reason it was not) |
+| `proxy_candidates_audit.txt` | Only when the proxy search runs: every LD partner returned for a flagged sentinel and what became of it (chosen, or the reason it was not) |
 | `input_qc_trait_gwas.txt` | Per trait: effect-allele rule used and how many variants matched as reported, by strand complement, or not at all |
-| `quality_control_report.txt` | QC summary across all pipeline steps |
-| `rsID_map.txt` | Final variant set with VAR_ID → rsID mapping |
+| `rsID_map.txt` | Final variant set: VAR_ID, rsID (from LDlink; blank when LD pruning is off), whether it is an original sentinel or a proxy, and the sentinel it stands for |
 | `alignment_GWAS_summStats.csv` | Aligned GWAS summary statistics for final variant set |
 
 ### Stability analysis

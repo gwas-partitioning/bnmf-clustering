@@ -9,16 +9,20 @@
 #   get_sig_snps()               — Collect variants below a P cutoff from each discovery GWAS
 #   get_biggest_gwas()           — Cross-reference them against the primary GWAS and apply
 #                                  the primary-GWAS filters (P and risk-allele agreement)
+#   read_primary_gwas_at_positions() — Read the primary GWAS at given positions in the
+#                                  standard form (shared by sentinels and proxies)
 #   snp_clump()                  — Position-based clumping (no external API required)
 #   ld_pruning_SNP.clip()        — LD pruning via LDlink SNPclip (multi-population)
-#   prune()                      — Single-chromosome LD pruning via LDlinkR or curl
-#   ld_pruning()                 — Full-genome LD pruning via LDlinkR (legacy)
-#   ld_pruning_topLD_api()       — LD pruning via TopLD local binary (legacy)
-#   count_traits_per_variant()   — (deprecated) Count non-missing traits per variant
-#   count_traits_per_variant_2025() — Parallel version of above
-#   window_to_sentinels()        — Filter variant pool to within kb-window of sentinel variants
-#   find_variants_needing_proxies() — Flag strand-ambiguous, multiallelic, or high-missingness variants
-#   choose_proxies()             — Search for LD proxies via LDlinkR::LDproxy_batch
+#   find_variants_needing_proxies() — Flag strand-ambiguous or high-missingness sentinels
+#   find_proxy_candidates()      — Proxy stage 1: LD partners of flagged sentinels from LDlink
+#   qualify_proxy_candidates()   — Proxy stage 2: judge each partner against the primary GWAS
+#   select_proxies()             — Proxy stage 3: choose one proxy per sentinel (no rescue)
+#
+# Legacy, kept for older run scripts and not used by main_script_example.R:
+#   prune(), ld_pruning(), ld_pruning_topLD_api()   — earlier LD pruning routines
+#   count_traits_per_variant(), count_traits_per_variant_2025() — trait counts per variant
+#   window_to_sentinels()        — Restrict a pre-fetched proxy pool to windows around sentinels
+#   choose_proxies()             — Single-call proxy search over a pre-fetched pool
 #
 # Assumptions:
 #   - Genome build: hg19/GRCh37

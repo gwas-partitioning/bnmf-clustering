@@ -14,7 +14,7 @@ fetched_qc <- quietly(fetch_summary_stats(
 
 full_qc <- list(
   run_name = "unit_test_run",
-  settings = list(PVCUTOFF = 5e-8, PVCUTOFF_PROXY = 1e-6, MAIN_PVCUTOFF = 0.05),
+  settings = list(PVCUTOFF = 5e-8, MAIN_PVCUTOFF = 0.05, PROXY_MIN_R2 = 0.8),
   input_qc = attr(vars_sig_qc, "input_qc"),
   concordance = attr(vars_main_qc, "concordance"),
   dropped = attr(vars_main_qc, "dropped"),

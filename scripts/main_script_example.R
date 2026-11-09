@@ -116,13 +116,14 @@ manifest_file <- file.path(example_dir, "clustering_data_source_example.xlsx")
 gwas <- read_excel(manifest_file, sheet = "main_gwas") %>%
   mutate(
     ID = paste(study, trait, population, sep = "_"),
-    # Resolve the example paths from the repository rather than trusting the
-    # working directory encoded in the workbook.
-    full_path = file.path(example_dir, "my_GWAS", basename(file))
+    # full_path is the only location column the pipeline reads. For this
+    # example the folder is re-resolved from the repository, so the run does
+    # not depend on the working directory encoded in the workbook.
+    full_path = file.path(example_dir, "my_GWAS", basename(full_path))
   )
 
 gwas_traits <- read_excel(manifest_file, sheet = "trait_gwas") %>%
-  mutate(full_path = file.path(example_dir, "my_GWAS", basename(file)))
+  mutate(full_path = file.path(example_dir, "my_GWAS", basename(full_path)))
 
 input_files <- c(gwas$full_path, gwas_traits$full_path)
 missing_files <- input_files[!file.exists(input_files)]

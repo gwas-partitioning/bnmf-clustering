@@ -3,7 +3,7 @@ data/*
 opt/*
 cache/*
 
-*.DS_store
+.DS_Store
 pipeline_walkthrough/*
 
 # Large reference/binary files
@@ -11,3 +11,10 @@ pipeline_walkthrough/*
 *.vcf.gz.tbi
 *.RData
 *.rds
+
+# R session files
+.Rhistory
+.Rapp.history
+
+# Output of scripts/main_script_example.R
+toy_bnmf_example_results/
