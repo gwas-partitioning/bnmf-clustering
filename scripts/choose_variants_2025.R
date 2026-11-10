@@ -1004,7 +1004,7 @@ ld_pruning_SNP.clip <- function(df_snps,
           genome_build = "grch37",
           table_type = "variant"
         ) %>%
-          rename(Alleles = Allele_Frequency) %>%
+          dplyr::rename(Alleles = Allele_Frequency) %>%
           mutate(Details = "Variant kept.")
       }, error = function(e) {
         message("LDhap error: ", e$message)
@@ -1157,7 +1157,7 @@ count_traits_per_variant <- function(gwas_variants, ss_files) {
                   col.names=headers,
                   data.table=F,
                   stringsAsFactors=F) %>%
-        rename(any_of(rename_cols))
+        dplyr::rename(any_of(rename_cols))
       
       
     } else {
@@ -1166,7 +1166,7 @@ count_traits_per_variant <- function(gwas_variants, ss_files) {
                   col.names=headers,
                   data.table=F,
                   stringsAsFactors=F) %>%
-        rename(any_of(rename_cols))
+        dplyr::rename(any_of(rename_cols))
       
     }
     if (nrow(df)==0) {
@@ -1854,7 +1854,7 @@ choose_proxies <- function(need_proxies,
       if (!is.null(variant_metadata)) {
         metadata <- as.data.frame(variant_metadata)
         if (!"ChrPos" %in% names(metadata) && "SNP" %in% names(metadata)) {
-          metadata <- metadata %>% rename(ChrPos = SNP)
+          metadata <- metadata %>% dplyr::rename(ChrPos = SNP)
         }
         required_metadata <- c("ChrPos", "VAR_ID", "REF", "ALT")
         if (!all(required_metadata %in% names(metadata))) {
@@ -1908,7 +1908,7 @@ choose_proxies <- function(need_proxies,
       # Select best proxy
       final_proxy_df <- final_proxy_df %>% 
         group_by(rsID) %>%
-        arrange(desc(frac_nonmissing), desc(r2), CHR) %>% 
+        arrange(dplyr::desc(frac_nonmissing), dplyr::desc(r2), CHR) %>% 
         dplyr::slice(1) %>%
         ungroup() %>%
         inner_join(need_proxies, by = "rsID") 
@@ -1964,7 +1964,7 @@ suzuki_pruning <- function(assoc_data_filtered, my_LDlinkR_token, populations = 
     
     chr_NAs <- results %>% group_by(CHR) %>%
       summarize(n = sum(!is.na(clump))) %>%
-      arrange(desc(n)) %>%
+      arrange(dplyr::desc(n)) %>%
       dplyr::rename(non_NA = n)
     chr_counts <- results %>% dplyr::count(CHR) %>% dplyr::rename(snps=n)
     chr_checks <- chr_NAs %>% inner_join(chr_counts, by='CHR')

@@ -264,7 +264,7 @@ if (RUN_LDLINK_PRUNING) {
       stop("No successful SNPclip outputs found for population ", ld_pop, ".")
     }
     bind_rows(lapply(files, fread)) %>%
-      rename(RS_Number = any_of("RS Number")) %>%
+      dplyr::rename(RS_Number = any_of("RS Number")) %>%
       mutate(LD_population = ld_pop)
   })
 
