@@ -13,6 +13,14 @@ The bNMF procedure, as applied here, detects clusters of GWAS variants for some 
 
 **Genome build:** hg19/GRCh37 for primary analysis; hg38 conversion is handled in the post-hoc step via liftover.
 
+### Pipeline overview
+
+Variants are selected first, then characterized with the additional traits and clustered.
+
+![Variant selection: discovery and primary GWAS to sentinel variants](doc/pipeline_variant_selection.svg)
+
+![Traits, proxy search and bNMF clustering](doc/pipeline_traits_proxy_clustering.svg)
+
 ### Quick start
 
 1. Run `Rscript scripts/main_script_example.R` from the repository checkout. It
