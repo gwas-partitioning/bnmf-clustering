@@ -9,149 +9,204 @@
 # catch an allele mistake made while preprocessing them (for example, the
 # wrong effect-allele column), which flips or scrambles a whole trait.
 #
+# The Catalog data come from its bulk "All associations with added ontology
+# annotations" file (about 70 MB zipped, updated weekly):
+#   https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip
+# Pass the .zip (needs the unzip command) or the unzipped .tsv. The REST API
+# is too slow for whole-trait queries (about 45 s per 500 records).
+#
 # Usage:
-#   1. Draft the audit manifest (one EFO term suggested per matrix trait):
-#        Rscript scripts/audit_zscore_alignment.R --draft \
+#   1. Draft the audit manifest (EFO terms suggested from each trait name):
+#        Rscript scripts/audit_zscore_alignment.R --draft --catalog CATALOG.zip \
 #          results/zmat_preImputed.rds audit_traits.tsv
 #   2. Review audit_traits.tsv: correct efo_id (see the suggestions column;
 #      separate several IDs with ";"), blank it to skip a trait, and
 #      optionally add the GCST accession of the study the clustering used
 #      and a reported_trait regular expression.
 #   3. Run the audit:
-#        Rscript scripts/audit_zscore_alignment.R \
+#        Rscript scripts/audit_zscore_alignment.R --catalog CATALOG.zip \
 #          results/zmat_preImputed.rds results/alignment_GWAS_summStats.csv \
 #          audit_traits.tsv results/zscore_audit [--min-abs-z 2]
 #      Writes results/zscore_audit.csv (one row per SNP-trait comparison),
-#      results/zscore_audit_traits.csv (one row per trait),
-#      results/zscore_audit.html, and results/zscore_audit_catalog_cache/.
+#      results/zscore_audit_traits.csv (one row per trait), and
+#      results/zscore_audit.html.
 #
 # Verdicts: PASS (>= 80% of informative SNPs agree in sign), FLIPPED (<= 20%),
-# REVIEW (in between), INSUFFICIENT (< 5 informative SNPs), LOOKUP_ERROR,
-# NOT_CHECKED (no EFO ID).
+# REVIEW (in between), INSUFFICIENT (< 5 informative SNPs), NOT_CHECKED (no
+# EFO ID).
 #
 # From R, source scripts/qc_report.R before this file.
 #
-# Dependencies: httr2.
+# Dependencies: data.table.
 # =============================================================================
 
-CATALOG_API <- "https://www.ebi.ac.uk/gwas/rest/api/v2"
 AUDIT_GWS_P <- 5e-8
 AUDIT_BASES <- c("A", "C", "G", "T")
+AUDIT_TERM_PATTERN <- "^[A-Za-z]+_[A-Za-z0-9]+$"   # EFO_0004340, OBA_VT0005416, MONDO_0005148
+CATALOG_COLUMNS <- c(
+  risk = "STRONGEST SNP-RISK ALLELE", snps = "SNPS", current = "SNP_ID_CURRENT",
+  p = "P-VALUE", value = "OR or BETA", ci = "95% CI (TEXT)", mapped = "MAPPED_TRAIT",
+  uri = "MAPPED_TRAIT_URI", accession = "STUDY ACCESSION", reported = "DISEASE/TRAIT"
+)
 
 audit_complement <- function(x) chartr("ACGT", "TGCA", x)
 
-catalog_direction <- function(beta_text, or_value) {
-  # +1 / -1 for the effect allele, NA when the record gives no direction.
-  # An odds ratio, when present, takes precedence over the beta text.
-  beta_text <- tolower(ifelse(is.na(beta_text), "", beta_text))
-  direction <- ifelse(grepl("increase", beta_text, fixed = TRUE), 1,
-                      ifelse(grepl("decrease", beta_text, fixed = TRUE), -1, NA_real_))
-  use_or <- is.finite(or_value) & or_value > 0 & or_value != 1
-  direction[use_or] <- sign(log(or_value[use_or]))
-  direction
+catalog_direction <- function(ci_text, value) {
+  # The Catalog stores effect sizes unsigned. A beta's direction is written in
+  # the CI text ("[0.01-0.02] unit increase"); without it, a value above 1 is
+  # an odds ratio for the risk allele. Anything else (including a bare value
+  # below 1, which could be an unsigned beta) gives no direction.
+  ci_text <- tolower(ifelse(is.na(ci_text), "", ci_text))
+  value <- suppressWarnings(as.numeric(value))
+  ifelse(grepl("increase", ci_text, fixed = TRUE), 1,
+  ifelse(grepl("decrease", ci_text, fixed = TRUE), -1,
+  ifelse(is.finite(value) & value > 1, 1, NA_real_)))
 }
 
-catalog_scalar <- function(x, type) {
-  if (is.null(x) || !length(x)) {
-    return(if (type == "character") NA_character_ else NA_real_)
+parse_catalog_rows <- function(raw) {
+  # Normalise rows of the bulk associations file (all columns character).
+  missing_cols <- setdiff(CATALOG_COLUMNS, names(raw))
+  if (length(missing_cols)) {
+    stop("The GWAS Catalog file lacks column(s): ", paste(missing_cols, collapse = ", "),
+         ". Use the 'All associations' file with added ontology annotations.")
   }
-  x <- x[[1]]
-  if (type == "numeric") return(suppressWarnings(as.numeric(x)))
-  if (is.numeric(x)) format(x, scientific = FALSE, trim = TRUE) else as.character(x)
-}
-
-parse_catalog_associations <- function(associations) {
-  # Flatten v2 association records (parsed JSON) into one row each.
-  chr <- function(f) vapply(associations, function(a) catalog_scalar(f(a), "character"),
-                            character(1))
-  num <- function(f) vapply(associations, function(a) catalog_scalar(f(a), "numeric"),
-                            numeric(1))
-  first_allele <- function(a) if (length(a$snp_allele)) a$snp_allele[[1]] else list()
+  col <- function(key) {
+    x <- as.character(raw[[CATALOG_COLUMNS[[key]]]])
+    x[is.na(x)] <- ""
+    trimws(x)
+  }
+  snps <- col("snps")
+  risk <- gsub("\\s+", "", col("risk"))
+  single <- grepl("^rs[0-9]+$", snps)
+  # "rs123-A": the effect allele follows the last "-" and must name this SNP.
+  effect_allele <- toupper(sub("^.*-", "", risk))
+  effect_allele[!grepl("-", risk, fixed = TRUE) | sub("-[^-]*$", "", risk) != snps |
+                  !nzchar(effect_allele)] <- NA_character_
+  current <- col("current")
+  # "http://www.ebi.ac.uk/efo/EFO_1, http://purl.obolibrary.org/obo/MONDO_2"
+  # becomes "EFO_1,MONDO_2".
+  term_ids <- gsub("\\s", "", gsub("[^,]*/", "", col("uri")))
   data.frame(
-    association_id = chr(function(a) a$association_id),
-    accession = chr(function(a) a$accession_id),
-    rsID = chr(function(a) first_allele(a)$rs_id),
-    effect_allele = toupper(chr(function(a) first_allele(a)$effect_allele)),
-    p_value = num(function(a) a$p_value),
-    beta_text = chr(function(a) a$beta),
-    or_value = num(function(a) a$or_per_copy_num),
-    reported_trait = vapply(associations, function(a) {
-      paste(unlist(a$reported_trait), collapse = "; ")
-    }, character(1)),
-    single_snp = vapply(associations, function(a) {
-      length(a$snp_allele) == 1L && !isTRUE(a$multi_snp_haplotype) &&
-        !isTRUE(a$snp_interaction)
-    }, logical(1)),
+    catalog_row = as.character(seq_along(snps)),
+    accession = col("accession"),
+    rsID = ifelse(single, snps, NA_character_),
+    rsID_current = ifelse(single & grepl("^[0-9]+$", current), paste0("rs", current),
+                          NA_character_),
+    effect_allele = effect_allele,
+    p_value = suppressWarnings(as.numeric(col("p"))),
+    ci_text = col("ci"),
+    effect_value = suppressWarnings(as.numeric(col("value"))),
+    reported_trait = col("reported"),
+    mapped_trait = col("mapped"),
+    term_ids = term_ids,
+    single_snp = single,
     stringsAsFactors = FALSE
   )
 }
 
-catalog_get_page <- function(url) {
-  if (!requireNamespace("httr2", quietly = TRUE)) {
-    stop("Install the httr2 package to query the GWAS Catalog.")
+read_catalog_bulk <- function(path) {
+  if (!file.exists(path)) stop("GWAS Catalog file not found: ", path)
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Install the data.table package to read the GWAS Catalog file.")
   }
-  httr2::request(url) |>
-    httr2::req_user_agent("bnmf_clustering z-score audit") |>
-    httr2::req_timeout(60) |>
-    httr2::req_retry(max_tries = 4) |>
-    httr2::req_perform() |>
-    httr2::resp_body_json()
-}
-
-catalog_associations_url <- function(efo_id, page, page_size = 500L) {
-  sprintf("%s/associations?efo_id=%s&size=%d&page=%d",
-          CATALOG_API, efo_id, as.integer(page_size), as.integer(page))
-}
-
-catalog_fetch_efo <- function(efo_id, cache_dir = NULL, get_page = catalog_get_page,
-                              page_size = 500L) {
-  # Every Catalog association annotated with one EFO term, cached as RDS.
-  if (!grepl("^[A-Za-z]+_[0-9]+$", efo_id)) stop("Invalid EFO ID: ", efo_id)
-  cache_file <- if (!is.null(cache_dir)) file.path(cache_dir, paste0(efo_id, ".rds"))
-  if (!is.null(cache_file) && file.exists(cache_file)) return(readRDS(cache_file))
-
-  pages <- list()
-  page <- 0L
-  repeat {
-    response <- get_page(catalog_associations_url(efo_id, page, page_size))
-    total <- response$page$totalPages
-    if (is.null(total)) stop("Unexpected GWAS Catalog response for ", efo_id)
-    pages[[length(pages) + 1L]] <-
-      parse_catalog_associations(response[["_embedded"]]$associations)
-    page <- page + 1L
-    if (total > 1L) message(sprintf("  %s: page %d of %d", efo_id, page, total))
-    if (page >= total) break
+  args <- list(sep = "\t", quote = "", colClasses = "character", na.strings = "",
+               select = unname(CATALOG_COLUMNS), showProgress = FALSE)
+  source_arg <- if (grepl("\\.zip$", path, ignore.case = TRUE)) {
+    if (!nzchar(Sys.which("unzip"))) stop("Reading a .zip needs the unzip command; unzip it and pass the .tsv.")
+    list(cmd = paste("unzip -p", shQuote(path)))
+  } else {
+    list(file = path)
   }
-  out <- do.call(rbind, pages)
-  out <- out[!duplicated(out$association_id), , drop = FALSE]
-  rownames(out) <- NULL
-  if (!is.null(cache_file)) {
-    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-    saveRDS(out, cache_file)
-  }
+  raw <- suppressWarnings(do.call(data.table::fread, c(source_arg, args)))
+  out <- parse_catalog_rows(as.data.frame(raw))
+  message(sprintf("Read %s GWAS Catalog associations from %s",
+                  format(nrow(out), big.mark = ","), basename(path)))
   out
 }
 
-catalog_search_efo <- function(query, get_page = catalog_get_page, n = 3L) {
-  # Up to n EFO terms whose label matches query, best first: exact label,
-  # "<query> measurement", labels starting with the query, other
-  # "measurement" terms, then the rest; shorter labels first within a tier.
-  url <- sprintf("%s/efo-traits?trait=%s&size=50", CATALOG_API,
-                 utils::URLencode(query, reserved = TRUE))
-  hits <- get_page(url)[["_embedded"]]$efo_traits
-  if (!length(hits)) {
-    return(data.frame(efo_id = character(0), efo_trait = character(0)))
+catalog_for_terms <- function(catalog, term_ids) {
+  # Rows annotated with any of term_ids (whole IDs: EFO_1 does not match EFO_10).
+  keys <- paste0(",", catalog$term_ids, ",")
+  hit <- Reduce(`|`, lapply(term_ids, function(id) {
+    grepl(paste0(",", id, ","), keys, fixed = TRUE)
+  }), FALSE)
+  catalog[hit, , drop = FALSE]
+}
+
+catalog_terms <- function(catalog) {
+  # One row per ontology term in the file: efo_id, efo_trait, n (associations).
+  has <- nzchar(catalog$term_ids)
+  tab <- table(paste(catalog$term_ids[has], catalog$mapped_trait[has], sep = "\t"))
+  parts <- strsplit(names(tab), "\t", fixed = TRUE)
+  ids <- strsplit(vapply(parts, `[`, character(1), 1L), ",", fixed = TRUE)
+  labels <- strsplit(vapply(parts, function(p) if (length(p) > 1L) p[2] else "", character(1)),
+                     ", ", fixed = TRUE)
+  # A label containing ", " cannot be paired with its ID; skip those rows.
+  ok <- lengths(ids) == lengths(labels)
+  long <- data.frame(efo_id = unlist(ids[ok]), efo_trait = unlist(labels[ok]),
+                     n = rep(as.integer(tab)[ok], lengths(ids[ok])), stringsAsFactors = FALSE)
+  if (!nrow(long)) return(data.frame(efo_id = character(0), efo_trait = character(0), n = integer(0)))
+  key <- paste(long$efo_id, long$efo_trait, sep = "\t")
+  n <- rowsum(long$n, key, reorder = FALSE)
+  first <- long[match(rownames(n), key), c("efo_id", "efo_trait")]
+  first$n <- as.integer(n[, 1])
+  rownames(first) <- NULL
+  first
+}
+
+# Common trait-name abbreviations, expanded before matching Catalog labels.
+AUDIT_TRAIT_SYNONYMS <- c(
+  "bmi" = "body mass index", "hdl" = "high density lipoprotein cholesterol",
+  "ldl" = "low density lipoprotein cholesterol", "tg" = "triglyceride",
+  "logtg" = "triglyceride", "sbp" = "systolic blood pressure",
+  "dbp" = "diastolic blood pressure", "whr" = "waist hip ratio",
+  "shbg" = "sex hormone binding globulin", "alt" = "alanine aminotransferase",
+  "ast" = "aspartate aminotransferase", "alp" = "alkaline phosphatase",
+  "ggt" = "gamma glutamyl transferase", "gamma glutamyltransferase" = "gamma glutamyl transferase",
+  "crp" = "c reactive protein", "white blood cell" = "leukocyte",
+  "red blood cell" = "erythrocyte", "oestradiol" = "estradiol", "haemoglobin" = "hemoglobin",
+  "adjbmi" = "bmi adjusted"
+)
+
+audit_norm_label <- function(x) trimws(gsub("[^a-z0-9]+", " ", tolower(x)))
+
+suggest_efo_terms <- function(terms, query, n = 3L) {
+  # Up to n terms whose label matches query, best first:
+  #   0 label and query have the same words
+  #   1 label has every word of the query (and more)
+  #   2 query has every word of the label
+  # ignoring a trailing "measurement" and word order, and trying the query
+  # both as given and with abbreviations expanded (BMI, HDL, adjBMI, ...).
+  # More associations first within a tier.
+  empty <- terms[0, c("efo_id", "efo_trait", "n")]
+  q <- audit_norm_label(query)
+  if (!nzchar(q) || !nrow(terms)) return(empty)
+  expanded <- q
+  for (abbr in names(AUDIT_TRAIT_SYNONYMS)) {
+    expanded <- gsub(paste0("(^| )", abbr, "( |$)"),
+                     paste0("\\1", AUDIT_TRAIT_SYNONYMS[[abbr]], "\\2"), expanded)
   }
-  id <- vapply(hits, function(h) catalog_scalar(h$efo_id, "character"), character(1))
-  label <- vapply(hits, function(h) catalog_scalar(h$efo_trait, "character"), character(1))
-  q <- tolower(query)
-  l <- tolower(label)
-  tier <- ifelse(l == q, 0L,
-          ifelse(l == paste(q, "measurement"), 1L,
-          ifelse(startsWith(l, q), 2L,
-          ifelse(grepl("measurement", l, fixed = TRUE), 3L, 4L))))
-  ord <- order(tier, nchar(label))
-  utils::head(data.frame(efo_id = id[ord], efo_trait = label[ord]), n)
+  core <- sub(" measurement$", "", audit_norm_label(terms$efo_trait))
+  core_words <- strsplit(core, " ", fixed = TRUE)
+  tier_for <- function(q) {
+    qw <- unique(strsplit(q, " ", fixed = TRUE)[[1]])
+    # Only terms sharing a word with the query can match.
+    tier <- rep(NA_integer_, length(core))
+    cand <- which(vapply(core_words, function(w) any(w %in% qw), logical(1)))
+    has_query <- vapply(core_words[cand], function(w) all(qw %in% w), logical(1))
+    in_query <- vapply(core_words[cand], function(w) all(w %in% qw), logical(1)) &
+      nchar(core[cand]) >= 4L
+    tier[cand] <- ifelse(has_query & in_query, 0L, ifelse(has_query, 1L,
+                         ifelse(in_query, 2L, NA_integer_)))
+    tier
+  }
+  tier <- pmin(tier_for(q), tier_for(expanded), na.rm = TRUE)
+  keep <- which(!is.na(tier))
+  if (!length(keep)) return(empty)
+  keep <- keep[order(tier[keep], -terms$n[keep], nchar(core[keep]))]
+  out <- utils::head(terms[keep, c("efo_id", "efo_trait", "n")], n)
+  rownames(out) <- NULL
+  out
 }
 
 prepare_alignment <- function(alignment, z) {
@@ -161,13 +216,17 @@ prepare_alignment <- function(alignment, z) {
   if (length(missing_cols)) {
     stop("The alignment file lacks column(s): ", paste(missing_cols, collapse = ", "))
   }
-  idx <- match(rownames(z), alignment$ChrPos)
+  # Runs from earlier pipeline versions name matrix rows "chr1:123" while the
+  # alignment file has "1:123"; match on the position without the prefix.
+  strip_chr <- function(x) sub("^chr", "", as.character(x), ignore.case = TRUE)
+  idx <- match(strip_chr(rownames(z)), strip_chr(alignment$ChrPos))
   if (anyNA(idx)) {
     stop(sum(is.na(idx)), " matrix row(s) have no alignment row (first: ",
          rownames(z)[is.na(idx)][1], ").")
   }
   a <- as.data.frame(alignment, stringsAsFactors = FALSE)[idx, needed]
   a[] <- lapply(a, as.character)
+  a$ChrPos <- rownames(z)
   a[c("REF", "ALT", "Risk_Allele")] <- lapply(a[c("REF", "ALT", "Risk_Allele")], toupper)
   bad_risk <- is.na(a$Risk_Allele) | !(a$Risk_Allele == a$REF | a$Risk_Allele == a$ALT)
   bad_risk[is.na(bad_risk)] <- TRUE
@@ -189,15 +248,22 @@ align_catalog_to_matrix <- function(catalog, alignment, accession = "",
                                     reported_trait = "", p_threshold = AUDIT_GWS_P) {
   # Keep usable genome-wide-significant records, match them to matrix rows by
   # rsID, and express each record's direction for the T2D risk allele.
-  catalog$catalog_direction <- catalog_direction(catalog$beta_text, catalog$or_value)
+  catalog$catalog_direction <- catalog_direction(catalog$ci_text, catalog$effect_value)
   keep <- catalog$single_snp & !is.na(catalog$rsID) & is.finite(catalog$p_value) &
     catalog$p_value <= p_threshold & !is.na(catalog$catalog_direction)
   if (nzchar(reported_trait)) {
     keep <- keep & grepl(reported_trait, catalog$reported_trait, ignore.case = TRUE,
                          perl = TRUE)
   }
+  kept <- catalog[keep, , drop = FALSE]
+  # Also match on the current rsID when dbSNP has merged the reported one.
+  merged <- kept[!is.na(kept$rsID_current) & kept$rsID_current != kept$rsID, , drop = FALSE]
+  merged$rsID <- merged$rsID_current
+  kept <- rbind(kept, merged)
+
   usable <- alignment[!is.na(alignment$rsID) & !alignment$palindromic, , drop = FALSE]
-  d <- merge(usable, catalog[keep, , drop = FALSE], by = "rsID")
+  d <- merge(usable, kept, by = "rsID")
+  d <- d[!duplicated(paste(d$catalog_row, d$ChrPos)), , drop = FALSE]
 
   ea <- d$effect_allele
   base <- !is.na(ea) & ea %in% AUDIT_BASES
@@ -243,8 +309,7 @@ call_snp_trait <- function(aligned, z_values, min_abs_z = 2) {
   calls
 }
 
-AUDIT_VERDICT_ORDER <- c("FLIPPED", "REVIEW", "LOOKUP_ERROR", "INSUFFICIENT",
-                         "PASS", "NOT_CHECKED")
+AUDIT_VERDICT_ORDER <- c("FLIPPED", "REVIEW", "INSUFFICIENT", "PASS", "NOT_CHECKED")
 
 trait_verdict <- function(calls, accession = "", min_n = 5L, pass_at = 0.8,
                           flip_at = 0.2) {
@@ -344,9 +409,10 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
   if (count[["REVIEW"]] > 0) flags <- c(flags, sprintf(
     "%d trait(s) have mixed agreement (%s). Possible causes: a partial allele mix-up, or an EFO term that pools a differently defined phenotype (for example adjusted and unadjusted). Their SNP tables are open below.",
     count[["REVIEW"]], traits_with("REVIEW")))
-  if (count[["LOOKUP_ERROR"]] > 0) flags <- c(flags, sprintf(
-    "The Catalog lookup failed for %d trait(s) (%s); rerun to retry.",
-    count[["LOOKUP_ERROR"]], traits_with("LOOKUP_ERROR")))
+  unknown <- summary$trait[grepl("not in the Catalog file", summary$note, fixed = TRUE)]
+  if (length(unknown)) flags <- c(flags, sprintf(
+    "Some EFO IDs were not found in the Catalog file, for: %s. Check them against the Catalog's trait pages.",
+    qc_name_list(unknown)))
   differs <- summary$trait[summary$verdict %in% c("PASS", "REVIEW", "FLIPPED") &
                              summary$study_differs %in% TRUE]
   if (length(differs)) flags <- c(flags, sprintf(
@@ -365,7 +431,7 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
                     "study_differs", "efo_id", "accession", "reported_trait", "note")
   detail_cols <- c("rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "effect_allele",
                    "strand_complemented", "catalog_direction", "expected_sign", "matrix_z",
-                   "status", "p_value", "accession", "same_study", "association_id",
+                   "status", "p_value", "accession", "same_study", "catalog_row",
                    "reported_trait")
   details <- vapply(seq_len(nrow(summary)), function(i) {
     s <- summary[i, ]
@@ -377,23 +443,27 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
             as.integer(s$n_informative), qc_html_table(rows[detail_cols], max_rows = 500L))
   }, character(1))
 
-  meta <- sprintf("%s variants &times; %s traits &middot; generated %s",
+  meta <- sprintf("%s variants &times; %s traits &middot; Catalog file %s &middot; generated %s",
                   audit_setting(settings, "n_variants", "?"),
                   audit_setting(settings, "n_traits", nrow(summary)),
+                  qc_html_escape(audit_setting(settings, "catalog_label", "not recorded")),
                   format(Sys.time(), "%Y-%m-%d %H:%M"))
   counts_line <- paste(sprintf("%s: %d", names(count), as.integer(count)), collapse = " &middot; ")
   methods <- sprintf(paste(
-    "<p>For each trait, every GWAS Catalog association annotated with the trait's EFO term(s) was taken from any study,",
-    "keeping single-SNP records with P &le; %s and a stated direction (an odds ratio, or a beta described as an increase or decrease).",
-    "Records were matched to matrix variants by rsID. A/T and C/G variants were excluded; an effect allele matching only the",
-    "complement of REF/ALT was read on the opposite strand. Each record's direction was expressed for the T2D risk allele.</p>",
+    "<p>For each trait, every GWAS Catalog association annotated with the trait's ontology term(s) was taken from any study,",
+    "keeping single-SNP records with P &le; %s and a direction: a beta whose CI text says increase or decrease, or an",
+    "unsigned value above 1, read as an odds ratio for the reported allele. Records were matched to matrix variants by rsID",
+    "(or by the current rsID when dbSNP has merged the reported one). A/T and C/G variants were excluded; an effect allele",
+    "matching only the complement of REF/ALT was read on the opposite strand. Each record's direction was expressed for the",
+    "T2D risk allele.</p>",
     "<p>Each variant gets one call: the smallest-P record from the clustering study when its accession is given and present,",
     "otherwise from any study. When those records disagree in direction the call is a Catalog conflict and is not counted.",
     "A call is informative when the matrix |z| &ge; %s. Verdicts need at least 5 informative variants: PASS when at least 80%%",
     "agree in sign, FLIPPED when at most 20%% do, REVIEW in between. The binomial P tests agreement against 50%%.</p>",
-    "<p>Limitations: an EFO term can pool related phenotypes whose directions differ (adjusted versus unadjusted, sex-specific);",
-    "the reported_trait filter narrows a term. Catalog records are curated top hits, so traits with few significant loci among",
-    "these variants may be INSUFFICIENT. Only the sign is checked, not the magnitude.</p>"),
+    "<p>Limitations: an ontology term can pool related phenotypes whose directions differ (adjusted versus unadjusted,",
+    "sex-specific); the reported_trait filter narrows a term. Catalog records are curated top hits, so traits with few",
+    "significant loci among these variants may be INSUFFICIENT. An unsigned beta above 1 with no direction text would be",
+    "misread as an odds ratio. Only the sign is checked, not the magnitude.</p>"),
     format(p_threshold), format(min_abs_z))
 
   css <- paste(
@@ -441,7 +511,7 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
 }
 
 AUDIT_COMPARISON_COLS <- c(
-  "trait", "rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "association_id", "accession",
+  "trait", "rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "catalog_row", "accession",
   "same_study", "reported_trait", "p_value", "effect_allele", "strand_complemented",
   "catalog_direction", "expected_sign", "matrix_z", "n_catalog_records", "informative",
   "concordant", "status"
@@ -479,7 +549,7 @@ read_audit_manifest <- function(path, traits) {
   unknown <- setdiff(m$trait, traits)
   if (length(unknown)) stop("Traits not in the matrix: ", paste(unknown, collapse = ", "))
   ids <- unlist(lapply(m$efo_id, audit_split_ids))
-  bad_ids <- ids[!grepl("^[A-Za-z]+_[0-9]+$", ids)]
+  bad_ids <- ids[!grepl(AUDIT_TERM_PATTERN, ids)]
   if (length(bad_ids)) stop("Invalid EFO ID(s): ", paste(bad_ids, collapse = ", "))
   bad_acc <- m$accession[nzchar(m$accession) & !grepl("^GCST[0-9]+$", m$accession)]
   if (length(bad_acc)) {
@@ -493,24 +563,22 @@ read_audit_manifest <- function(path, traits) {
   m
 }
 
-draft_audit_manifest <- function(traits, out_file, search = catalog_search_efo) {
-  # Suggest EFO terms from each trait name. The result needs human review.
+draft_audit_manifest <- function(traits, out_file, catalog) {
+  # Suggest ontology terms from each trait name. The result needs human review.
   if (file.exists(out_file)) {
     stop(out_file, " already exists; edit it, or choose another file name.")
   }
+  terms <- catalog_terms(catalog)
   rows <- lapply(traits, function(trait) {
-    query <- trimws(gsub("[_.]+", " ", trait))
-    hits <- tryCatch(search(query), error = function(e) {
-      warning(trait, ": EFO search failed: ", conditionMessage(e), call. = FALSE)
-      NULL
-    })
-    found <- !is.null(hits) && nrow(hits) > 0L
-    message(sprintf("%s: %s", trait, if (found) hits$efo_id[1] else "no EFO match"))
+    hits <- suggest_efo_terms(terms, gsub("[_.]+", " ", trait))
+    found <- nrow(hits) > 0L
+    message(sprintf("%s: %s", trait,
+                    if (found) sprintf("%s (%s)", hits$efo_id[1], hits$efo_trait[1]) else "no match"))
     data.frame(
       trait = trait,
       efo_id = if (found) hits$efo_id[1] else "",
       accession = "", reported_trait = "",
-      suggestions = if (found) paste(sprintf("%s (%s)", hits$efo_id, hits$efo_trait),
+      suggestions = if (found) paste(sprintf("%s (%s, n=%d)", hits$efo_id, hits$efo_trait, hits$n),
                                      collapse = "; ") else "",
       stringsAsFactors = FALSE
     )
@@ -521,47 +589,33 @@ draft_audit_manifest <- function(traits, out_file, search = catalog_search_efo) 
   invisible(out)
 }
 
-audit_zscore_alignment <- function(z, alignment, manifest, output_prefix = NULL,
+audit_zscore_alignment <- function(z, alignment, manifest, catalog, output_prefix = NULL,
                                    min_abs_z = 2, p_threshold = AUDIT_GWS_P,
-                                   get_page = catalog_get_page) {
+                                   catalog_label = "") {
   a <- prepare_alignment(alignment, z)
-  cache_dir <- if (!is.null(output_prefix)) paste0(output_prefix, "_catalog_cache")
-
-  # Fetch each EFO term once, whichever traits share it.
-  efo_ids <- unique(unlist(lapply(manifest$efo_id, audit_split_ids)))
-  catalog <- list()
-  errors <- character(0)
-  for (id in efo_ids) {
-    message("Fetching GWAS Catalog associations for ", id)
-    got <- tryCatch(catalog_fetch_efo(id, cache_dir, get_page), error = function(e) e)
-    if (inherits(got, "error")) {
-      errors[[id]] <- conditionMessage(got)
-      warning(id, ": ", conditionMessage(got), call. = FALSE)
-    } else {
-      catalog[[id]] <- got
-    }
-  }
+  known_ids <- unique(unlist(strsplit(unique(catalog$term_ids), ",", fixed = TRUE)))
+  # Only records for the matrix's variants can matter.
+  matrix_rsids <- a$rsID[!is.na(a$rsID)]
+  local <- catalog[catalog$rsID %in% matrix_rsids | catalog$rsID_current %in% matrix_rsids, ,
+                   drop = FALSE]
 
   summaries <- list()
   comparisons <- list()
   for (i in seq_len(nrow(manifest))) {
     row <- manifest[i, ]
     ids <- audit_split_ids(row$efo_id)
-    calls <- NULL
     note <- ""
     if (!length(ids)) {
       v <- trait_verdict(NULL)
       v$verdict <- "NOT_CHECKED"
       note <- "No EFO ID given."
-    } else if (any(ids %in% names(errors))) {
-      v <- trait_verdict(NULL)
-      v$verdict <- "LOOKUP_ERROR"
-      note <- paste(unname(errors[intersect(ids, names(errors))]), collapse = "; ")
     } else {
-      records <- do.call(rbind, unname(catalog[ids]))
-      records <- records[!duplicated(records$association_id), , drop = FALSE]
-      aligned <- align_catalog_to_matrix(records, a, row$accession, row$reported_trait,
-                                         p_threshold)
+      missing_ids <- setdiff(ids, known_ids)
+      if (length(missing_ids)) {
+        note <- sprintf("EFO ID(s) not in the Catalog file: %s.", paste(missing_ids, collapse = ", "))
+      }
+      aligned <- align_catalog_to_matrix(catalog_for_terms(local, ids), a, row$accession,
+                                         row$reported_trait, p_threshold)
       calls <- call_snp_trait(aligned, z[, row$trait], min_abs_z)
       v <- trait_verdict(calls, row$accession)
       if (!is.null(calls)) {
@@ -583,7 +637,63 @@ audit_zscore_alignment <- function(z, alignment, manifest, output_prefix = NULL,
     utils::write.csv(summary, paste0(output_prefix, "_traits.csv"), row.names = FALSE)
     write_audit_report(summary, comparisons, paste0(output_prefix, ".html"),
                        settings = list(min_abs_z = min_abs_z, p_threshold = p_threshold,
-                                       n_variants = nrow(z), n_traits = nrow(manifest)))
+                                       n_variants = nrow(z), n_traits = nrow(manifest),
+                                       catalog_label = catalog_label))
   }
   invisible(list(summary = summary, comparisons = comparisons))
+}
+
+if (sys.nframe() == 0L) {
+  # Rscript writes spaces in the script path as "~+~".
+  script_path <- gsub("~+~", " ", sub("^--file=", "",
+    grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)[1]), fixed = TRUE)
+  source(file.path(dirname(normalizePath(script_path)), "qc_report.R"))
+
+  usage <- paste(
+    "Usage:",
+    "  Rscript audit_zscore_alignment.R --draft --catalog CATALOG.zip zmat_preImputed.rds audit_traits.tsv",
+    "  Rscript audit_zscore_alignment.R --catalog CATALOG.zip zmat_preImputed.rds \\",
+    "    alignment_GWAS_summStats.csv audit_traits.tsv output_prefix [--min-abs-z 2]",
+    "CATALOG.zip: gwas-catalog-associations_ontology-annotated-full.zip from",
+    "  https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/ (or the unzipped .tsv).",
+    "See the header of this script for the manifest columns.", sep = "\n")
+  args <- commandArgs(trailingOnly = TRUE)
+  if (!length(args) || any(args %in% c("-h", "--help"))) {
+    cat(usage, "\n")
+    quit(status = 0)
+  }
+  take_value <- function(flag) {
+    at <- which(args == flag)
+    if (!length(at)) return(NULL)
+    if (at[1] == length(args)) { cat(usage, "\n"); quit(status = 1) }
+    value <- args[at[1] + 1L]
+    args <<- args[-c(at[1], at[1] + 1L)]
+    value
+  }
+  catalog_path <- take_value("--catalog")
+  min_abs_z_arg <- take_value("--min-abs-z")
+  min_abs_z <- if (is.null(min_abs_z_arg)) 2 else suppressWarnings(as.numeric(min_abs_z_arg))
+  draft <- "--draft" %in% args
+  args <- setdiff(args, "--draft")
+  if (is.null(catalog_path) || !is.finite(min_abs_z) || min_abs_z < 0 ||
+      length(args) != if (draft) 2L else 4L) {
+    cat(usage, "\n")
+    quit(status = 1)
+  }
+  catalog_label <- sprintf("%s (modified %s)", basename(catalog_path),
+                           format(file.info(catalog_path)$mtime, "%Y-%m-%d"))
+  if (draft) {
+    z <- audit_read_matrix(args[1])
+    if (file.exists(args[2])) stop(args[2], " already exists; edit it, or choose another file name.")
+    draft_audit_manifest(colnames(z), args[2], read_catalog_bulk(catalog_path))
+    message("Wrote ", args[2], ". Review efo_id for every trait before running the audit.")
+  } else {
+    z <- audit_read_matrix(args[1])
+    alignment <- utils::read.csv(args[2], colClasses = "character", check.names = FALSE)
+    manifest <- read_audit_manifest(args[3], colnames(z))
+    result <- audit_zscore_alignment(z, alignment, manifest, read_catalog_bulk(catalog_path),
+                                     args[4], min_abs_z = min_abs_z,
+                                     catalog_label = catalog_label)
+    print(table(factor(result$summary$verdict, levels = AUDIT_VERDICT_ORDER)))
+  }
 }

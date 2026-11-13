@@ -1,115 +1,103 @@
 # Z-score alignment audit: scripts/audit_zscore_alignment.R
-# No network access: Catalog responses are canned lists shaped like the
-# parsed JSON of REST API v2.
+# No network access: Catalog data are small tables in the layout of the bulk
+# "All associations with added ontology annotations" file.
 
 suppressWarnings(suppressPackageStartupMessages({
   source(file.path(scripts_dir, "qc_report.R"))
   source(file.path(scripts_dir, "audit_zscore_alignment.R"))
 }))
 
-fake_assoc <- function(id, rs, ea, p = 1e-10, beta = "0.1 unit increase",
-                       or = NULL, accession = "GCST000001", reported = "Trait X",
-                       haplotype = FALSE, n_alleles = 1L) {
-  list(association_id = id, accession_id = accession,
-       snp_allele = rep(list(list(rs_id = rs, effect_allele = ea)), n_alleles),
-       p_value = p, beta = beta, or_per_copy_num = or,
-       reported_trait = list(reported), multi_snp_haplotype = haplotype,
-       snp_interaction = FALSE)
+efo_uri <- function(id) paste0("http://www.ebi.ac.uk/efo/", id)
+
+cat_row <- function(rs, ea, p = "1E-10", value = "0.1", ci = "[0.05-0.15] unit increase",
+                    uri = efo_uri("EFO_0000001"), mapped = "trait x",
+                    accession = "GCST000001", reported = "Trait X", snps = rs,
+                    current = "", risk = paste0(rs, "-", ea)) {
+  row <- list(risk, snps, current, p, value, ci, mapped, uri, accession, reported)
+  names(row) <- unname(CATALOG_COLUMNS)
+  as.data.frame(row, check.names = FALSE, stringsAsFactors = FALSE)
 }
 
-test_that("catalog_direction reads beta text and odds ratios", {
+fake_catalog <- function(...) parse_catalog_rows(do.call(rbind, list(...)))
+
+test_that("catalog_direction reads CI text first, then odds ratios above 1", {
   expect_equal(
-    catalog_direction(c("0.1 unit increase", "0.2 unit decrease", "-", NA, "-", "-"),
-                      c(NA, NA, 1.2, NA, 0.8, 1)),
-    c(1, -1, 1, NA, -1, NA)
+    catalog_direction(c("[0.05-0.15] unit increase", "[0.02-0.02] mmol/L decrease",
+                        "[1.05-1.13]", "", "[0.8-0.9]", NA, "[1.8-2.14] unit decrease"),
+                      c("0.1", "0.02", "1.09", "", "0.85", "2", "1.97")),
+    c(1, -1, 1, NA, NA, 1, -1)
   )
-  expect_equal(catalog_direction("0.1 unit decrease", 1.3), 1)
 })
 
-test_that("parse_catalog_associations flattens v2 records", {
-  d <- parse_catalog_associations(list(
-    fake_assoc(1, "rs1", "a", p = 2e-9, reported = "BMI"),
-    fake_assoc(228396747, "rs2", "G", beta = "-", or = 1.1),
-    fake_assoc(3, "rs3", "T", haplotype = TRUE),
-    fake_assoc(4, "rs4", "C", n_alleles = 2L)
+test_that("parse_catalog_rows reads alleles, rsIDs and ontology terms", {
+  d <- parse_catalog_rows(rbind(
+    cat_row("rs1", "a", p = "2E-9"),
+    cat_row("rs2", "T", risk = "rs2 -T"),
+    cat_row("rs3", "", risk = "rs3--"),
+    cat_row("rs4", "?"),
+    cat_row("rs5; rs6", "A", risk = "rs5-A"),
+    cat_row("chr6:31892560", "G"),
+    cat_row("rs7", "C", current = "777"),
+    cat_row("rs8", "G", uri = paste(efo_uri("EFO_0000002"),
+                                    "http://purl.obolibrary.org/obo/OBA_VT0005416", sep = ", ")),
+    cat_row("rs9", "G", risk = "rs10-G")
   ))
-  expect_equal(d$association_id, c("1", "228396747", "3", "4"))
-  expect_equal(d$rsID, c("rs1", "rs2", "rs3", "rs4"))
-  expect_equal(d$effect_allele[1], "A")
+  expect_equal(d$catalog_row, as.character(1:9))
+  expect_equal(d$effect_allele, c("A", "T", NA, "?", NA, "G", "C", "G", NA))
+  expect_equal(d$single_snp, c(TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, TRUE, TRUE, TRUE))
+  expect_true(is.na(d$rsID[5]) && is.na(d$rsID[6]))
+  expect_equal(d$rsID_current[7], "rs777")
+  expect_equal(d$term_ids[c(1, 8)], c("EFO_0000001", "EFO_0000002,OBA_VT0005416"))
   expect_equal(d$p_value[1], 2e-9)
-  expect_equal(d$or_value, c(NA, 1.1, NA, NA))
-  expect_equal(d$reported_trait[1], "BMI")
-  expect_equal(d$single_snp, c(TRUE, TRUE, FALSE, FALSE))
+  expect_error(parse_catalog_rows(data.frame(SNPS = "rs1")), "lacks column")
 })
 
-test_that("parse_catalog_associations handles nulls and empty input", {
-  d <- parse_catalog_associations(list(fake_assoc(5, NULL, NULL, p = NULL, beta = NULL)))
-  expect_true(is.na(d$rsID))
-  expect_true(is.na(d$effect_allele))
-  expect_true(is.na(d$p_value))
-  empty <- parse_catalog_associations(list())
-  expect_equal(nrow(empty), 0L)
-  expect_named(empty, names(d))
+test_that("read_catalog_bulk reads the TSV and the zip", {
+  raw <- rbind(cat_row("rs1", "A"), cat_row("rs2", "G", value = "", ci = ""))
+  raw$extra <- "ignored"
+  dir <- tempfile()
+  dir.create(dir)
+  tsv <- file.path(dir, "assoc.tsv")
+  utils::write.table(raw, tsv, sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+  from_tsv <- quietly(read_catalog_bulk(tsv))
+  expect_equal(from_tsv, parse_catalog_rows(raw[unname(CATALOG_COLUMNS)]),
+               ignore_attr = TRUE)
+  expect_true(is.na(from_tsv$effect_value[2]))
+  skip_if(!nzchar(Sys.which("zip")) || !nzchar(Sys.which("unzip")), "zip/unzip not available")
+  zip <- file.path(dir, "assoc.zip")
+  utils::zip(zip, tsv, flags = "-jq")
+  expect_equal(quietly(read_catalog_bulk(zip)), from_tsv)
+  expect_error(read_catalog_bulk(file.path(dir, "missing.zip")), "not found")
 })
 
-fake_api <- function(pages) {
-  env <- new.env()
-  env$calls <- character(0)
-  env$get <- function(url) {
-    env$calls <- c(env$calls, url)
-    if (!url %in% names(pages)) stop("unexpected URL: ", url)
-    pages[[url]]
-  }
-  env
-}
-
-assoc_page <- function(assocs, total) {
-  list(`_embedded` = list(associations = assocs), page = list(totalPages = total))
-}
-
-test_that("catalog_fetch_efo reads every page and caches the result", {
-  api <- fake_api(setNames(
-    list(assoc_page(list(fake_assoc(1, "rs1", "A"), fake_assoc(2, "rs2", "G")), 2),
-         assoc_page(list(fake_assoc(2, "rs2", "G"), fake_assoc(3, "rs3", "C")), 2)),
-    c(catalog_associations_url("EFO_0000001", 0), catalog_associations_url("EFO_0000001", 1))
-  ))
-  cache <- file.path(tempfile(), "cache")
-  d <- quietly(catalog_fetch_efo("EFO_0000001", cache_dir = cache, get_page = api$get))
-  expect_equal(d$association_id, c("1", "2", "3"))
-  expect_length(api$calls, 2L)
-  again <- catalog_fetch_efo("EFO_0000001", cache_dir = cache, get_page = api$get)
-  expect_identical(again, d)
-  expect_length(api$calls, 2L)
+test_that("catalog_for_terms matches whole IDs only", {
+  d <- fake_catalog(cat_row("rs1", "A", uri = efo_uri("EFO_1")),
+                    cat_row("rs2", "A", uri = efo_uri("EFO_10")),
+                    cat_row("rs3", "A", uri = paste(efo_uri("EFO_2"), efo_uri("EFO_1"), sep = ", ")))
+  expect_equal(catalog_for_terms(d, "EFO_1")$rsID, c("rs1", "rs3"))
+  expect_equal(catalog_for_terms(d, c("EFO_10", "EFO_2"))$rsID, c("rs2", "rs3"))
 })
 
-test_that("catalog_fetch_efo returns no rows for an unknown term", {
-  api <- fake_api(setNames(list(list(page = list(totalPages = 0))),
-                           catalog_associations_url("EFO_0000002", 0)))
-  expect_equal(nrow(catalog_fetch_efo("EFO_0000002", get_page = api$get)), 0L)
-})
-
-test_that("catalog_fetch_efo rejects malformed IDs and responses", {
-  expect_error(catalog_fetch_efo("EFO 1&x=2", get_page = function(url) stop("no call")),
-               "Invalid EFO ID")
-  api <- fake_api(setNames(list(list(oops = TRUE)), catalog_associations_url("EFO_0000003", 0)))
-  expect_error(catalog_fetch_efo("EFO_0000003", get_page = api$get),
-               "Unexpected GWAS Catalog response")
-})
-
-test_that("catalog_search_efo ranks exact and measurement labels first", {
-  hits <- list(`_embedded` = list(efo_traits = list(
-    list(efo_id = "HP_1", efo_trait = "Decreased HDL concentration"),
-    list(efo_id = "EFO_2", efo_trait = "high density lipoprotein cholesterol measurement"),
-    list(efo_id = "EFO_3", efo_trait = "HDL")
-  )))
-  d <- catalog_search_efo("HDL", get_page = function(url) {
-    expect_match(url, "efo-traits?trait=HDL&", fixed = TRUE)
-    hits
-  })
-  expect_equal(d$efo_id, c("EFO_3", "EFO_2", "HP_1"))
-  none <- catalog_search_efo("zzz", get_page = function(url) list(page = list(totalPages = 0)))
-  expect_equal(nrow(none), 0L)
-  expect_named(none, c("efo_id", "efo_trait"))
+test_that("suggest_efo_terms ranks label matches and counts associations", {
+  d <- fake_catalog(
+    cat_row("rs1", "A", uri = efo_uri("EFO_1"), mapped = "body mass index"),
+    cat_row("rs2", "A", uri = efo_uri("EFO_1"), mapped = "body mass index"),
+    cat_row("rs3", "A", uri = efo_uri("EFO_2"), mapped = "BMI-adjusted waist-hip ratio"),
+    cat_row("rs4", "A", uri = paste(efo_uri("EFO_3"), efo_uri("EFO_1"), sep = ", "),
+            mapped = "urate measurement, body mass index"),
+    cat_row("rs5", "A", uri = efo_uri("EFO_4"), mapped = "glucose measurement"),
+    cat_row("rs6", "A", uri = efo_uri("EFO_5"), mapped = "glucose tolerance test")
+  )
+  terms <- catalog_terms(d)
+  expect_equal(terms$n[terms$efo_id == "EFO_1"], 3L)
+  expect_equal(suggest_efo_terms(terms, "Body mass index")$efo_id, "EFO_1")
+  expect_equal(suggest_efo_terms(terms, "Urate")$efo_id, "EFO_3")
+  expect_equal(suggest_efo_terms(terms, "Glucose")$efo_id, c("EFO_4", "EFO_5"))
+  # Abbreviation expanded; the literal "BMI" match ranks after it.
+  expect_equal(suggest_efo_terms(terms, "BMI")$efo_id, c("EFO_1", "EFO_2"))
+  # A label contained in the trait name ("urate" in "Urate_male").
+  expect_equal(suggest_efo_terms(terms, "Urate male")$efo_id, "EFO_3")
+  expect_equal(nrow(suggest_efo_terms(terms, "XINSG30")), 0L)
 })
 
 audit_fixture <- function() {
@@ -123,22 +111,21 @@ audit_fixture <- function() {
     Risk_Allele = c("G", "C", "A", "T", "A", "A", "T", "G"),
     stringsAsFactors = FALSE
   )
-  records <- list(
-    fake_assoc(1, "rs1", "G"),                                # risk allele, increase
-    fake_assoc(2, "rs2", "T", beta = "0.2 unit decrease"),    # non-risk, decrease
-    fake_assoc(3, "rs3", "T"),                                # complement of risk A
-    fake_assoc(4, "rs4", "T", beta = "-", or = 1.2),          # risk, OR > 1
-    fake_assoc(5, "rs5", "G", beta = "-", or = 0.9),          # non-risk, OR < 1
-    fake_assoc(6, "rs6", "A"),
-    fake_assoc(7, "rs7", "T"),                                # palindromic: dropped
-    fake_assoc(8, "rs8", "G")
+  raw <- rbind(
+    cat_row("rs1", "G"),                                       # risk allele, increase
+    cat_row("rs2", "T", ci = "[0.1-0.3] unit decrease"),       # non-risk, decrease
+    cat_row("rs3", "T"),                                       # complement of risk A
+    cat_row("rs4", "T", value = "1.2", ci = "[1.1-1.3]"),      # risk, odds ratio
+    cat_row("rs5", "A", value = "1.3", ci = ""),               # risk, odds ratio, no CI
+    cat_row("rs6", "A"),
+    cat_row("rs7", "T"),                                       # palindromic: dropped
+    cat_row("rs8", "G")
   )
   z <- cbind(good = rep(5, 8), flipped = rep(-5, 8),
              scrambled = c(5, -5, 5, -5, 5, -5, 5, -5),
-             lookup = rep(5, 8), blank = rep(5, 8))
+             unknown = rep(5, 8), blank = rep(5, 8))
   rownames(z) <- alignment$ChrPos
-  list(alignment = alignment, records = records,
-       catalog = parse_catalog_associations(records), z = z)
+  list(alignment = alignment, catalog = parse_catalog_rows(raw), z = z)
 }
 
 test_that("prepare_alignment orders rows like the matrix and flags palindromes", {
@@ -146,6 +133,9 @@ test_that("prepare_alignment orders rows like the matrix and flags palindromes",
   a <- prepare_alignment(fx$alignment[8:1, ], fx$z)
   expect_equal(a$ChrPos, rownames(fx$z))
   expect_equal(a$palindromic, c(rep(FALSE, 6), TRUE, FALSE))
+  z_chr <- fx$z
+  rownames(z_chr) <- paste0("chr", rownames(z_chr))
+  expect_equal(prepare_alignment(fx$alignment, z_chr)$ChrPos, rownames(z_chr))
 })
 
 test_that("prepare_alignment rejects missing rows, bad risk alleles and absent rsIDs", {
@@ -170,35 +160,43 @@ test_that("align_catalog_to_matrix orients every record to the T2D risk allele",
 test_that("align_catalog_to_matrix applies the P, allele and reported-trait filters", {
   fx <- audit_fixture()
   a <- prepare_alignment(fx$alignment, fx$z)
-  catalog <- parse_catalog_associations(list(
-    fake_assoc(1, "rs1", "G", p = 1e-6),                    # not genome-wide
-    fake_assoc(2, "rs2", "?"),                               # unknown allele
-    fake_assoc(3, "rs3", "AT"),                              # not a single base
-    fake_assoc(4, "rs4", "T", beta = "-"),                   # no direction
-    fake_assoc(5, "rs5", "G", reported = "BMI-adjusted thing"),
-    fake_assoc(6, "rs6", "A", reported = "Unadjusted thing"),
-    fake_assoc(7, "rs99", "A")                               # not in the matrix
-  ))
+  catalog <- fake_catalog(
+    cat_row("rs1", "G", p = "1E-6"),                         # not genome-wide
+    cat_row("rs2", "?"),                                      # unknown allele
+    cat_row("rs3", "AT"),                                     # not a single base
+    cat_row("rs4", "T", value = "", ci = ""),                 # no direction
+    cat_row("rs5", "G", reported = "BMI-adjusted thing"),
+    cat_row("rs6", "A", reported = "Unadjusted thing"),
+    cat_row("rs99", "A")                                      # not in the matrix
+  )
   d <- align_catalog_to_matrix(catalog, a, reported_trait = "unadjusted")
   expect_equal(d$rsID, "rs6")
   expect_equal(nrow(align_catalog_to_matrix(catalog[0, ], a)), 0L)
 })
 
+test_that("align_catalog_to_matrix matches a merged rsID by its current ID", {
+  fx <- audit_fixture()
+  a <- prepare_alignment(fx$alignment, fx$z)
+  d <- align_catalog_to_matrix(fake_catalog(cat_row("rs555", "A", current = "6")), a)
+  expect_equal(d$rsID, "rs6")
+  expect_equal(d$expected_sign, 1)
+})
+
 test_that("call_snp_trait prefers the clustering study and flags conflicts", {
   fx <- audit_fixture()
   a <- prepare_alignment(fx$alignment, fx$z)
-  catalog <- parse_catalog_associations(list(
-    fake_assoc(1, "rs1", "G", p = 1e-30, accession = "GCST000008"),
-    fake_assoc(2, "rs1", "G", p = 1e-9, accession = "GCST000009"),
-    fake_assoc(3, "rs2", "C", p = 1e-12),                    # risk allele: +1
-    fake_assoc(4, "rs2", "T", p = 1e-10),                    # non-risk: -1
-    fake_assoc(5, "rs3", "A", p = 1e-10)
-  ))
+  catalog <- fake_catalog(
+    cat_row("rs1", "G", p = "1E-30", accession = "GCST000008"),
+    cat_row("rs1", "G", p = "1E-9", accession = "GCST000009"),
+    cat_row("rs2", "C", p = "1E-12"),                         # risk allele: +1
+    cat_row("rs2", "T", p = "1E-10"),                         # non-risk: -1
+    cat_row("rs3", "A", p = "1E-10")
+  )
   d <- align_catalog_to_matrix(catalog, a, accession = "GCST000009")
   z <- setNames(c(5, 5, 1, rep(5, 5)), rownames(fx$z))
   calls <- call_snp_trait(d, z, min_abs_z = 2)
   expect_equal(calls$rsID, c("rs1", "rs2", "rs3"))
-  expect_equal(calls$association_id, c("2", "3", "5"))
+  expect_equal(calls$catalog_row, c("2", "3", "5"))
   expect_equal(calls$same_study, c(TRUE, FALSE, FALSE))
   expect_equal(calls$n_catalog_records, c(2L, 2L, 1L))
   expect_equal(calls$status, c("concordant", "catalog_conflict", "weak_matrix_z"))
@@ -267,11 +265,12 @@ test_that("write_audit_report writes a self-contained page with every trait", {
   summary <- rbind(summary, blank)
   f <- file.path(tempfile(), "report.html")
   flags <- quietly(write_audit_report(summary, do.call(rbind, calls), f,
-                                      settings = list(min_abs_z = 2)))
+                                      settings = list(min_abs_z = 2, catalog_label = "test.zip")))
   html <- paste(readLines(f), collapse = "\n")
   for (t in c(traits, "blank")) expect_match(html, paste0(">", t, "<"), fixed = TRUE)
   expect_match(html, "<svg", fixed = TRUE)
   expect_match(html, "<details open>", fixed = TRUE)
+  expect_match(html, "test.zip", fixed = TRUE)
   expect_false(grepl("<script", html, fixed = TRUE))
   expect_true(any(grepl("flipped", flags, fixed = TRUE)))
 })
@@ -284,9 +283,9 @@ write_lines_tsv <- function(lines) {
 
 test_that("read_audit_manifest fills optional columns and validates entries", {
   traits <- c("good", "flipped")
-  m <- read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tEFO_0000001", "flipped\t")),
+  m <- read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tOBA_VT0005416", "flipped\t")),
                            traits)
-  expect_equal(m$efo_id, c("EFO_0000001", ""))
+  expect_equal(m$efo_id, c("OBA_VT0005416", ""))
   expect_equal(m$accession, c("", ""))
   expect_equal(m$reported_trait, c("", ""))
   expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "nope\tEFO_1")), traits),
@@ -306,47 +305,37 @@ test_that("read_audit_manifest fills optional columns and validates entries", {
 
 test_that("draft_audit_manifest writes suggestions and never overwrites", {
   out <- tempfile(fileext = ".tsv")
-  search <- function(q) {
-    if (q == "Waist circumference male") {
-      data.frame(efo_id = c("EFO_1", "EFO_2"), efo_trait = c("waist circumference", "waist"))
-    } else {
-      data.frame(efo_id = character(0), efo_trait = character(0))
-    }
-  }
-  quietly(draft_audit_manifest(c("Waist circumference_male", "XINSG30"), out, search = search))
+  catalog <- fake_catalog(
+    cat_row("rs1", "A", uri = efo_uri("EFO_1"), mapped = "waist circumference male"),
+    cat_row("rs2", "A", uri = efo_uri("EFO_2"), mapped = "waist circumference male adjusted")
+  )
+  quietly(draft_audit_manifest(c("Waist circumference_male", "XINSG30"), out, catalog))
   m <- utils::read.delim(out, colClasses = "character", na.strings = character(0))
   expect_equal(names(m), c("trait", "efo_id", "accession", "reported_trait", "suggestions"))
   expect_equal(m$efo_id, c("EFO_1", ""))
-  expect_equal(m$suggestions[1], "EFO_1 (waist circumference); EFO_2 (waist)")
-  expect_error(draft_audit_manifest("x", out, search = search), "already exists")
+  expect_equal(m$suggestions[1],
+               "EFO_1 (waist circumference male, n=1); EFO_2 (waist circumference male adjusted, n=1)")
+  expect_error(draft_audit_manifest("x", out, catalog), "already exists")
   expect_equal(nrow(read_audit_manifest(out, c("Waist circumference_male", "XINSG30"))), 2L)
 })
 
 test_that("audit_zscore_alignment labels every trait and writes its outputs", {
   fx <- audit_fixture()
-  api <- fake_api(setNames(list(assoc_page(fx$records, 1)),
-                           catalog_associations_url("EFO_0000001", 0)))
-  get_page <- function(url) {
-    if (grepl("EFO_0000666", url, fixed = TRUE)) stop("HTTP 500")
-    api$get(url)
-  }
   manifest <- data.frame(
-    trait = c("good", "flipped", "scrambled", "lookup", "blank"),
-    efo_id = c("EFO_0000001", "EFO_0000001", "EFO_0000001", "EFO_0000001; EFO_0000666", ""),
+    trait = c("good", "flipped", "scrambled", "unknown", "blank"),
+    efo_id = c("EFO_0000001", "EFO_0000001", "EFO_0000001", "EFO_0000666", ""),
     accession = "", reported_trait = "", stringsAsFactors = FALSE
   )
   prefix <- file.path(tempfile(), "audit")
-  res <- quietly(audit_zscore_alignment(fx$z, fx$alignment, manifest, prefix,
-                                        get_page = get_page))
+  res <- quietly(audit_zscore_alignment(fx$z, fx$alignment, manifest, fx$catalog, prefix,
+                                        catalog_label = "test.zip"))
   s <- res$summary
   expect_equal(s$verdict[match(manifest$trait, s$trait)],
-               c("PASS", "FLIPPED", "REVIEW", "LOOKUP_ERROR", "NOT_CHECKED"))
-  expect_match(s$note[s$trait == "lookup"], "HTTP 500")
-  expect_length(api$calls, 1L)
+               c("PASS", "FLIPPED", "REVIEW", "INSUFFICIENT", "NOT_CHECKED"))
+  expect_match(s$note[s$trait == "unknown"], "not in the Catalog file")
   for (suffix in c(".csv", "_traits.csv", ".html")) {
     expect_true(file.exists(paste0(prefix, suffix)))
   }
-  expect_true(file.exists(file.path(paste0(prefix, "_catalog_cache"), "EFO_0000001.rds")))
   comp <- utils::read.csv(paste0(prefix, ".csv"))
   expect_equal(sort(unique(comp$trait)), c("flipped", "good", "scrambled"))
   expect_equal(nrow(comp), 21L)
