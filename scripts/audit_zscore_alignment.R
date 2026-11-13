@@ -439,3 +439,151 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
   message(sprintf("Audit report written to %s (%d item(s) to check).", file, length(flags)))
   invisible(flags)
 }
+
+AUDIT_COMPARISON_COLS <- c(
+  "trait", "rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "association_id", "accession",
+  "same_study", "reported_trait", "p_value", "effect_allele", "strand_complemented",
+  "catalog_direction", "expected_sign", "matrix_z", "n_catalog_records", "informative",
+  "concordant", "status"
+)
+
+audit_read_matrix <- function(path) {
+  z <- readRDS(path)
+  if (is.data.frame(z)) z <- as.matrix(z)
+  if (!is.matrix(z) || !is.numeric(z) || is.null(rownames(z)) || is.null(colnames(z)) ||
+      anyDuplicated(rownames(z)) || anyDuplicated(colnames(z))) {
+    stop(path, " is not a numeric matrix with unique row and column names.")
+  }
+  z
+}
+
+audit_split_ids <- function(x) {
+  ids <- trimws(strsplit(x, ";", fixed = TRUE)[[1]])
+  ids[nzchar(ids)]
+}
+
+read_audit_manifest <- function(path, traits) {
+  m <- utils::read.delim(path, colClasses = "character", na.strings = character(0),
+                         quote = "", check.names = FALSE)
+  missing_cols <- setdiff(c("trait", "efo_id"), names(m))
+  if (length(missing_cols)) {
+    stop(path, " lacks column(s): ", paste(missing_cols, collapse = ", "))
+  }
+  for (col in c("accession", "reported_trait")) if (!col %in% names(m)) m[[col]] <- ""
+  m <- m[c("trait", "efo_id", "accession", "reported_trait")]
+  m[] <- lapply(m, function(x) trimws(ifelse(is.na(x), "", x)))
+
+  if (anyDuplicated(m$trait)) {
+    stop("Duplicate traits in ", path, ": ", qc_name_list(unique(m$trait[duplicated(m$trait)])))
+  }
+  unknown <- setdiff(m$trait, traits)
+  if (length(unknown)) stop("Traits not in the matrix: ", paste(unknown, collapse = ", "))
+  ids <- unlist(lapply(m$efo_id, audit_split_ids))
+  bad_ids <- ids[!grepl("^[A-Za-z]+_[0-9]+$", ids)]
+  if (length(bad_ids)) stop("Invalid EFO ID(s): ", paste(bad_ids, collapse = ", "))
+  bad_acc <- m$accession[nzchar(m$accession) & !grepl("^GCST[0-9]+$", m$accession)]
+  if (length(bad_acc)) {
+    stop("Invalid accession(s) (expected GCST followed by digits): ", paste(bad_acc, collapse = ", "))
+  }
+  for (re in m$reported_trait[nzchar(m$reported_trait)]) {
+    ok <- tryCatch({ suppressWarnings(grepl(re, "", perl = TRUE)); TRUE },
+                   error = function(e) FALSE)
+    if (!ok) stop("Invalid reported_trait regular expression: ", re)
+  }
+  m
+}
+
+draft_audit_manifest <- function(traits, out_file, search = catalog_search_efo) {
+  # Suggest EFO terms from each trait name. The result needs human review.
+  if (file.exists(out_file)) {
+    stop(out_file, " already exists; edit it, or choose another file name.")
+  }
+  rows <- lapply(traits, function(trait) {
+    query <- trimws(gsub("[_.]+", " ", trait))
+    hits <- tryCatch(search(query), error = function(e) {
+      warning(trait, ": EFO search failed: ", conditionMessage(e), call. = FALSE)
+      NULL
+    })
+    found <- !is.null(hits) && nrow(hits) > 0L
+    message(sprintf("%s: %s", trait, if (found) hits$efo_id[1] else "no EFO match"))
+    data.frame(
+      trait = trait,
+      efo_id = if (found) hits$efo_id[1] else "",
+      accession = "", reported_trait = "",
+      suggestions = if (found) paste(sprintf("%s (%s)", hits$efo_id, hits$efo_trait),
+                                     collapse = "; ") else "",
+      stringsAsFactors = FALSE
+    )
+  })
+  out <- do.call(rbind, rows)
+  dir.create(dirname(out_file), recursive = TRUE, showWarnings = FALSE)
+  utils::write.table(out, out_file, sep = "\t", quote = FALSE, row.names = FALSE, na = "")
+  invisible(out)
+}
+
+audit_zscore_alignment <- function(z, alignment, manifest, output_prefix = NULL,
+                                   min_abs_z = 2, p_threshold = AUDIT_GWS_P,
+                                   get_page = catalog_get_page) {
+  a <- prepare_alignment(alignment, z)
+  cache_dir <- if (!is.null(output_prefix)) paste0(output_prefix, "_catalog_cache")
+
+  # Fetch each EFO term once, whichever traits share it.
+  efo_ids <- unique(unlist(lapply(manifest$efo_id, audit_split_ids)))
+  catalog <- list()
+  errors <- character(0)
+  for (id in efo_ids) {
+    message("Fetching GWAS Catalog associations for ", id)
+    got <- tryCatch(catalog_fetch_efo(id, cache_dir, get_page), error = function(e) e)
+    if (inherits(got, "error")) {
+      errors[[id]] <- conditionMessage(got)
+      warning(id, ": ", conditionMessage(got), call. = FALSE)
+    } else {
+      catalog[[id]] <- got
+    }
+  }
+
+  summaries <- list()
+  comparisons <- list()
+  for (i in seq_len(nrow(manifest))) {
+    row <- manifest[i, ]
+    ids <- audit_split_ids(row$efo_id)
+    calls <- NULL
+    note <- ""
+    if (!length(ids)) {
+      v <- trait_verdict(NULL)
+      v$verdict <- "NOT_CHECKED"
+      note <- "No EFO ID given."
+    } else if (any(ids %in% names(errors))) {
+      v <- trait_verdict(NULL)
+      v$verdict <- "LOOKUP_ERROR"
+      note <- paste(unname(errors[intersect(ids, names(errors))]), collapse = "; ")
+    } else {
+      records <- do.call(rbind, unname(catalog[ids]))
+      records <- records[!duplicated(records$association_id), , drop = FALSE]
+      aligned <- align_catalog_to_matrix(records, a, row$accession, row$reported_trait,
+                                         p_threshold)
+      calls <- call_snp_trait(aligned, z[, row$trait], min_abs_z)
+      v <- trait_verdict(calls, row$accession)
+      if (!is.null(calls)) {
+        comparisons[[length(comparisons) + 1L]] <- cbind(trait = row$trait, calls)
+      }
+    }
+    message(sprintf("%s: %s (%d of %d informative SNPs concordant)", row$trait, v$verdict,
+                    as.integer(v$n_concordant), as.integer(v$n_informative)))
+    summaries[[i]] <- cbind(row, v, note = note, stringsAsFactors = FALSE)
+  }
+  summary <- do.call(rbind, summaries)
+  rownames(summary) <- NULL
+  comparisons <- if (length(comparisons)) do.call(rbind, comparisons)[AUDIT_COMPARISON_COLS]
+
+  if (!is.null(output_prefix)) {
+    dir.create(dirname(output_prefix), recursive = TRUE, showWarnings = FALSE)
+    utils::write.csv(if (is.null(comparisons)) data.frame() else comparisons,
+                     paste0(output_prefix, ".csv"), row.names = FALSE)
+    utils::write.csv(summary, paste0(output_prefix, "_traits.csv"), row.names = FALSE)
+    write_audit_report(summary, comparisons, paste0(output_prefix, ".html"),
+                       settings = list(min_abs_z = min_abs_z, p_threshold = p_threshold,
+                                       n_variants = nrow(z), n_traits = nrow(manifest)))
+  }
+  invisible(list(summary = summary, comparisons = comparisons))
+}

@@ -275,3 +275,79 @@ test_that("write_audit_report writes a self-contained page with every trait", {
   expect_false(grepl("<script", html, fixed = TRUE))
   expect_true(any(grepl("flipped", flags, fixed = TRUE)))
 })
+
+write_lines_tsv <- function(lines) {
+  f <- tempfile(fileext = ".tsv")
+  writeLines(lines, f)
+  f
+}
+
+test_that("read_audit_manifest fills optional columns and validates entries", {
+  traits <- c("good", "flipped")
+  m <- read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tEFO_0000001", "flipped\t")),
+                           traits)
+  expect_equal(m$efo_id, c("EFO_0000001", ""))
+  expect_equal(m$accession, c("", ""))
+  expect_equal(m$reported_trait, c("", ""))
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "nope\tEFO_1")), traits),
+               "not in the matrix")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tbad id")), traits),
+               "EFO ID")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id\taccession",
+                                                     "good\tEFO_1\tXYZ")), traits),
+               "accession")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id\treported_trait",
+                                                     "good\tEFO_1\t(")), traits),
+               "reported_trait")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait", "good")), traits), "efo_id")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tEFO_1",
+                                                     "good\tEFO_2")), traits), "Duplicate")
+})
+
+test_that("draft_audit_manifest writes suggestions and never overwrites", {
+  out <- tempfile(fileext = ".tsv")
+  search <- function(q) {
+    if (q == "Waist circumference male") {
+      data.frame(efo_id = c("EFO_1", "EFO_2"), efo_trait = c("waist circumference", "waist"))
+    } else {
+      data.frame(efo_id = character(0), efo_trait = character(0))
+    }
+  }
+  quietly(draft_audit_manifest(c("Waist circumference_male", "XINSG30"), out, search = search))
+  m <- utils::read.delim(out, colClasses = "character", na.strings = character(0))
+  expect_equal(names(m), c("trait", "efo_id", "accession", "reported_trait", "suggestions"))
+  expect_equal(m$efo_id, c("EFO_1", ""))
+  expect_equal(m$suggestions[1], "EFO_1 (waist circumference); EFO_2 (waist)")
+  expect_error(draft_audit_manifest("x", out, search = search), "already exists")
+  expect_equal(nrow(read_audit_manifest(out, c("Waist circumference_male", "XINSG30"))), 2L)
+})
+
+test_that("audit_zscore_alignment labels every trait and writes its outputs", {
+  fx <- audit_fixture()
+  api <- fake_api(setNames(list(assoc_page(fx$records, 1)),
+                           catalog_associations_url("EFO_0000001", 0)))
+  get_page <- function(url) {
+    if (grepl("EFO_0000666", url, fixed = TRUE)) stop("HTTP 500")
+    api$get(url)
+  }
+  manifest <- data.frame(
+    trait = c("good", "flipped", "scrambled", "lookup", "blank"),
+    efo_id = c("EFO_0000001", "EFO_0000001", "EFO_0000001", "EFO_0000001; EFO_0000666", ""),
+    accession = "", reported_trait = "", stringsAsFactors = FALSE
+  )
+  prefix <- file.path(tempfile(), "audit")
+  res <- quietly(audit_zscore_alignment(fx$z, fx$alignment, manifest, prefix,
+                                        get_page = get_page))
+  s <- res$summary
+  expect_equal(s$verdict[match(manifest$trait, s$trait)],
+               c("PASS", "FLIPPED", "REVIEW", "LOOKUP_ERROR", "NOT_CHECKED"))
+  expect_match(s$note[s$trait == "lookup"], "HTTP 500")
+  expect_length(api$calls, 1L)
+  for (suffix in c(".csv", "_traits.csv", ".html")) {
+    expect_true(file.exists(paste0(prefix, suffix)))
+  }
+  expect_true(file.exists(file.path(paste0(prefix, "_catalog_cache"), "EFO_0000001.rds")))
+  comp <- utils::read.csv(paste0(prefix, ".csv"))
+  expect_equal(sort(unique(comp$trait)), c("flipped", "good", "scrambled"))
+  expect_equal(nrow(comp), 21L)
+})
