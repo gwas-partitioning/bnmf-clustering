@@ -2,216 +2,203 @@
 # audit_zscore_alignment.R
 # =============================================================================
 # Checks that each trait column of the pre-imputed z-score matrix
-# (zmat_preImputed.rds) is oriented to the T2D risk allele, by comparing signs
-# with genome-wide-significant associations in the NHGRI-EBI GWAS Catalog.
+# (zmat_preImputed.rds) is oriented to the T2D risk allele, by comparing it
+# with the same variants in the Common Metabolic Diseases Knowledge Portal
+# (https://hugeamp.org), which holds full summary statistics (every variant,
+# not only significant hits) for about 1,700 phenotypes.
 #
 # The check is independent of your own summary-statistics files, so it can
 # catch an allele mistake made while preprocessing them (for example, the
 # wrong effect-allele column), which flips or scrambles a whole trait.
 #
-# The Catalog data come from its bulk "All associations with added ontology
-# annotations" file (about 70 MB zipped, updated weekly):
-#   https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip
-# Pass the .zip (needs the unzip command) or the unzipped .tsv. The REST API
-# is too slow for whole-trait queries (about 45 s per 500 records).
-#
 # Usage:
-#   1. Draft the audit manifest (EFO terms suggested from each trait name):
-#        Rscript scripts/audit_zscore_alignment.R --draft --catalog CATALOG.zip \
+#   1. Draft the audit manifest (a Portal phenotype suggested per trait):
+#        Rscript scripts/audit_zscore_alignment.R --draft \
 #          results/zmat_preImputed.rds audit_traits.tsv
-#   2. Review audit_traits.tsv: correct efo_id (see the suggestions column;
-#      separate several IDs with ";"), blank it to skip a trait, and
-#      optionally add the GCST accession of the study the clustering used
-#      and a reported_trait regular expression.
+#   2. Review audit_traits.tsv: correct kp_phenotype (see the suggestions
+#      column, or https://hugeamp.org for the phenotype list) or blank it to
+#      skip a trait.
 #   3. Run the audit:
-#        Rscript scripts/audit_zscore_alignment.R --catalog CATALOG.zip \
+#        Rscript scripts/audit_zscore_alignment.R \
 #          results/zmat_preImputed.rds results/alignment_GWAS_summStats.csv \
-#          audit_traits.tsv results/zscore_audit [--min-abs-z 2]
-#      Writes results/zscore_audit.csv (one row per SNP-trait comparison),
-#      results/zscore_audit_traits.csv (one row per trait), and
-#      results/zscore_audit.html.
+#          audit_traits.tsv results/zscore_audit \
+#          [--ancestry Mixed] [--min-abs-z 2] [--workers 4]
+#      Writes results/zscore_audit.csv (one row per variant-trait comparison),
+#      results/zscore_audit_traits.csv (one row per trait),
+#      results/zscore_audit.html, and results/zscore_audit_portal_cache/.
+#      The first run queries the Portal once per variant (all phenotypes come
+#      back together), about 10-20 minutes for 1,000 variants; reruns use the
+#      cache. --ancestry selects the Portal's ancestry-specific analysis
+#      (for example EU, AF, EA, SA, HS); the default is its multi-ancestry
+#      meta-analysis.
 #
-# Verdicts: PASS (>= 80% of informative SNPs agree in sign), FLIPPED (<= 20%),
-# REVIEW (in between), INSUFFICIENT (< 5 informative SNPs), NOT_CHECKED (no
-# EFO ID).
+# Verdicts: PASS (>= 80% of informative variants agree in sign), FLIPPED
+# (<= 20%), REVIEW (in between), INSUFFICIENT (< 5 informative variants),
+# NOT_CHECKED (no Portal phenotype). A variant is informative when both the
+# matrix and the Portal z-score have |z| >= 2.
 #
 # From R, source scripts/qc_report.R before this file.
 #
-# Dependencies: data.table.
+# Dependencies: httr2 (and jsonlite, which it uses); parallel (base R).
 # =============================================================================
 
-AUDIT_GWS_P <- 5e-8
-AUDIT_BASES <- c("A", "C", "G", "T")
-AUDIT_TERM_PATTERN <- "^[A-Za-z]+_[A-Za-z0-9]+$"   # EFO_0004340, OBA_VT0005416, MONDO_0005148
-CATALOG_COLUMNS <- c(
-  risk = "STRONGEST SNP-RISK ALLELE", snps = "SNPS", current = "SNP_ID_CURRENT",
-  p = "P-VALUE", value = "OR or BETA", ci = "95% CI (TEXT)", mapped = "MAPPED_TRAIT",
-  uri = "MAPPED_TRAIT_URI", accession = "STUDY ACCESSION", reported = "DISEASE/TRAIT"
-)
+KP_API <- "https://bioindex.hugeamp.org/api"
+AUDIT_USER_AGENT <- "bnmf_clustering z-score audit"
 
-audit_complement <- function(x) chartr("ACGT", "TGCA", x)
-
-catalog_direction <- function(ci_text, value) {
-  # The Catalog stores effect sizes unsigned. A beta's direction is written in
-  # the CI text ("[0.01-0.02] unit increase"); without it, a value above 1 is
-  # an odds ratio for the risk allele. Anything else (including a bare value
-  # below 1, which could be an unsigned beta) gives no direction.
-  ci_text <- tolower(ifelse(is.na(ci_text), "", ci_text))
-  value <- suppressWarnings(as.numeric(value))
-  ifelse(grepl("increase", ci_text, fixed = TRUE), 1,
-  ifelse(grepl("decrease", ci_text, fixed = TRUE), -1,
-  ifelse(is.finite(value) & value > 1, 1, NA_real_)))
+kp_get_json <- function(url) {
+  # The Portal refuses requests without a user agent.
+  if (!requireNamespace("httr2", quietly = TRUE)) {
+    stop("Install the httr2 package to query the Knowledge Portal.")
+  }
+  httr2::request(url) |>
+    httr2::req_user_agent(AUDIT_USER_AGENT) |>
+    httr2::req_timeout(180) |>
+    httr2::req_retry(max_tries = 4) |>
+    httr2::req_perform() |>
+    httr2::resp_body_json()
 }
 
-parse_catalog_rows <- function(raw) {
-  # Normalise rows of the bulk associations file (all columns character).
-  missing_cols <- setdiff(CATALOG_COLUMNS, names(raw))
-  if (length(missing_cols)) {
-    stop("The GWAS Catalog file lacks column(s): ", paste(missing_cols, collapse = ", "),
-         ". Use the 'All associations' file with added ontology annotations.")
+kp_variant_url <- function(var_id, ancestry = "Mixed") {
+  if (identical(ancestry, "Mixed")) {
+    sprintf("%s/bio/query/phewas-associations?q=%s", KP_API, var_id)
+  } else {
+    sprintf("%s/bio/query/ancestry-phewas-associations?q=%s,%s", KP_API, ancestry, var_id)
   }
-  col <- function(key) {
-    x <- as.character(raw[[CATALOG_COLUMNS[[key]]]])
-    x[is.na(x)] <- ""
-    trimws(x)
-  }
-  snps <- col("snps")
-  risk <- gsub("\\s+", "", col("risk"))
-  single <- grepl("^rs[0-9]+$", snps)
-  # "rs123-A": the effect allele follows the last "-" and must name this SNP.
-  effect_allele <- toupper(sub("^.*-", "", risk))
-  effect_allele[!grepl("-", risk, fixed = TRUE) | sub("-[^-]*$", "", risk) != snps |
-                  !nzchar(effect_allele)] <- NA_character_
-  current <- col("current")
-  # "http://www.ebi.ac.uk/efo/EFO_1, http://purl.obolibrary.org/obo/MONDO_2"
-  # becomes "EFO_1,MONDO_2".
-  term_ids <- gsub("\\s", "", gsub("[^,]*/", "", col("uri")))
+}
+
+audit_or <- function(x, y) if (is.null(x) || !length(x)) y else x
+
+kp_parse_rows <- function(rows) {
+  # Portal rows (parsed JSON) to phenotype, beta, se, p, n.
+  num <- function(f) vapply(rows, function(r) {
+    suppressWarnings(as.numeric(audit_or(r[[f]], NA)[[1]]))
+  }, numeric(1))
   data.frame(
-    catalog_row = as.character(seq_along(snps)),
-    accession = col("accession"),
-    rsID = ifelse(single, snps, NA_character_),
-    rsID_current = ifelse(single & grepl("^[0-9]+$", current), paste0("rs", current),
-                          NA_character_),
-    effect_allele = effect_allele,
-    p_value = suppressWarnings(as.numeric(col("p"))),
-    ci_text = col("ci"),
-    effect_value = suppressWarnings(as.numeric(col("value"))),
-    reported_trait = col("reported"),
-    mapped_trait = col("mapped"),
-    term_ids = term_ids,
-    single_snp = single,
+    phenotype = vapply(rows, function(r) as.character(audit_or(r$phenotype, NA)[[1]]),
+                       character(1)),
+    beta = num("beta"), se = num("stdErr"), p = num("pValue"), n = num("n"),
     stringsAsFactors = FALSE
   )
 }
 
-read_catalog_bulk <- function(path) {
-  if (!file.exists(path)) stop("GWAS Catalog file not found: ", path)
-  if (!requireNamespace("data.table", quietly = TRUE)) {
-    stop("Install the data.table package to read the GWAS Catalog file.")
+kp_empty <- function() {
+  data.frame(phenotype = character(0), beta = numeric(0), se = numeric(0), p = numeric(0),
+             n = numeric(0), effect_allele = character(0), other_allele = character(0),
+             kp_var_id = character(0), stringsAsFactors = FALSE)
+}
+
+kp_fetch_variant <- function(chrom, pos, ref, alt, ancestry = "Mixed", cache_dir = NULL,
+                             get_json = kp_get_json) {
+  # All Portal phenotypes at one variant. The Portal names a variant
+  # chr:pos:A1:A2 (hg19) and reports beta for A2; its allele order need not
+  # match ours, so the other order is tried when the first returns nothing.
+  cache_file <- if (!is.null(cache_dir)) {
+    file.path(cache_dir, sprintf("%s_%s_%s_%s_%s.rds", chrom, pos, ref, alt, ancestry))
   }
-  args <- list(sep = "\t", quote = "", colClasses = "character", na.strings = "",
-               select = unname(CATALOG_COLUMNS), showProgress = FALSE)
-  source_arg <- if (grepl("\\.zip$", path, ignore.case = TRUE)) {
-    if (!nzchar(Sys.which("unzip"))) stop("Reading a .zip needs the unzip command; unzip it and pass the .tsv.")
-    list(cmd = paste("unzip -p", shQuote(path)))
-  } else {
-    list(file = path)
+  if (!is.null(cache_file) && file.exists(cache_file)) return(readRDS(cache_file))
+  out <- NULL
+  for (alleles in list(c(ref, alt), c(alt, ref))) {
+    var_id <- paste(chrom, pos, alleles[1], alleles[2], sep = ":")
+    response <- get_json(kp_variant_url(var_id, ancestry))
+    if (is.null(response$count)) stop("Unexpected Knowledge Portal response for ", var_id)
+    if (response$count > 0) {
+      out <- kp_parse_rows(response$data)
+      out$effect_allele <- alleles[2]
+      out$other_allele <- alleles[1]
+      out$kp_var_id <- var_id
+      break
+    }
   }
-  raw <- suppressWarnings(do.call(data.table::fread, c(source_arg, args)))
-  out <- parse_catalog_rows(as.data.frame(raw))
-  message(sprintf("Read %s GWAS Catalog associations from %s",
-                  format(nrow(out), big.mark = ","), basename(path)))
+  if (is.null(out)) out <- kp_empty()
+  if (!is.null(cache_file)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    saveRDS(out, cache_file)
+  }
   out
 }
 
-catalog_for_terms <- function(catalog, term_ids) {
-  # Rows annotated with any of term_ids (whole IDs: EFO_1 does not match EFO_10).
-  keys <- paste0(",", catalog$term_ids, ",")
-  hit <- Reduce(`|`, lapply(term_ids, function(id) {
-    grepl(paste0(",", id, ","), keys, fixed = TRUE)
-  }), FALSE)
-  catalog[hit, , drop = FALSE]
+kp_fetch_matrix <- function(alignment, ancestry = "Mixed", cache_dir = NULL,
+                            get_json = kp_get_json, workers = 4L) {
+  # Portal results for every matrix variant, fetched in parallel where the
+  # platform allows forking. Variants whose query fails are listed in
+  # attr(, "failed") and left out; rerunning retries them.
+  pos <- sub("^.*:", "", alignment$ChrPos)
+  chrom <- sub("^chr", "", sub(":.*$", "", alignment$ChrPos), ignore.case = TRUE)
+  one <- function(i) {
+    tryCatch({
+      d <- kp_fetch_variant(chrom[i], pos[i], alignment$REF[i], alignment$ALT[i], ancestry,
+                            cache_dir, get_json)
+      if (nrow(d)) d$ChrPos <- alignment$ChrPos[i] else d$ChrPos <- character(0)
+      d
+    }, error = function(e) structure(conditionMessage(e), class = "kp_failure"))
+  }
+  idx <- seq_len(nrow(alignment))
+  workers <- if (.Platform$OS.type == "windows") 1L else max(1L, as.integer(workers))
+  message(sprintf("Querying the Knowledge Portal for %d variants (%s, %d worker%s)...",
+                  length(idx), ancestry, workers, if (workers == 1L) "" else "s"))
+  results <- if (workers > 1L) {
+    parallel::mclapply(idx, one, mc.cores = workers, mc.preschedule = FALSE)
+  } else {
+    lapply(idx, one)
+  }
+  failed <- vapply(results, function(r) inherits(r, "kp_failure") || inherits(r, "try-error"),
+                   logical(1))
+  out <- do.call(rbind, results[!failed])
+  if (is.null(out)) out <- cbind(kp_empty(), ChrPos = character(0))
+  rownames(out) <- NULL
+  attr(out, "failed") <- alignment$ChrPos[failed]
+  attr(out, "not_found") <- setdiff(alignment$ChrPos[!failed], out$ChrPos)
+  if (any(failed)) {
+    warning(sum(failed), " variant(s) could not be fetched (first: ", alignment$ChrPos[failed][1],
+            ": ", unclass(results[failed][[1]]), "). Rerun to retry them.", call. = FALSE)
+  }
+  out
 }
 
-catalog_terms <- function(catalog) {
-  # One row per ontology term in the file: efo_id, efo_trait, n (associations).
-  has <- nzchar(catalog$term_ids)
-  tab <- table(paste(catalog$term_ids[has], catalog$mapped_trait[has], sep = "\t"))
-  parts <- strsplit(names(tab), "\t", fixed = TRUE)
-  ids <- strsplit(vapply(parts, `[`, character(1), 1L), ",", fixed = TRUE)
-  labels <- strsplit(vapply(parts, function(p) if (length(p) > 1L) p[2] else "", character(1)),
-                     ", ", fixed = TRUE)
-  # A label containing ", " cannot be paired with its ID; skip those rows.
-  ok <- lengths(ids) == lengths(labels)
-  long <- data.frame(efo_id = unlist(ids[ok]), efo_trait = unlist(labels[ok]),
-                     n = rep(as.integer(tab)[ok], lengths(ids[ok])), stringsAsFactors = FALSE)
-  if (!nrow(long)) return(data.frame(efo_id = character(0), efo_trait = character(0), n = integer(0)))
-  key <- paste(long$efo_id, long$efo_trait, sep = "\t")
-  n <- rowsum(long$n, key, reorder = FALSE)
-  first <- long[match(rownames(n), key), c("efo_id", "efo_trait")]
-  first$n <- as.integer(n[, 1])
-  rownames(first) <- NULL
-  first
+kp_phenotypes <- function(get_json = kp_get_json) {
+  rows <- get_json(sprintf("%s/portal/phenotypes", KP_API))$data
+  data.frame(
+    name = vapply(rows, function(r) as.character(audit_or(r$name, NA)[[1]]), character(1)),
+    description = vapply(rows, function(r) as.character(audit_or(r$description, "")[[1]]), character(1)),
+    group = vapply(rows, function(r) as.character(audit_or(r$group, "")[[1]]), character(1)),
+    stringsAsFactors = FALSE
+  )
 }
-
-# Common trait-name abbreviations, expanded before matching Catalog labels.
-AUDIT_TRAIT_SYNONYMS <- c(
-  "bmi" = "body mass index", "hdl" = "high density lipoprotein cholesterol",
-  "ldl" = "low density lipoprotein cholesterol", "tg" = "triglyceride",
-  "logtg" = "triglyceride", "sbp" = "systolic blood pressure",
-  "dbp" = "diastolic blood pressure", "whr" = "waist hip ratio",
-  "shbg" = "sex hormone binding globulin", "alt" = "alanine aminotransferase",
-  "ast" = "aspartate aminotransferase", "alp" = "alkaline phosphatase",
-  "ggt" = "gamma glutamyl transferase", "gamma glutamyltransferase" = "gamma glutamyl transferase",
-  "crp" = "c reactive protein", "white blood cell" = "leukocyte",
-  "red blood cell" = "erythrocyte", "oestradiol" = "estradiol", "haemoglobin" = "hemoglobin",
-  "adjbmi" = "bmi adjusted"
-)
 
 audit_norm_label <- function(x) trimws(gsub("[^a-z0-9]+", " ", tolower(x)))
 
-suggest_efo_terms <- function(terms, query, n = 3L) {
-  # Up to n terms whose label matches query, best first:
-  #   0 label and query have the same words
-  #   1 label has every word of the query (and more)
-  #   2 query has every word of the label
-  # ignoring a trailing "measurement" and word order, and trying the query
-  # both as given and with abbreviations expanded (BMI, HDL, adjBMI, ...).
-  # More associations first within a tier.
-  empty <- terms[0, c("efo_id", "efo_trait", "n")]
-  q <- audit_norm_label(query)
-  if (!nzchar(q) || !nrow(terms)) return(empty)
-  expanded <- q
-  for (abbr in names(AUDIT_TRAIT_SYNONYMS)) {
-    expanded <- gsub(paste0("(^| )", abbr, "( |$)"),
-                     paste0("\\1", AUDIT_TRAIT_SYNONYMS[[abbr]], "\\2"), expanded)
-  }
-  core <- sub(" measurement$", "", audit_norm_label(terms$efo_trait))
-  core_words <- strsplit(core, " ", fixed = TRUE)
-  tier_for <- function(q) {
-    qw <- unique(strsplit(q, " ", fixed = TRUE)[[1]])
-    # Only terms sharing a word with the query can match.
-    tier <- rep(NA_integer_, length(core))
-    cand <- which(vapply(core_words, function(w) any(w %in% qw), logical(1)))
-    has_query <- vapply(core_words[cand], function(w) all(qw %in% w), logical(1))
-    in_query <- vapply(core_words[cand], function(w) all(w %in% qw), logical(1)) &
-      nchar(core[cand]) >= 4L
-    tier[cand] <- ifelse(has_query & in_query, 0L, ifelse(has_query, 1L,
-                         ifelse(in_query, 2L, NA_integer_)))
-    tier
-  }
-  tier <- pmin(tier_for(q), tier_for(expanded), na.rm = TRUE)
+suggest_kp_phenotypes <- function(phenotypes, trait, n = 3L) {
+  # Up to n Portal phenotypes for a matrix trait name, best first:
+  #   0 the phenotype code equals the trait name (ignoring case and punctuation)
+  #   1 the description has the same words as the trait name
+  #   2 the description has every word of the trait name (and more)
+  #   3 the trait name has every word of the description
+  # Shorter descriptions first within a tier.
+  empty <- phenotypes[0, c("name", "description")]
+  q <- audit_norm_label(trait)
+  if (!nzchar(q) || !nrow(phenotypes)) return(empty)
+  squash <- function(x) gsub("[^a-z0-9]", "", tolower(x))
+  qw <- unique(strsplit(q, " ", fixed = TRUE)[[1]])
+  desc <- audit_norm_label(sub("\\s*\\([^)]*\\)\\s*$", "", phenotypes$description))
+  dw <- strsplit(desc, " ", fixed = TRUE)
+  has_query <- vapply(dw, function(w) all(qw %in% w), logical(1))
+  in_query <- vapply(dw, function(w) length(w) > 0L && all(w %in% qw), logical(1)) &
+    nchar(desc) >= 4L
+  tier <- ifelse(squash(phenotypes$name) == squash(trait), 0L,
+          ifelse(has_query & in_query, 1L,
+          ifelse(has_query, 2L,
+          ifelse(in_query, 3L, NA_integer_))))
   keep <- which(!is.na(tier))
   if (!length(keep)) return(empty)
-  keep <- keep[order(tier[keep], -terms$n[keep], nchar(core[keep]))]
-  out <- utils::head(terms[keep, c("efo_id", "efo_trait", "n")], n)
+  keep <- keep[order(tier[keep], nchar(desc[keep]))]
+  out <- utils::head(phenotypes[keep, c("name", "description")], n)
   rownames(out) <- NULL
   out
 }
 
 prepare_alignment <- function(alignment, z) {
   # One alignment row per matrix row, in matrix order.
-  needed <- c("ChrPos", "rsID", "REF", "ALT", "Risk_Allele")
+  needed <- c("ChrPos", "REF", "ALT", "Risk_Allele")
   missing_cols <- setdiff(needed, names(alignment))
   if (length(missing_cols)) {
     stop("The alignment file lacks column(s): ", paste(missing_cols, collapse = ", "))
@@ -224,8 +211,10 @@ prepare_alignment <- function(alignment, z) {
     stop(sum(is.na(idx)), " matrix row(s) have no alignment row (first: ",
          rownames(z)[is.na(idx)][1], ").")
   }
-  a <- as.data.frame(alignment, stringsAsFactors = FALSE)[idx, needed]
+  keep_cols <- intersect(c(needed, "rsID"), names(alignment))
+  a <- as.data.frame(alignment, stringsAsFactors = FALSE)[idx, keep_cols, drop = FALSE]
   a[] <- lapply(a, as.character)
+  if (!"rsID" %in% names(a)) a$rsID <- NA_character_
   a$ChrPos <- rownames(z)
   a[c("REF", "ALT", "Risk_Allele")] <- lapply(a[c("REF", "ALT", "Risk_Allele")], toupper)
   bad_risk <- is.na(a$Risk_Allele) | !(a$Risk_Allele == a$REF | a$Risk_Allele == a$ALT)
@@ -234,91 +223,42 @@ prepare_alignment <- function(alignment, z) {
     stop(sum(bad_risk), " variant(s) have a Risk_Allele that is neither REF nor ALT (first: ",
          a$ChrPos[bad_risk][1], ").")
   }
-  a$rsID[is.na(a$rsID) | !grepl("^rs[0-9]+$", a$rsID)] <- NA_character_
-  if (all(is.na(a$rsID))) {
-    stop("The alignment file has no rsIDs; the audit matches the Catalog by rsID. ",
-         "rsIDs come from LDlink, so they are blank when LD pruning is off.")
-  }
-  a$palindromic <- paste0(a$REF, a$ALT) %in% c("AT", "TA", "CG", "GC")
   rownames(a) <- NULL
-  a
+  a[c("ChrPos", "rsID", "REF", "ALT", "Risk_Allele")]
 }
 
-align_catalog_to_matrix <- function(catalog, alignment, accession = "",
-                                    reported_trait = "", p_threshold = AUDIT_GWS_P) {
-  # Keep usable genome-wide-significant records, match them to matrix rows by
-  # rsID, and express each record's direction for the T2D risk allele.
-  catalog$catalog_direction <- catalog_direction(catalog$ci_text, catalog$effect_value)
-  keep <- catalog$single_snp & !is.na(catalog$rsID) & is.finite(catalog$p_value) &
-    catalog$p_value <= p_threshold & !is.na(catalog$catalog_direction)
-  if (nzchar(reported_trait)) {
-    keep <- keep & grepl(reported_trait, catalog$reported_trait, ignore.case = TRUE,
-                         perl = TRUE)
-  }
-  kept <- catalog[keep, , drop = FALSE]
-  # Also match on the current rsID when dbSNP has merged the reported one.
-  merged <- kept[!is.na(kept$rsID_current) & kept$rsID_current != kept$rsID, , drop = FALSE]
-  merged$rsID <- merged$rsID_current
-  kept <- rbind(kept, merged)
-
-  usable <- alignment[!is.na(alignment$rsID) & !alignment$palindromic, , drop = FALSE]
-  d <- merge(usable, kept, by = "rsID")
-  d <- d[!duplicated(paste(d$catalog_row, d$ChrPos)), , drop = FALSE]
-
-  ea <- d$effect_allele
-  base <- !is.na(ea) & ea %in% AUDIT_BASES
-  direct <- base & (ea == d$REF | ea == d$ALT)
-  flipped_strand <- base & !direct &
-    (audit_complement(ea) == d$REF | audit_complement(ea) == d$ALT)
-  matched <- direct | flipped_strand
-  d <- d[matched, , drop = FALSE]
-  d$strand_complemented <- flipped_strand[matched]
-  d$aligned_allele <- ifelse(d$strand_complemented, audit_complement(d$effect_allele),
-                             d$effect_allele)
-  d$expected_sign <- d$catalog_direction * ifelse(d$aligned_allele == d$Risk_Allele, 1, -1)
-  d$same_study <- nzchar(accession) & !is.na(d$accession) & d$accession == accession
-  d <- d[order(match(d$ChrPos, alignment$ChrPos), d$p_value), , drop = FALSE]
+compare_trait <- function(portal, alignment, z_values, phenotype, min_abs_z = 2) {
+  # One row per matrix variant that the Portal has for this phenotype. The
+  # Portal z-score (beta / se for its effect allele) is re-expressed for the
+  # T2D risk allele and compared in sign with the matrix z-score.
+  p <- portal[portal$phenotype == phenotype & is.finite(portal$beta) &
+                is.finite(portal$se) & portal$se > 0, , drop = FALSE]
+  p <- p[!duplicated(p$ChrPos), , drop = FALSE]
+  if (!nrow(p)) return(NULL)
+  d <- merge(alignment, p, by = "ChrPos")
+  if (!nrow(d)) return(NULL)
+  aligned_to_risk <- d$effect_allele == d$Risk_Allele
+  d$portal_z <- ifelse(aligned_to_risk, 1, -1) * d$beta / d$se
+  d$matrix_z <- unname(z_values[d$ChrPos])
+  d$status <- ifelse(!is.finite(d$matrix_z), "missing_in_matrix",
+              ifelse(abs(d$matrix_z) < min_abs_z | abs(d$portal_z) < min_abs_z, "weak",
+              ifelse(sign(d$matrix_z) == sign(d$portal_z), "concordant", "discordant")))
+  d$informative <- d$status %in% c("concordant", "discordant")
+  d$concordant <- ifelse(d$informative, d$status == "concordant", NA)
+  d <- d[order(match(d$ChrPos, names(z_values))), , drop = FALSE]
   rownames(d) <- NULL
   d
 }
 
-call_snp_trait <- function(aligned, z_values, min_abs_z = 2) {
-  # One call per matrix variant: the smallest-P record from the clustering
-  # study when there is one, otherwise from any study. Records in that pool
-  # that disagree in direction make the call a catalog_conflict.
-  if (!nrow(aligned)) return(NULL)
-  rows <- lapply(split(seq_len(nrow(aligned)), aligned$ChrPos), function(i) {
-    g <- aligned[i, , drop = FALSE]
-    pool <- if (any(g$same_study)) g[g$same_study, , drop = FALSE] else g
-    best <- pool[which.min(pool$p_value), , drop = FALSE]
-    best$n_catalog_records <- nrow(g)
-    best$catalog_conflict <- length(unique(pool$expected_sign)) > 1L
-    best
-  })
-  calls <- do.call(rbind, rows)
-  calls <- calls[order(match(calls$ChrPos, names(z_values))), , drop = FALSE]
-  calls$matrix_z <- unname(z_values[calls$ChrPos])
-  calls$status <- ifelse(calls$catalog_conflict, "catalog_conflict",
-                  ifelse(!is.finite(calls$matrix_z), "missing_in_matrix",
-                  ifelse(abs(calls$matrix_z) < min_abs_z, "weak_matrix_z",
-                  ifelse(sign(calls$matrix_z) == calls$expected_sign,
-                         "concordant", "discordant"))))
-  calls$informative <- calls$status %in% c("concordant", "discordant")
-  calls$concordant <- ifelse(calls$informative, calls$status == "concordant", NA)
-  rownames(calls) <- NULL
-  calls
-}
-
 AUDIT_VERDICT_ORDER <- c("FLIPPED", "REVIEW", "INSUFFICIENT", "PASS", "NOT_CHECKED")
 
-trait_verdict <- function(calls, accession = "", min_n = 5L, pass_at = 0.8,
-                          flip_at = 0.2) {
+trait_verdict <- function(calls, min_n = 5L, pass_at = 0.8, flip_at = 0.2) {
   informative <- if (is.null(calls)) logical(0) else calls$informative
   n <- sum(informative)
   k <- if (n) sum(calls$concordant[informative]) else 0L
   concordance <- if (n) k / n else NA_real_
-  same <- if (n) informative & calls$same_study else logical(0)
-  n_same <- sum(same)
+  both <- if (is.null(calls)) logical(0) else is.finite(calls$matrix_z) & is.finite(calls$portal_z)
+  z_cor <- if (sum(both) >= 3L) suppressWarnings(stats::cor(calls$matrix_z[both], calls$portal_z[both])) else NA_real_
   verdict <- if (n < min_n) {
     "INSUFFICIENT"
   } else if (concordance >= pass_at) {
@@ -330,14 +270,12 @@ trait_verdict <- function(calls, accession = "", min_n = 5L, pass_at = 0.8,
   }
   data.frame(
     verdict = verdict,
-    n_catalog_snps = if (is.null(calls)) 0L else nrow(calls),
+    n_portal_variants = if (is.null(calls)) 0L else nrow(calls),
     n_informative = n,
     n_concordant = k,
     concordance = concordance,
     binom_p = if (n) stats::binom.test(k, n)$p.value else NA_real_,
-    n_same_study = n_same,
-    same_study_concordance = if (n_same) mean(calls$concordant[same]) else NA_real_,
-    study_differs = if (nzchar(accession)) n_same == 0L else NA,
+    z_correlation = z_cor,
     stringsAsFactors = FALSE
   )
 }
@@ -349,10 +287,10 @@ audit_setting <- function(settings, name, default) {
 }
 
 concordance_plot_svg <- function(summary) {
-  # Dot plot: one row per trait with informative SNPs, x = share concordant,
-  # dot area grows with the number of informative SNPs.
+  # Dot plot: one row per trait with informative variants, x = share
+  # concordant, dot area grows with the number of informative variants.
   s <- summary[summary$n_informative > 0 & is.finite(summary$concordance), , drop = FALSE]
-  if (!nrow(s)) return("<p class=\"muted\">No trait had informative SNPs to plot.</p>")
+  if (!nrow(s)) return("<p class=\"muted\">No trait had informative variants to plot.</p>")
   s <- s[order(s$concordance, s$trait), , drop = FALSE]
   left <- 240; plot_w <- 480; right <- 60; top <- 16; row_h <- 18
   width <- left + plot_w + right
@@ -361,7 +299,7 @@ concordance_plot_svg <- function(summary) {
   f <- function(v) formatC(v, format = "f", digits = 1)
   x <- function(v) left + v * plot_w
   y <- top + (seq_len(nrow(s)) - 0.5) * row_h
-  r <- pmin(8, 2.5 + sqrt(s$n_informative) / 1.5)
+  r <- pmin(8, 2.5 + sqrt(s$n_informative) / 2)
   col <- unname(AUDIT_COLORS[s$verdict])
   col[is.na(col)] <- "#7a8794"
   ticks <- c(0, 0.2, 0.5, 0.8, 1)
@@ -378,7 +316,7 @@ concordance_plot_svg <- function(summary) {
                    '<text x="%1$s" y="%4$s" text-anchor="middle" fill="#6a7486">%5$s</text>'),
             f(x(ticks)), top, f(bottom), f(bottom + 14), format(ticks)),
     sprintf(paste0('<text x="%s" y="%s" text-anchor="middle" fill="#3b4658">',
-                   'Share of informative SNPs whose matrix sign matches the Catalog</text>'),
+                   'Share of informative variants whose matrix sign matches the Portal</text>'),
             f(x(0.5)), f(bottom + 32)),
     sprintf('<text x="%d" y="%s" text-anchor="end" dominant-baseline="middle" fill="#1c2330">%s</text>',
             left - 8, f(y), qc_html_escape(s$trait)),
@@ -396,7 +334,6 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
     stop("Source scripts/qc_report.R before writing the audit report.")
   }
   min_abs_z <- audit_setting(settings, "min_abs_z", 2)
-  p_threshold <- audit_setting(settings, "p_threshold", AUDIT_GWS_P)
   summary <- summary[order(match(summary$verdict, AUDIT_VERDICT_ORDER), summary$trait), ,
                      drop = FALSE]
   count <- table(factor(summary$verdict, levels = AUDIT_VERDICT_ORDER))
@@ -404,20 +341,23 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
 
   flags <- character(0)
   if (count[["FLIPPED"]] > 0) flags <- c(flags, sprintf(
-    "%d trait(s) look flipped: the matrix sign disagrees with the Catalog at most informative SNPs (%s). Check which column was used as the effect allele when these GWAS were formatted.",
+    "%d trait(s) look flipped: the matrix sign disagrees with the Portal at most informative variants (%s). Check which column was used as the effect allele when these GWAS were formatted.",
     count[["FLIPPED"]], traits_with("FLIPPED")))
   if (count[["REVIEW"]] > 0) flags <- c(flags, sprintf(
-    "%d trait(s) have mixed agreement (%s). Possible causes: a partial allele mix-up, or an EFO term that pools a differently defined phenotype (for example adjusted and unadjusted). Their SNP tables are open below.",
+    "%d trait(s) have mixed agreement (%s). Possible causes: a partial allele mix-up, or a Portal phenotype defined differently from your GWAS (for example adjusted versus unadjusted). Their variant tables are open below.",
     count[["REVIEW"]], traits_with("REVIEW")))
-  unknown <- summary$trait[grepl("not in the Catalog file", summary$note, fixed = TRUE)]
+  negative <- summary$trait[summary$verdict %in% c("PASS", "INSUFFICIENT") &
+                              is.finite(summary$z_correlation) & summary$z_correlation < 0]
+  if (length(negative)) flags <- c(flags, sprintf(
+    "Matrix and Portal z-scores are negatively correlated for: %s. Check these traits even though their verdict is not FLIPPED.",
+    qc_name_list(negative)))
+  unknown <- summary$trait[grepl("not a Portal phenotype", summary$note, fixed = TRUE)]
   if (length(unknown)) flags <- c(flags, sprintf(
-    "Some EFO IDs were not found in the Catalog file, for: %s. Check them against the Catalog's trait pages.",
-    qc_name_list(unknown)))
-  differs <- summary$trait[summary$verdict %in% c("PASS", "REVIEW", "FLIPPED") &
-                             summary$study_differs %in% TRUE]
-  if (length(differs)) flags <- c(flags, sprintf(
-    "No informative Catalog record came from the clustering study for: %s. Their verdicts rest on other studies of the trait.",
-    qc_name_list(differs)))
+    "Phenotype codes not found in the Portal for: %s.", qc_name_list(unknown)))
+  n_failed <- length(audit_setting(settings, "failed", character(0)))
+  if (n_failed) flags <- c(flags, sprintf(
+    "%d variant(s) could not be fetched from the Portal and were left out; rerun to retry them.",
+    n_failed))
 
   check_block <- if (length(flags)) {
     paste0("<div class=\"checks\"><h2>Things to check</h2><ul>",
@@ -427,44 +367,38 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
   }
 
   summary_cols <- c("trait", "verdict", "n_informative", "n_concordant", "concordance",
-                    "binom_p", "n_catalog_snps", "n_same_study", "same_study_concordance",
-                    "study_differs", "efo_id", "accession", "reported_trait", "note")
-  detail_cols <- c("rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "effect_allele",
-                   "strand_complemented", "catalog_direction", "expected_sign", "matrix_z",
-                   "status", "p_value", "accession", "same_study", "catalog_row",
-                   "reported_trait")
+                    "binom_p", "z_correlation", "n_portal_variants", "kp_phenotype", "note")
+  detail_cols <- c("rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "kp_var_id", "effect_allele",
+                   "matrix_z", "portal_z", "status", "p", "n")
   details <- vapply(seq_len(nrow(summary)), function(i) {
     s <- summary[i, ]
     rows <- if (is.null(comparisons)) NULL else comparisons[comparisons$trait == s$trait, , drop = FALSE]
     if (is.null(rows) || !nrow(rows)) return("")
-    sprintf("<details%s><summary><strong>%s</strong> &middot; %s (%d of %d informative SNPs concordant)</summary>%s</details>",
+    sprintf("<details%s><summary><strong>%s</strong> &middot; %s (%d of %d informative variants concordant)</summary>%s</details>",
             if (s$verdict %in% c("FLIPPED", "REVIEW")) " open" else "",
             qc_html_escape(s$trait), s$verdict, as.integer(s$n_concordant),
-            as.integer(s$n_informative), qc_html_table(rows[detail_cols], max_rows = 500L))
+            as.integer(s$n_informative), qc_html_table(rows[detail_cols], max_rows = 1500L))
   }, character(1))
 
-  meta <- sprintf("%s variants &times; %s traits &middot; Catalog file %s &middot; generated %s",
+  meta <- sprintf("%s variants &times; %s traits &middot; Knowledge Portal, %s analysis &middot; generated %s",
                   audit_setting(settings, "n_variants", "?"),
                   audit_setting(settings, "n_traits", nrow(summary)),
-                  qc_html_escape(audit_setting(settings, "catalog_label", "not recorded")),
+                  qc_html_escape(audit_setting(settings, "ancestry", "Mixed")),
                   format(Sys.time(), "%Y-%m-%d %H:%M"))
   counts_line <- paste(sprintf("%s: %d", names(count), as.integer(count)), collapse = " &middot; ")
   methods <- sprintf(paste(
-    "<p>For each trait, every GWAS Catalog association annotated with the trait's ontology term(s) was taken from any study,",
-    "keeping single-SNP records with P &le; %s and a direction: a beta whose CI text says increase or decrease, or an",
-    "unsigned value above 1, read as an odds ratio for the reported allele. Records were matched to matrix variants by rsID",
-    "(or by the current rsID when dbSNP has merged the reported one). A/T and C/G variants were excluded; an effect allele",
-    "matching only the complement of REF/ALT was read on the opposite strand. Each record's direction was expressed for the",
-    "T2D risk allele.</p>",
-    "<p>Each variant gets one call: the smallest-P record from the clustering study when its accession is given and present,",
-    "otherwise from any study. When those records disagree in direction the call is a Catalog conflict and is not counted.",
-    "A call is informative when the matrix |z| &ge; %s. Verdicts need at least 5 informative variants: PASS when at least 80%%",
-    "agree in sign, FLIPPED when at most 20%% do, REVIEW in between. The binomial P tests agreement against 50%%.</p>",
-    "<p>Limitations: an ontology term can pool related phenotypes whose directions differ (adjusted versus unadjusted,",
-    "sex-specific); the reported_trait filter narrows a term. Catalog records are curated top hits, so traits with few",
-    "significant loci among these variants may be INSUFFICIENT. An unsigned beta above 1 with no direction text would be",
-    "misread as an odds ratio. Only the sign is checked, not the magnitude.</p>"),
-    format(p_threshold), format(min_abs_z))
+    "<p>Each matrix variant was looked up in the Common Metabolic Diseases Knowledge Portal (hugeamp.org) by hg19",
+    "position and alleles, which returns that variant's beta and standard error for every Portal phenotype. For each",
+    "trait, the Portal z-score (beta / SE) for the phenotype named in the manifest was expressed for the T2D risk allele",
+    "and compared with the matrix z-score. Positions and alleles are matched exactly on the same build, so strand-ambiguous",
+    "(A/T, C/G) variants are included.</p>",
+    "<p>A variant is informative when both z-scores have |z| &ge; %s. Verdicts need at least 5 informative variants:",
+    "PASS when at least 80%% agree in sign, FLIPPED when at most 20%% do, REVIEW in between. The binomial P tests",
+    "agreement against 50%%; z_correlation is the Pearson correlation over all variants the Portal has for the trait.</p>",
+    "<p>Limitations: a Portal phenotype is usually a meta-analysis across the Portal's datasets and may differ from your",
+    "GWAS in definition (adjustment, sex) or ancestry; such differences lower agreement without any error on your side.",
+    "If your trait GWAS was itself downloaded from the Portal, the check is not independent of it.</p>"),
+    format(min_abs_z))
 
   css <- paste(
     "body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1c2330;}",
@@ -498,7 +432,7 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
     "<h2>Sign concordance by trait</h2>",
     paste0("<div class=\"plot\">", concordance_plot_svg(summary), "</div>"),
     "<p class=\"muted\">Red band: at most 20% agree (FLIPPED). Amber band: 20&ndash;80% (REVIEW).</p>",
-    "<h2>Variant calls by trait</h2>",
+    "<h2>Variant comparisons by trait</h2>",
     details[nzchar(details)],
     "<h2>Method</h2>",
     methods,
@@ -511,9 +445,8 @@ write_audit_report <- function(summary, comparisons, file, settings = list()) {
 }
 
 AUDIT_COMPARISON_COLS <- c(
-  "trait", "rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "catalog_row", "accession",
-  "same_study", "reported_trait", "p_value", "effect_allele", "strand_complemented",
-  "catalog_direction", "expected_sign", "matrix_z", "n_catalog_records", "informative",
+  "trait", "kp_phenotype", "rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "kp_var_id",
+  "effect_allele", "beta", "se", "p", "n", "portal_z", "matrix_z", "informative",
   "concordant", "status"
 )
 
@@ -527,58 +460,41 @@ audit_read_matrix <- function(path) {
   z
 }
 
-audit_split_ids <- function(x) {
-  ids <- trimws(strsplit(x, ";", fixed = TRUE)[[1]])
-  ids[nzchar(ids)]
-}
-
 read_audit_manifest <- function(path, traits) {
   m <- utils::read.delim(path, colClasses = "character", na.strings = character(0),
                          quote = "", check.names = FALSE)
-  missing_cols <- setdiff(c("trait", "efo_id"), names(m))
+  missing_cols <- setdiff(c("trait", "kp_phenotype"), names(m))
   if (length(missing_cols)) {
-    stop(path, " lacks column(s): ", paste(missing_cols, collapse = ", "))
+    stop(path, " lacks column(s): ", paste(missing_cols, collapse = ", "),
+         ". Draft a new manifest with --draft.")
   }
-  for (col in c("accession", "reported_trait")) if (!col %in% names(m)) m[[col]] <- ""
-  m <- m[c("trait", "efo_id", "accession", "reported_trait")]
+  m <- m[c("trait", "kp_phenotype")]
   m[] <- lapply(m, function(x) trimws(ifelse(is.na(x), "", x)))
-
   if (anyDuplicated(m$trait)) {
     stop("Duplicate traits in ", path, ": ", qc_name_list(unique(m$trait[duplicated(m$trait)])))
   }
   unknown <- setdiff(m$trait, traits)
   if (length(unknown)) stop("Traits not in the matrix: ", paste(unknown, collapse = ", "))
-  ids <- unlist(lapply(m$efo_id, audit_split_ids))
-  bad_ids <- ids[!grepl(AUDIT_TERM_PATTERN, ids)]
-  if (length(bad_ids)) stop("Invalid EFO ID(s): ", paste(bad_ids, collapse = ", "))
-  bad_acc <- m$accession[nzchar(m$accession) & !grepl("^GCST[0-9]+$", m$accession)]
-  if (length(bad_acc)) {
-    stop("Invalid accession(s) (expected GCST followed by digits): ", paste(bad_acc, collapse = ", "))
-  }
-  for (re in m$reported_trait[nzchar(m$reported_trait)]) {
-    ok <- tryCatch({ suppressWarnings(grepl(re, "", perl = TRUE)); TRUE },
-                   error = function(e) FALSE)
-    if (!ok) stop("Invalid reported_trait regular expression: ", re)
-  }
+  bad <- m$kp_phenotype[nzchar(m$kp_phenotype) & grepl("[[:space:],;]", m$kp_phenotype)]
+  if (length(bad)) stop("Give one Portal phenotype code per trait (got: ", paste(bad, collapse = ", "), ").")
   m
 }
 
-draft_audit_manifest <- function(traits, out_file, catalog) {
-  # Suggest ontology terms from each trait name. The result needs human review.
+draft_audit_manifest <- function(traits, out_file, phenotypes) {
+  # Suggest a Portal phenotype for each trait name. The result needs review.
   if (file.exists(out_file)) {
     stop(out_file, " already exists; edit it, or choose another file name.")
   }
-  terms <- catalog_terms(catalog)
   rows <- lapply(traits, function(trait) {
-    hits <- suggest_efo_terms(terms, gsub("[_.]+", " ", trait))
+    hits <- suggest_kp_phenotypes(phenotypes, gsub("[_.]+", " ", trait))
+    if (!nrow(hits)) hits <- suggest_kp_phenotypes(phenotypes, trait)
     found <- nrow(hits) > 0L
     message(sprintf("%s: %s", trait,
-                    if (found) sprintf("%s (%s)", hits$efo_id[1], hits$efo_trait[1]) else "no match"))
+                    if (found) sprintf("%s (%s)", hits$name[1], hits$description[1]) else "no match"))
     data.frame(
       trait = trait,
-      efo_id = if (found) hits$efo_id[1] else "",
-      accession = "", reported_trait = "",
-      suggestions = if (found) paste(sprintf("%s (%s; %d Catalog records)", hits$efo_id, hits$efo_trait, hits$n),
+      kp_phenotype = if (found) hits$name[1] else "",
+      suggestions = if (found) paste(sprintf("%s (%s)", hits$name, hits$description),
                                      collapse = "; ") else "",
       stringsAsFactors = FALSE
     )
@@ -589,56 +505,49 @@ draft_audit_manifest <- function(traits, out_file, catalog) {
   invisible(out)
 }
 
-audit_zscore_alignment <- function(z, alignment, manifest, catalog, output_prefix = NULL,
-                                   min_abs_z = 2, p_threshold = AUDIT_GWS_P,
-                                   catalog_label = "") {
+audit_zscore_alignment <- function(z, alignment, manifest, portal, output_prefix = NULL,
+                                   min_abs_z = 2, phenotype_names = NULL,
+                                   settings = list()) {
   a <- prepare_alignment(alignment, z)
-  known_ids <- unique(unlist(strsplit(unique(catalog$term_ids), ",", fixed = TRUE)))
-  # Only records for the matrix's variants can matter.
-  matrix_rsids <- a$rsID[!is.na(a$rsID)]
-  local <- catalog[catalog$rsID %in% matrix_rsids | catalog$rsID_current %in% matrix_rsids, ,
-                   drop = FALSE]
-
   summaries <- list()
   comparisons <- list()
   for (i in seq_len(nrow(manifest))) {
     row <- manifest[i, ]
-    ids <- audit_split_ids(row$efo_id)
     note <- ""
-    if (!length(ids)) {
+    calls <- NULL
+    if (!nzchar(row$kp_phenotype)) {
       v <- trait_verdict(NULL)
       v$verdict <- "NOT_CHECKED"
-      note <- "No EFO ID given."
+      note <- "No Portal phenotype given."
     } else {
-      missing_ids <- setdiff(ids, known_ids)
-      if (length(missing_ids)) {
-        note <- sprintf("EFO ID(s) not in the Catalog file: %s.", paste(missing_ids, collapse = ", "))
+      if (!is.null(phenotype_names) && !row$kp_phenotype %in% phenotype_names) {
+        note <- sprintf("%s is not a Portal phenotype code.", row$kp_phenotype)
       }
-      aligned <- align_catalog_to_matrix(catalog_for_terms(local, ids), a, row$accession,
-                                         row$reported_trait, p_threshold)
-      calls <- call_snp_trait(aligned, z[, row$trait], min_abs_z)
-      v <- trait_verdict(calls, row$accession)
+      calls <- compare_trait(portal, a, z[, row$trait], row$kp_phenotype, min_abs_z)
+      v <- trait_verdict(calls)
       if (!is.null(calls)) {
-        comparisons[[length(comparisons) + 1L]] <- cbind(trait = row$trait, calls)
+        calls$trait <- row$trait
+        calls$kp_phenotype <- row$kp_phenotype
+        comparisons[[length(comparisons) + 1L]] <- calls[AUDIT_COMPARISON_COLS]
       }
     }
-    message(sprintf("%s: %s (%d of %d informative SNPs concordant)", row$trait, v$verdict,
+    message(sprintf("%s: %s (%d of %d informative variants concordant)", row$trait, v$verdict,
                     as.integer(v$n_concordant), as.integer(v$n_informative)))
     summaries[[i]] <- cbind(row, v, note = note, stringsAsFactors = FALSE)
   }
   summary <- do.call(rbind, summaries)
   rownames(summary) <- NULL
-  comparisons <- if (length(comparisons)) do.call(rbind, comparisons)[AUDIT_COMPARISON_COLS]
+  comparisons <- if (length(comparisons)) do.call(rbind, comparisons)
 
   if (!is.null(output_prefix)) {
     dir.create(dirname(output_prefix), recursive = TRUE, showWarnings = FALSE)
     utils::write.csv(if (is.null(comparisons)) data.frame() else comparisons,
                      paste0(output_prefix, ".csv"), row.names = FALSE)
     utils::write.csv(summary, paste0(output_prefix, "_traits.csv"), row.names = FALSE)
-    write_audit_report(summary, comparisons, paste0(output_prefix, ".html"),
-                       settings = list(min_abs_z = min_abs_z, p_threshold = p_threshold,
-                                       n_variants = nrow(z), n_traits = nrow(manifest),
-                                       catalog_label = catalog_label))
+    settings$min_abs_z <- min_abs_z
+    settings$n_variants <- nrow(z)
+    settings$n_traits <- nrow(manifest)
+    write_audit_report(summary, comparisons, paste0(output_prefix, ".html"), settings)
   }
   invisible(list(summary = summary, comparisons = comparisons))
 }
@@ -651,49 +560,49 @@ if (sys.nframe() == 0L) {
 
   usage <- paste(
     "Usage:",
-    "  Rscript audit_zscore_alignment.R --draft --catalog CATALOG.zip zmat_preImputed.rds audit_traits.tsv",
-    "  Rscript audit_zscore_alignment.R --catalog CATALOG.zip zmat_preImputed.rds \\",
-    "    alignment_GWAS_summStats.csv audit_traits.tsv output_prefix [--min-abs-z 2]",
-    "CATALOG.zip: gwas-catalog-associations_ontology-annotated-full.zip from",
-    "  https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/ (or the unzipped .tsv).",
+    "  Rscript audit_zscore_alignment.R --draft zmat_preImputed.rds audit_traits.tsv",
+    "  Rscript audit_zscore_alignment.R zmat_preImputed.rds alignment_GWAS_summStats.csv \\",
+    "    audit_traits.tsv output_prefix [--ancestry Mixed] [--min-abs-z 2] [--workers 4]",
     "See the header of this script for the manifest columns.", sep = "\n")
   args <- commandArgs(trailingOnly = TRUE)
   if (!length(args) || any(args %in% c("-h", "--help"))) {
     cat(usage, "\n")
     quit(status = 0)
   }
-  take_value <- function(flag) {
+  take_value <- function(flag, default) {
     at <- which(args == flag)
-    if (!length(at)) return(NULL)
+    if (!length(at)) return(default)
     if (at[1] == length(args)) { cat(usage, "\n"); quit(status = 1) }
     value <- args[at[1] + 1L]
     args <<- args[-c(at[1], at[1] + 1L)]
     value
   }
-  catalog_path <- take_value("--catalog")
-  min_abs_z_arg <- take_value("--min-abs-z")
-  min_abs_z <- if (is.null(min_abs_z_arg)) 2 else suppressWarnings(as.numeric(min_abs_z_arg))
+  ancestry <- take_value("--ancestry", "Mixed")
+  min_abs_z <- suppressWarnings(as.numeric(take_value("--min-abs-z", "2")))
+  workers <- suppressWarnings(as.integer(take_value("--workers", "4")))
   draft <- "--draft" %in% args
   args <- setdiff(args, "--draft")
-  if (is.null(catalog_path) || !is.finite(min_abs_z) || min_abs_z < 0 ||
-      length(args) != if (draft) 2L else 4L) {
+  if (!is.finite(min_abs_z) || min_abs_z < 0 || is.na(workers) ||
+      !grepl("^[A-Za-z]+$", ancestry) || length(args) != if (draft) 2L else 4L) {
     cat(usage, "\n")
     quit(status = 1)
   }
-  catalog_label <- sprintf("%s (modified %s)", basename(catalog_path),
-                           format(file.info(catalog_path)$mtime, "%Y-%m-%d"))
+  phenotypes <- kp_phenotypes()
   if (draft) {
     z <- audit_read_matrix(args[1])
-    if (file.exists(args[2])) stop(args[2], " already exists; edit it, or choose another file name.")
-    draft_audit_manifest(colnames(z), args[2], read_catalog_bulk(catalog_path))
-    message("Wrote ", args[2], ". Review efo_id for every trait before running the audit.")
+    draft_audit_manifest(colnames(z), args[2], phenotypes)
+    message("Wrote ", args[2], ". Review kp_phenotype for every trait before running the audit.")
   } else {
     z <- audit_read_matrix(args[1])
     alignment <- utils::read.csv(args[2], colClasses = "character", check.names = FALSE)
     manifest <- read_audit_manifest(args[3], colnames(z))
-    result <- audit_zscore_alignment(z, alignment, manifest, read_catalog_bulk(catalog_path),
-                                     args[4], min_abs_z = min_abs_z,
-                                     catalog_label = catalog_label)
+    a <- prepare_alignment(alignment, z)
+    portal <- kp_fetch_matrix(a, ancestry, paste0(args[4], "_portal_cache"), workers = workers)
+    result <- audit_zscore_alignment(
+      z, alignment, manifest, portal, args[4], min_abs_z = min_abs_z,
+      phenotype_names = phenotypes$name,
+      settings = list(ancestry = ancestry, failed = attr(portal, "failed"))
+    )
     print(table(factor(result$summary$verdict, levels = AUDIT_VERDICT_ORDER)))
   }
 }

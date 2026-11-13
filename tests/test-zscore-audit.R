@@ -1,108 +1,66 @@
 # Z-score alignment audit: scripts/audit_zscore_alignment.R
-# No network access: Catalog data are small tables in the layout of the bulk
-# "All associations with added ontology annotations" file.
+# No network access: Knowledge Portal responses are canned lists shaped like
+# the parsed JSON of its BioIndex API.
 
 suppressWarnings(suppressPackageStartupMessages({
   source(file.path(scripts_dir, "qc_report.R"))
   source(file.path(scripts_dir, "audit_zscore_alignment.R"))
 }))
 
-efo_uri <- function(id) paste0("http://www.ebi.ac.uk/efo/", id)
-
-cat_row <- function(rs, ea, p = "1E-10", value = "0.1", ci = "[0.05-0.15] unit increase",
-                    uri = efo_uri("EFO_0000001"), mapped = "trait x",
-                    accession = "GCST000001", reported = "Trait X", snps = rs,
-                    current = "", risk = paste0(rs, "-", ea)) {
-  row <- list(risk, snps, current, p, value, ci, mapped, uri, accession, reported)
-  names(row) <- unname(CATALOG_COLUMNS)
-  as.data.frame(row, check.names = FALSE, stringsAsFactors = FALSE)
+kp_row <- function(phenotype, beta, se = 0.01, p = 1e-6, n = 1e5) {
+  list(phenotype = phenotype, beta = beta, stdErr = se, pValue = p, n = n, ancestry = "Mixed")
 }
 
-fake_catalog <- function(...) parse_catalog_rows(do.call(rbind, list(...)))
+fake_portal_api <- function(responses) {
+  # responses: named list, var_id -> list of kp_row(); unknown IDs return none.
+  env <- new.env()
+  env$calls <- character(0)
+  env$get <- function(url) {
+    env$calls <- c(env$calls, url)
+    var_id <- sub("^.*q=(?:[A-Za-z]+,)?", "", url, perl = TRUE)
+    rows <- responses[[var_id]]
+    list(count = length(rows), data = if (length(rows)) rows else list())
+  }
+  env
+}
 
-test_that("catalog_direction reads CI text first, then odds ratios above 1", {
-  expect_equal(
-    catalog_direction(c("[0.05-0.15] unit increase", "[0.02-0.02] mmol/L decrease",
-                        "[1.05-1.13]", "", "[0.8-0.9]", NA, "[1.8-2.14] unit decrease"),
-                      c("0.1", "0.02", "1.09", "", "0.85", "2", "1.97")),
-    c(1, -1, 1, NA, NA, 1, -1)
-  )
+test_that("kp_variant_url uses the ancestry-specific index when asked", {
+  expect_match(kp_variant_url("1:100:A:G"), "phewas-associations?q=1:100:A:G", fixed = TRUE)
+  expect_match(kp_variant_url("1:100:A:G", "EU"),
+               "ancestry-phewas-associations?q=EU,1:100:A:G", fixed = TRUE)
 })
 
-test_that("parse_catalog_rows reads alleles, rsIDs and ontology terms", {
-  d <- parse_catalog_rows(rbind(
-    cat_row("rs1", "a", p = "2E-9"),
-    cat_row("rs2", "T", risk = "rs2 -T"),
-    cat_row("rs3", "", risk = "rs3--"),
-    cat_row("rs4", "?"),
-    cat_row("rs5; rs6", "A", risk = "rs5-A"),
-    cat_row("chr6:31892560", "G"),
-    cat_row("rs7", "C", current = "777"),
-    cat_row("rs8", "G", uri = paste(efo_uri("EFO_0000002"),
-                                    "http://purl.obolibrary.org/obo/OBA_VT0005416", sep = ", ")),
-    cat_row("rs9", "G", risk = "rs10-G")
-  ))
-  expect_equal(d$catalog_row, as.character(1:9))
-  expect_equal(d$effect_allele, c("A", "T", NA, "?", NA, "G", "C", "G", NA))
-  expect_equal(d$single_snp, c(TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, TRUE, TRUE, TRUE))
-  expect_true(is.na(d$rsID[5]) && is.na(d$rsID[6]))
-  expect_equal(d$rsID_current[7], "rs777")
-  expect_equal(d$term_ids[c(1, 8)], c("EFO_0000001", "EFO_0000002,OBA_VT0005416"))
-  expect_equal(d$p_value[1], 2e-9)
-  expect_error(parse_catalog_rows(data.frame(SNPS = "rs1")), "lacks column")
+test_that("kp_parse_rows reads beta, se, P and N, tolerating nulls", {
+  d <- kp_parse_rows(list(kp_row("HDL", -0.02, p = 3e-9), list(phenotype = "BMI", beta = NULL)))
+  expect_equal(d$phenotype, c("HDL", "BMI"))
+  expect_equal(d$beta, c(-0.02, NA))
+  expect_equal(d$se, c(0.01, NA))
+  expect_equal(d$p[1], 3e-9)
 })
 
-test_that("read_catalog_bulk reads the TSV and the zip", {
-  raw <- rbind(cat_row("rs1", "A"), cat_row("rs2", "G", value = "", ci = ""))
-  raw$extra <- "ignored"
-  dir <- tempfile()
-  dir.create(dir)
-  tsv <- file.path(dir, "assoc.tsv")
-  utils::write.table(raw, tsv, sep = "\t", quote = FALSE, row.names = FALSE, na = "")
-  from_tsv <- quietly(read_catalog_bulk(tsv))
-  expect_equal(from_tsv, parse_catalog_rows(raw[unname(CATALOG_COLUMNS)]),
-               ignore_attr = TRUE)
-  expect_true(is.na(from_tsv$effect_value[2]))
-  skip_if(!nzchar(Sys.which("zip")) || !nzchar(Sys.which("unzip")), "zip/unzip not available")
-  zip <- file.path(dir, "assoc.zip")
-  utils::zip(zip, tsv, flags = "-jq")
-  expect_equal(quietly(read_catalog_bulk(zip)), from_tsv)
-  expect_error(read_catalog_bulk(file.path(dir, "missing.zip")), "not found")
-})
-
-test_that("catalog_for_terms matches whole IDs only", {
-  d <- fake_catalog(cat_row("rs1", "A", uri = efo_uri("EFO_1")),
-                    cat_row("rs2", "A", uri = efo_uri("EFO_10")),
-                    cat_row("rs3", "A", uri = paste(efo_uri("EFO_2"), efo_uri("EFO_1"), sep = ", ")))
-  expect_equal(catalog_for_terms(d, "EFO_1")$rsID, c("rs1", "rs3"))
-  expect_equal(catalog_for_terms(d, c("EFO_10", "EFO_2"))$rsID, c("rs2", "rs3"))
-})
-
-test_that("suggest_efo_terms ranks label matches and counts associations", {
-  d <- fake_catalog(
-    cat_row("rs1", "A", uri = efo_uri("EFO_1"), mapped = "body mass index"),
-    cat_row("rs2", "A", uri = efo_uri("EFO_1"), mapped = "body mass index"),
-    cat_row("rs3", "A", uri = efo_uri("EFO_2"), mapped = "BMI-adjusted waist-hip ratio"),
-    cat_row("rs4", "A", uri = paste(efo_uri("EFO_3"), efo_uri("EFO_1"), sep = ", "),
-            mapped = "urate measurement, body mass index"),
-    cat_row("rs5", "A", uri = efo_uri("EFO_4"), mapped = "glucose measurement"),
-    cat_row("rs6", "A", uri = efo_uri("EFO_5"), mapped = "glucose tolerance test")
-  )
-  terms <- catalog_terms(d)
-  expect_equal(terms$n[terms$efo_id == "EFO_1"], 3L)
-  expect_equal(suggest_efo_terms(terms, "Body mass index")$efo_id, "EFO_1")
-  expect_equal(suggest_efo_terms(terms, "Urate")$efo_id, "EFO_3")
-  expect_equal(suggest_efo_terms(terms, "Glucose")$efo_id, c("EFO_4", "EFO_5"))
-  # Abbreviation expanded; the literal "BMI" match ranks after it.
-  expect_equal(suggest_efo_terms(terms, "BMI")$efo_id, c("EFO_1", "EFO_2"))
-  # A label contained in the trait name ("urate" in "Urate_male").
-  expect_equal(suggest_efo_terms(terms, "Urate male")$efo_id, "EFO_3")
-  expect_equal(nrow(suggest_efo_terms(terms, "XINSG30")), 0L)
+test_that("kp_fetch_variant tries both allele orders and caches the result", {
+  api <- fake_portal_api(list("1:100:G:A" = list(kp_row("HDL", 0.05))))
+  cache <- file.path(tempfile(), "cache")
+  d <- kp_fetch_variant("1", "100", "A", "G", cache_dir = cache, get_json = api$get)
+  expect_equal(d$effect_allele, "A")
+  expect_equal(d$other_allele, "G")
+  expect_equal(d$kp_var_id, "1:100:G:A")
+  expect_length(api$calls, 2L)
+  again <- kp_fetch_variant("1", "100", "A", "G", cache_dir = cache, get_json = api$get)
+  expect_identical(again, d)
+  expect_length(api$calls, 2L)
+  none <- kp_fetch_variant("1", "999", "A", "G", cache_dir = cache, get_json = api$get)
+  expect_equal(nrow(none), 0L)
+  kp_fetch_variant("1", "999", "A", "G", cache_dir = cache, get_json = api$get)
+  expect_length(api$calls, 4L)
+  expect_error(kp_fetch_variant("1", "5", "A", "G", get_json = function(url) list(detail = "x")),
+               "Unexpected Knowledge Portal response")
 })
 
 audit_fixture <- function() {
-  # Eight matrix variants. rs7 is A/T (palindromic). Every Catalog record
-  # below implies +1 for the T2D risk allele, reached in different ways.
+  # Eight matrix variants (rs7 is A/T, which needs no special handling here).
+  # The Portal reports alternate variants for the risk and the non-risk
+  # allele; every beta implies +5 for the T2D risk allele.
   alignment <- data.frame(
     ChrPos = paste0("1:", 1:8 * 100),
     rsID = paste0("rs", 1:8),
@@ -111,133 +69,117 @@ audit_fixture <- function() {
     Risk_Allele = c("G", "C", "A", "T", "A", "A", "T", "G"),
     stringsAsFactors = FALSE
   )
-  raw <- rbind(
-    cat_row("rs1", "G"),                                       # risk allele, increase
-    cat_row("rs2", "T", ci = "[0.1-0.3] unit decrease"),       # non-risk, decrease
-    cat_row("rs3", "T"),                                       # complement of risk A
-    cat_row("rs4", "T", value = "1.2", ci = "[1.1-1.3]"),      # risk, odds ratio
-    cat_row("rs5", "A", value = "1.3", ci = ""),               # risk, odds ratio, no CI
-    cat_row("rs6", "A"),
-    cat_row("rs7", "T"),                                       # palindromic: dropped
-    cat_row("rs8", "G")
+  nonrisk <- ifelse(alignment$Risk_Allele == alignment$REF, alignment$ALT, alignment$REF)
+  effect <- ifelse(seq_len(8) %% 2 == 1, alignment$Risk_Allele, nonrisk)
+  other <- ifelse(effect == alignment$REF, alignment$ALT, alignment$REF)
+  pos <- sub("^1:", "", alignment$ChrPos)
+  portal <- data.frame(
+    phenotype = "TRAITX",
+    beta = ifelse(effect == alignment$Risk_Allele, 0.05, -0.05),
+    se = 0.01, p = 1e-7, n = 1e5,
+    effect_allele = effect, other_allele = other,
+    kp_var_id = paste("1", pos, other, effect, sep = ":"),
+    ChrPos = alignment$ChrPos, stringsAsFactors = FALSE
   )
   z <- cbind(good = rep(5, 8), flipped = rep(-5, 8),
              scrambled = c(5, -5, 5, -5, 5, -5, 5, -5),
              unknown = rep(5, 8), blank = rep(5, 8))
   rownames(z) <- alignment$ChrPos
-  list(alignment = alignment, catalog = parse_catalog_rows(raw), z = z)
+  list(alignment = alignment, portal = portal, z = z)
 }
 
-test_that("prepare_alignment orders rows like the matrix and flags palindromes", {
+test_that("kp_fetch_matrix gathers every variant and records failures", {
+  fx <- audit_fixture()
+  p <- fx$portal
+  responses <- setNames(lapply(seq_len(nrow(p)), function(i) {
+    list(kp_row("TRAITX", p$beta[i]), kp_row("OTHER", 0.01))
+  }), p$kp_var_id)
+  responses[["1:800:G:A"]] <- NULL; responses[["1:800:A:G"]] <- NULL   # not in the Portal
+  api <- fake_portal_api(responses)
+  get <- function(url) if (grepl("1:300:", url, fixed = TRUE)) stop("HTTP 503") else api$get(url)
+  a <- prepare_alignment(fx$alignment, fx$z)
+  for (workers in c(1L, 2L)) {
+    d <- suppressWarnings(quietly(kp_fetch_matrix(a, get_json = get, workers = workers)))
+    expect_equal(attr(d, "failed"), "1:300")
+    expect_equal(attr(d, "not_found"), "1:800")
+    expect_equal(sort(unique(d$ChrPos)), paste0("1:", c(1, 2, 4, 5, 6, 7) * 100))
+    expect_equal(nrow(d), 12L)
+  }
+  expect_warning(kp_fetch_matrix(a, get_json = get, workers = 1L), "could not be fetched")
+})
+
+test_that("suggest_kp_phenotypes matches codes and descriptions", {
+  ph <- data.frame(
+    name = c("HDL", "WHRadjBMI", "WaistC", "FI", "FIadjBMI", "BMI"),
+    description = c("HDL cholesterol", "Waist-hip ratio adj BMI", "Waist circumference",
+                    "Fasting insulin", "Fasting insulin adj BMI", "Body mass index (BMI)"),
+    group = "", stringsAsFactors = FALSE
+  )
+  expect_equal(suggest_kp_phenotypes(ph, "HDL")$name[1], "HDL")
+  expect_equal(suggest_kp_phenotypes(ph, "WHR_adjBMI")$name[1], "WHRadjBMI")
+  expect_equal(suggest_kp_phenotypes(ph, "Waist circumference male")$name, "WaistC")
+  expect_equal(suggest_kp_phenotypes(ph, "Fasting insulin")$name, c("FI", "FIadjBMI"))
+  expect_equal(suggest_kp_phenotypes(ph, "Body mass index")$name[1], "BMI")
+  expect_equal(nrow(suggest_kp_phenotypes(ph, "XINSG30")), 0L)
+})
+
+test_that("prepare_alignment orders rows like the matrix", {
   fx <- audit_fixture()
   a <- prepare_alignment(fx$alignment[8:1, ], fx$z)
   expect_equal(a$ChrPos, rownames(fx$z))
-  expect_equal(a$palindromic, c(rep(FALSE, 6), TRUE, FALSE))
   z_chr <- fx$z
   rownames(z_chr) <- paste0("chr", rownames(z_chr))
   expect_equal(prepare_alignment(fx$alignment, z_chr)$ChrPos, rownames(z_chr))
+  no_rsid <- fx$alignment[setdiff(names(fx$alignment), "rsID")]
+  expect_true(all(is.na(prepare_alignment(no_rsid, fx$z)$rsID)))
 })
 
-test_that("prepare_alignment rejects missing rows, bad risk alleles and absent rsIDs", {
+test_that("prepare_alignment rejects missing rows and bad risk alleles", {
   fx <- audit_fixture()
   expect_error(prepare_alignment(fx$alignment[-1, ], fx$z), "no alignment row")
   bad <- fx$alignment
   bad$Risk_Allele[1] <- "C"
   expect_error(prepare_alignment(bad, fx$z), "Risk_Allele")
-  no_rsid <- fx$alignment
-  no_rsid$rsID <- ""
-  expect_error(prepare_alignment(no_rsid, fx$z), "rsID")
 })
 
-test_that("align_catalog_to_matrix orients every record to the T2D risk allele", {
-  fx <- audit_fixture()
-  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
-  expect_equal(d$rsID, c("rs1", "rs2", "rs3", "rs4", "rs5", "rs6", "rs8"))
-  expect_true(all(d$expected_sign == 1))
-  expect_equal(d$strand_complemented, c(FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE))
-})
-
-test_that("align_catalog_to_matrix applies the P, allele and reported-trait filters", {
+test_that("compare_trait expresses Portal z-scores for the T2D risk allele", {
   fx <- audit_fixture()
   a <- prepare_alignment(fx$alignment, fx$z)
-  catalog <- fake_catalog(
-    cat_row("rs1", "G", p = "1E-6"),                         # not genome-wide
-    cat_row("rs2", "?"),                                      # unknown allele
-    cat_row("rs3", "AT"),                                     # not a single base
-    cat_row("rs4", "T", value = "", ci = ""),                 # no direction
-    cat_row("rs5", "G", reported = "BMI-adjusted thing"),
-    cat_row("rs6", "A", reported = "Unadjusted thing"),
-    cat_row("rs99", "A")                                      # not in the matrix
-  )
-  d <- align_catalog_to_matrix(catalog, a, reported_trait = "unadjusted")
-  expect_equal(d$rsID, "rs6")
-  expect_equal(nrow(align_catalog_to_matrix(catalog[0, ], a)), 0L)
-})
-
-test_that("align_catalog_to_matrix matches a merged rsID by its current ID", {
-  fx <- audit_fixture()
-  a <- prepare_alignment(fx$alignment, fx$z)
-  d <- align_catalog_to_matrix(fake_catalog(cat_row("rs555", "A", current = "6")), a)
-  expect_equal(d$rsID, "rs6")
-  expect_equal(d$expected_sign, 1)
-})
-
-test_that("call_snp_trait prefers the clustering study and flags conflicts", {
-  fx <- audit_fixture()
-  a <- prepare_alignment(fx$alignment, fx$z)
-  catalog <- fake_catalog(
-    cat_row("rs1", "G", p = "1E-30", accession = "GCST000008"),
-    cat_row("rs1", "G", p = "1E-9", accession = "GCST000009"),
-    cat_row("rs2", "C", p = "1E-12"),                         # risk allele: +1
-    cat_row("rs2", "T", p = "1E-10"),                         # non-risk: -1
-    cat_row("rs3", "A", p = "1E-10")
-  )
-  d <- align_catalog_to_matrix(catalog, a, accession = "GCST000009")
-  z <- setNames(c(5, 5, 1, rep(5, 5)), rownames(fx$z))
-  calls <- call_snp_trait(d, z, min_abs_z = 2)
-  expect_equal(calls$rsID, c("rs1", "rs2", "rs3"))
-  expect_equal(calls$catalog_row, c("2", "3", "5"))
-  expect_equal(calls$same_study, c(TRUE, FALSE, FALSE))
-  expect_equal(calls$n_catalog_records, c(2L, 2L, 1L))
-  expect_equal(calls$status, c("concordant", "catalog_conflict", "weak_matrix_z"))
-  expect_equal(calls$informative, c(TRUE, FALSE, FALSE))
+  d <- compare_trait(fx$portal, a, fx$z[, "good"], "TRAITX")
+  expect_equal(d$ChrPos, rownames(fx$z))
+  expect_equal(d$portal_z, rep(5, 8))
+  expect_true(all(d$status == "concordant"))
+  z <- fx$z[, "good"]
+  z[2] <- 1
   z[3] <- NA
-  expect_equal(call_snp_trait(d, z)$status[3], "missing_in_matrix")
-  expect_null(call_snp_trait(d[0, ], z))
+  d <- compare_trait(fx$portal, a, z, "TRAITX")
+  expect_equal(d$status[2:3], c("weak", "missing_in_matrix"))
+  expect_equal(d$informative[1:3], c(TRUE, FALSE, FALSE))
+  weak_portal <- fx$portal
+  weak_portal$se[1] <- 1
+  expect_equal(compare_trait(weak_portal, a, fx$z[, "good"], "TRAITX")$status[1], "weak")
+  expect_null(compare_trait(fx$portal, a, fx$z[, "good"], "NOPE"))
 })
 
 test_that("trait_verdict separates aligned, flipped and scrambled traits", {
   fx <- audit_fixture()
-  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
-  verdict <- function(trait) trait_verdict(call_snp_trait(d, fx$z[, trait]))
+  a <- prepare_alignment(fx$alignment, fx$z)
+  verdict <- function(trait) trait_verdict(compare_trait(fx$portal, a, fx$z[, trait], "TRAITX"))
   good <- verdict("good")
   flipped <- verdict("flipped")
   scrambled <- verdict("scrambled")
   expect_equal(c(good$verdict, flipped$verdict, scrambled$verdict),
                c("PASS", "FLIPPED", "REVIEW"))
-  expect_equal(good$n_informative, 7L)
-  expect_equal(good$concordance, 1)
+  expect_equal(good$n_informative, 8L)
   expect_equal(flipped$concordance, 0)
-  expect_equal(scrambled$n_concordant, 3L)
+  expect_equal(scrambled$n_concordant, 4L)
   expect_lt(flipped$binom_p, 0.05)
-  expect_true(is.na(good$study_differs))
-})
-
-test_that("trait_verdict needs enough informative SNPs and reports same-study agreement", {
+  calls <- compare_trait(fx$portal, a, c(1:8) * 0.5 + 2, "TRAITX")
+  calls$matrix_z <- seq(2, 9)
+  calls$portal_z <- seq(9, 2)
+  expect_lt(trait_verdict(calls)$z_correlation, 0)
   expect_equal(trait_verdict(NULL)$verdict, "INSUFFICIENT")
-  expect_equal(trait_verdict(NULL)$n_informative, 0L)
-  calls <- data.frame(informative = c(TRUE, TRUE, TRUE, TRUE, TRUE, FALSE),
-                      concordant = c(TRUE, TRUE, TRUE, TRUE, FALSE, NA),
-                      same_study = c(TRUE, TRUE, FALSE, FALSE, FALSE, TRUE))
-  v <- trait_verdict(calls, accession = "GCST000009")
-  expect_equal(v$verdict, "PASS")
-  expect_equal(v$concordance, 0.8)
-  expect_equal(v$n_same_study, 2L)
-  expect_equal(v$same_study_concordance, 1)
-  expect_false(v$study_differs)
   expect_equal(trait_verdict(calls[1:4, ])$verdict, "INSUFFICIENT")
-  calls$same_study <- FALSE
-  expect_true(trait_verdict(calls, accession = "GCST000009")$study_differs)
 })
 
 test_that("concordance_plot_svg escapes trait names and skips traits without data", {
@@ -250,72 +192,39 @@ test_that("concordance_plot_svg escapes trait names and skips traits without dat
   expect_match(concordance_plot_svg(s[2, ]), "No trait", fixed = TRUE)
 })
 
-test_that("write_audit_report writes a self-contained page with every trait", {
-  fx <- audit_fixture()
-  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
-  traits <- c("good", "flipped", "scrambled")
-  calls <- lapply(traits, function(t) cbind(trait = t, call_snp_trait(d, fx$z[, t])))
-  summary <- do.call(rbind, lapply(seq_along(traits), function(i) {
-    cbind(trait = traits[i], efo_id = "EFO_0000001", accession = "", reported_trait = "",
-          trait_verdict(calls[[i]]), note = "")
-  }))
-  blank <- cbind(trait = "blank", efo_id = "", accession = "", reported_trait = "",
-                 trait_verdict(NULL), note = "No EFO ID given.")
-  blank$verdict <- "NOT_CHECKED"
-  summary <- rbind(summary, blank)
-  f <- file.path(tempfile(), "report.html")
-  flags <- quietly(write_audit_report(summary, do.call(rbind, calls), f,
-                                      settings = list(min_abs_z = 2, catalog_label = "test.zip")))
-  html <- paste(readLines(f), collapse = "\n")
-  for (t in c(traits, "blank")) expect_match(html, paste0(">", t, "<"), fixed = TRUE)
-  expect_match(html, "<svg", fixed = TRUE)
-  expect_match(html, "<details open>", fixed = TRUE)
-  expect_match(html, "test.zip", fixed = TRUE)
-  expect_false(grepl("<script", html, fixed = TRUE))
-  expect_true(any(grepl("flipped", flags, fixed = TRUE)))
-})
-
 write_lines_tsv <- function(lines) {
   f <- tempfile(fileext = ".tsv")
   writeLines(lines, f)
   f
 }
 
-test_that("read_audit_manifest fills optional columns and validates entries", {
+test_that("read_audit_manifest validates the trait list", {
   traits <- c("good", "flipped")
-  m <- read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tOBA_VT0005416", "flipped\t")),
-                           traits)
-  expect_equal(m$efo_id, c("OBA_VT0005416", ""))
-  expect_equal(m$accession, c("", ""))
-  expect_equal(m$reported_trait, c("", ""))
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "nope\tEFO_1")), traits),
+  m <- read_audit_manifest(write_lines_tsv(c("trait\tkp_phenotype\tsuggestions",
+                                             "good\tHDL\tx", "flipped\t\t")), traits)
+  expect_equal(m$kp_phenotype, c("HDL", ""))
+  expect_named(m, c("trait", "kp_phenotype"))
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tkp_phenotype", "nope\tHDL")), traits),
                "not in the matrix")
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tbad id")), traits),
-               "EFO ID")
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id\taccession",
-                                                     "good\tEFO_1\tXYZ")), traits),
-               "accession")
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id\treported_trait",
-                                                     "good\tEFO_1\t(")), traits),
-               "reported_trait")
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait", "good")), traits), "efo_id")
-  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tEFO_1",
-                                                     "good\tEFO_2")), traits), "Duplicate")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tkp_phenotype", "good\tHDL;LDL")),
+                                   traits), "one Portal phenotype")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tefo_id", "good\tEFO_1")), traits),
+               "kp_phenotype")
+  expect_error(read_audit_manifest(write_lines_tsv(c("trait\tkp_phenotype", "good\tHDL",
+                                                     "good\tLDL")), traits), "Duplicate")
 })
 
 test_that("draft_audit_manifest writes suggestions and never overwrites", {
   out <- tempfile(fileext = ".tsv")
-  catalog <- fake_catalog(
-    cat_row("rs1", "A", uri = efo_uri("EFO_1"), mapped = "waist circumference male"),
-    cat_row("rs2", "A", uri = efo_uri("EFO_2"), mapped = "waist circumference male adjusted")
-  )
-  quietly(draft_audit_manifest(c("Waist circumference_male", "XINSG30"), out, catalog))
+  ph <- data.frame(name = c("WaistC", "WaistCadjBMI"),
+                   description = c("Waist circumference", "Waist circumference adj BMI"),
+                   group = "", stringsAsFactors = FALSE)
+  quietly(draft_audit_manifest(c("Waist circumference_male", "XINSG30"), out, ph))
   m <- utils::read.delim(out, colClasses = "character", na.strings = character(0))
-  expect_equal(names(m), c("trait", "efo_id", "accession", "reported_trait", "suggestions"))
-  expect_equal(m$efo_id, c("EFO_1", ""))
-  expect_equal(m$suggestions[1],
-               "EFO_1 (waist circumference male; 1 Catalog records); EFO_2 (waist circumference male adjusted; 1 Catalog records)")
-  expect_error(draft_audit_manifest("x", out, catalog), "already exists")
+  expect_equal(names(m), c("trait", "kp_phenotype", "suggestions"))
+  expect_equal(m$kp_phenotype, c("WaistC", ""))
+  expect_equal(m$suggestions[1], "WaistC (Waist circumference)")
+  expect_error(draft_audit_manifest("x", out, ph), "already exists")
   expect_equal(nrow(read_audit_manifest(out, c("Waist circumference_male", "XINSG30"))), 2L)
 })
 
@@ -323,20 +232,27 @@ test_that("audit_zscore_alignment labels every trait and writes its outputs", {
   fx <- audit_fixture()
   manifest <- data.frame(
     trait = c("good", "flipped", "scrambled", "unknown", "blank"),
-    efo_id = c("EFO_0000001", "EFO_0000001", "EFO_0000001", "EFO_0000666", ""),
-    accession = "", reported_trait = "", stringsAsFactors = FALSE
+    kp_phenotype = c("TRAITX", "TRAITX", "TRAITX", "NOPE", ""),
+    stringsAsFactors = FALSE
   )
   prefix <- file.path(tempfile(), "audit")
-  res <- quietly(audit_zscore_alignment(fx$z, fx$alignment, manifest, fx$catalog, prefix,
-                                        catalog_label = "test.zip"))
+  res <- quietly(audit_zscore_alignment(fx$z, fx$alignment, manifest, fx$portal, prefix,
+                                        phenotype_names = c("TRAITX", "OTHER"),
+                                        settings = list(ancestry = "EU", failed = "1:999")))
   s <- res$summary
   expect_equal(s$verdict[match(manifest$trait, s$trait)],
                c("PASS", "FLIPPED", "REVIEW", "INSUFFICIENT", "NOT_CHECKED"))
-  expect_match(s$note[s$trait == "unknown"], "not in the Catalog file")
+  expect_match(s$note[s$trait == "unknown"], "not a Portal phenotype")
   for (suffix in c(".csv", "_traits.csv", ".html")) {
     expect_true(file.exists(paste0(prefix, suffix)))
   }
   comp <- utils::read.csv(paste0(prefix, ".csv"))
   expect_equal(sort(unique(comp$trait)), c("flipped", "good", "scrambled"))
-  expect_equal(nrow(comp), 21L)
+  expect_equal(nrow(comp), 24L)
+  html <- paste(readLines(paste0(prefix, ".html")), collapse = "\n")
+  for (t in manifest$trait) expect_match(html, paste0(">", t, "<"), fixed = TRUE)
+  expect_match(html, "<details open>", fixed = TRUE)
+  expect_match(html, "EU analysis", fixed = TRUE)
+  expect_match(html, "could not be fetched", fixed = TRUE)
+  expect_false(grepl("<script", html, fixed = TRUE))
 })

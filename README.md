@@ -51,7 +51,7 @@ Sample input files are provided in `example_data/` to illustrate the expected fo
 * Optimized bNMF runner: `progressr`, `progress`.
 * Post-hoc analysis: `GenomicRanges`, `IRanges`, `rtracklayer`, `openxlsx`, `Homo.sapiens`, `vroom`, `scales`.
 * Stability analysis: `ggplot2`, `pheatmap`, `clue`.
-* Z-score alignment audit: `data.table` (and the `unzip` command to read the Catalog `.zip`).
+* Z-score alignment audit: `httr2` (with `jsonlite`).
 * Tests: `testthat`.
 * Optional helpers: `curl` (rsID map generator); `S4Vectors` (liftover in the formatter); `strex` (one legacy function).
 
@@ -156,8 +156,8 @@ The tests build small synthetic summary statistics files and need no network acc
 #### `qc_report.R` — Per-run QC report
 * **`write_qc_report()`** — Write `QC_report.html`, one self-contained page per run. It opens with a "Things to check" list (assumed effect alleles, low agreement with the primary GWAS, sentinel-level variants removed, traits matched on the opposite strand, sentinels with no trait data, sentinels with no proxy, sentinels that fail the re-check of discovery P, primary-GWAS P and shared risk allele) followed by the tables behind each item. The run script collects the pieces in a list as it goes; sections with no data are left out, so the report can be written part-way through a run and again at the end. The final-variant-set section lists each variant's discovery and primary-GWAS P, and a "Sentinel checks" section re-verifies every sentinel (needs `qc$sentinels` and `qc$main_pvalue_cutoff`). See the header of the script and `main_script_example.R` for the pattern.
 
-#### `audit_zscore_alignment.R` — Allele-alignment audit against the GWAS Catalog
-* Command-line script; see "Checking z-score alignment" below. Checks each trait column of `zmat_preImputed.rds` against genome-wide-significant GWAS Catalog associations, independently of your own summary-statistics files.
+#### `audit_zscore_alignment.R` — Allele-alignment audit against the Knowledge Portal
+* Command-line script; see "Checking z-score alignment" below. Checks each trait column of `zmat_preImputed.rds` against full summary statistics in the Common Metabolic Diseases Knowledge Portal, independently of your own summary-statistics files.
 
 #### `run_bNMF_2025.R` — bNMF clustering
 * **`BayesNMF.L2EU()`** — Core L2-Euclidean Bayesian NMF with ARD prior (auto-selects number of clusters K)
@@ -203,7 +203,7 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `input_qc_trait_gwas.txt` | Per trait: effect-allele rule used and how many variants matched as reported, by strand complement, or not at all |
 | `rsID_map.txt` | Final variant set: VAR_ID, rsID (from LDlink; blank when LD pruning is off), whether it is an original sentinel or a proxy, and the sentinel it stands for |
 | `alignment_GWAS_summStats.csv` | Aligned GWAS summary statistics for final variant set |
-| `zscore_audit.html`, `zscore_audit.csv`, `zscore_audit_traits.csv` | Only when you run the alignment audit: per-trait sign agreement with the GWAS Catalog, and every variant comparison behind it |
+| `zscore_audit.html`, `zscore_audit.csv`, `zscore_audit_traits.csv` | Only when you run the alignment audit: per-trait sign agreement with the Knowledge Portal, and every variant comparison behind it |
 
 ### Stability analysis
 
@@ -219,27 +219,26 @@ The command writes its tables, plots, and consensus matrix to `my_trait_v1_resul
 
 ### Checking z-score alignment
 
-The most likely place for an allele error is the preprocessing of trait summary statistics (for example, using the wrong column as the effect allele), which flips or scrambles a whole trait. `audit_zscore_alignment.R` checks every trait column of `zmat_preImputed.rds` against the NHGRI-EBI GWAS Catalog, so it does not depend on the files that may contain the error. It needs `data.table`; the rsIDs in `alignment_GWAS_summStats.csv` come from LDlink, so LD pruning must have been on.
+The most likely place for an allele error is the preprocessing of trait summary statistics (for example, using the wrong column as the effect allele), which flips or scrambles a whole trait. `audit_zscore_alignment.R` checks every trait column of `zmat_preImputed.rds` against the [Common Metabolic Diseases Knowledge Portal](https://hugeamp.org), which holds full summary statistics (every variant, not only significant hits) for about 1,700 phenotypes, so the check does not depend on the files that may contain the error. It needs `httr2` and network access.
 
-1. Download the Catalog's associations file with ontology annotations (about 70 MB, updated weekly): [`gwas-catalog-associations_ontology-annotated-full.zip`](https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip). Keep it zipped (reading the zip needs the `unzip` command) or pass the unzipped `.tsv`.
-
-2. Draft a manifest with suggested ontology terms for each trait:
+1. Draft a manifest with a suggested Portal phenotype for each trait (a few seconds):
 
    ```sh
-   Rscript scripts/audit_zscore_alignment.R --draft --catalog gwas-catalog-associations_ontology-annotated-full.zip \
-     my_results/zmat_preImputed.rds audit_traits.tsv
+   Rscript scripts/audit_zscore_alignment.R --draft my_results/zmat_preImputed.rds audit_traits.tsv
    ```
 
-3. Review `audit_traits.tsv`. Check each `efo_id` against the `suggestions` column or the [Catalog trait search](https://www.ebi.ac.uk/gwas/): separate several IDs with `;`, and leave a trait blank to skip it. Names the draft cannot guess (study-specific abbreviations such as `DI` or `XINSG30`) are left blank. Optionally add the `accession` (GCST…) of the study you used, and a `reported_trait` regular expression to narrow a broad term, for example to BMI-adjusted analyses.
+2. Review `audit_traits.tsv`. Only the `kp_phenotype` column is read: check it against the `suggestions` column (or the phenotype list on hugeamp.org), and leave it blank to skip a trait. One code per trait.
 
-4. Run the audit:
+3. Run the audit:
 
    ```sh
-   Rscript scripts/audit_zscore_alignment.R --catalog gwas-catalog-associations_ontology-annotated-full.zip \
-     my_results/zmat_preImputed.rds my_results/alignment_GWAS_summStats.csv audit_traits.tsv my_results/zscore_audit
+   Rscript scripts/audit_zscore_alignment.R my_results/zmat_preImputed.rds \
+     my_results/alignment_GWAS_summStats.csv audit_traits.tsv my_results/zscore_audit
    ```
 
-For each trait, the variants with a genome-wide-significant Catalog association (any study; the clustering study is preferred when its accession is given) are compared in sign with the matrix, after orienting the Catalog effect allele to the T2D risk allele. A/T and C/G variants are skipped, and so are variants with matrix |z| < 2 (`--min-abs-z`). A trait is PASS when at least 80% of at least 5 informative variants agree, FLIPPED when at most 20% do, and REVIEW in between. A REVIEW can also mean the ontology term pools a differently defined phenotype; the report's per-trait tables show which variants disagree. The report also flags IDs that are missing from the Catalog file. The Catalog retires and replaces terms, so if a familiar ID is flagged, look the trait up again.
+   The first run looks up every matrix variant in the Portal (one query per variant returns all phenotypes; about 10–20 minutes for 1,000 variants with the default `--workers 4`). Results are cached in `zscore_audit_portal_cache/`, so later runs, including after editing the manifest, take seconds. `--ancestry EU` (or AF, EA, SA, HS) uses the Portal's ancestry-specific analysis instead of its multi-ancestry meta-analysis.
+
+Variants are matched on hg19 position and alleles, so strand-ambiguous variants are included. For each trait, the Portal z-score is expressed for the T2D risk allele and compared in sign with the matrix z-score; a variant counts when both have |z| ≥ 2 (`--min-abs-z`). A trait is PASS when at least 80% of at least 5 informative variants agree, FLIPPED when at most 20% do, and REVIEW in between. The report also gives the correlation between matrix and Portal z-scores. A REVIEW can also mean the Portal phenotype is defined differently from your GWAS (adjustment, sex, ancestry); the report's per-trait tables show which variants disagree. If a trait's input was itself downloaded from the Portal, the check is not independent of it.
 
 ### Contributors
 * Claire Kim (design and code)

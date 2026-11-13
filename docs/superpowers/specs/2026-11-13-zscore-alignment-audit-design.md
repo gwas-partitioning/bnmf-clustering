@@ -2,6 +2,21 @@
 
 Date: 2026-11-13
 
+> **Second revision (2026-11-13): reference switched to the Knowledge Portal.**
+> The Catalog holds only each locus's lead variants, so only a few matrix
+> variants matched exactly for most traits (39 of 94 INSUFFICIENT on the
+> T2DGGI matrix). The audit now queries the Common Metabolic Diseases
+> Knowledge Portal BioIndex (`phewas-associations`, or
+> `ancestry-phewas-associations` with `--ancestry`) once per matrix variant by
+> hg19 `chr:pos:A1:A2` (beta is for A2; the other allele order is tried when
+> the first returns nothing), which returns beta/SE/P/N for every Portal
+> phenotype. Results are cached per variant. The manifest is `trait`,
+> `kp_phenotype` (one Portal code). A variant is informative when both
+> |z| >= 2; strand-ambiguous variants are included, since positions and
+> alleles match exactly on one build. Verdict thresholds are unchanged; the
+> report adds the matrix-versus-Portal z correlation. The Catalog notes below
+> are historical.
+>
 > **Revision (2026-11-13, during implementation):** the REST API v2 proved too
 > slow for whole-trait queries (about 45 s per page of 500; BMI alone about
 > 40 minutes). The audit instead reads the Catalog's bulk file
