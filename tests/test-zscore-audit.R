@@ -207,3 +207,37 @@ test_that("call_snp_trait prefers the clustering study and flags conflicts", {
   expect_equal(call_snp_trait(d, z)$status[3], "missing_in_matrix")
   expect_null(call_snp_trait(d[0, ], z))
 })
+
+test_that("trait_verdict separates aligned, flipped and scrambled traits", {
+  fx <- audit_fixture()
+  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
+  verdict <- function(trait) trait_verdict(call_snp_trait(d, fx$z[, trait]))
+  good <- verdict("good")
+  flipped <- verdict("flipped")
+  scrambled <- verdict("scrambled")
+  expect_equal(c(good$verdict, flipped$verdict, scrambled$verdict),
+               c("PASS", "FLIPPED", "REVIEW"))
+  expect_equal(good$n_informative, 7L)
+  expect_equal(good$concordance, 1)
+  expect_equal(flipped$concordance, 0)
+  expect_equal(scrambled$n_concordant, 3L)
+  expect_lt(flipped$binom_p, 0.05)
+  expect_true(is.na(good$study_differs))
+})
+
+test_that("trait_verdict needs enough informative SNPs and reports same-study agreement", {
+  expect_equal(trait_verdict(NULL)$verdict, "INSUFFICIENT")
+  expect_equal(trait_verdict(NULL)$n_informative, 0L)
+  calls <- data.frame(informative = c(TRUE, TRUE, TRUE, TRUE, TRUE, FALSE),
+                      concordant = c(TRUE, TRUE, TRUE, TRUE, FALSE, NA),
+                      same_study = c(TRUE, TRUE, FALSE, FALSE, FALSE, TRUE))
+  v <- trait_verdict(calls, accession = "GCST000009")
+  expect_equal(v$verdict, "PASS")
+  expect_equal(v$concordance, 0.8)
+  expect_equal(v$n_same_study, 2L)
+  expect_equal(v$same_study_concordance, 1)
+  expect_false(v$study_differs)
+  expect_equal(trait_verdict(calls[1:4, ])$verdict, "INSUFFICIENT")
+  calls$same_study <- FALSE
+  expect_true(trait_verdict(calls, accession = "GCST000009")$study_differs)
+})

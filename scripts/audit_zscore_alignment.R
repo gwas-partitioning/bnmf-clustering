@@ -242,3 +242,37 @@ call_snp_trait <- function(aligned, z_values, min_abs_z = 2) {
   rownames(calls) <- NULL
   calls
 }
+
+AUDIT_VERDICT_ORDER <- c("FLIPPED", "REVIEW", "LOOKUP_ERROR", "INSUFFICIENT",
+                         "PASS", "NOT_CHECKED")
+
+trait_verdict <- function(calls, accession = "", min_n = 5L, pass_at = 0.8,
+                          flip_at = 0.2) {
+  informative <- if (is.null(calls)) logical(0) else calls$informative
+  n <- sum(informative)
+  k <- if (n) sum(calls$concordant[informative]) else 0L
+  concordance <- if (n) k / n else NA_real_
+  same <- if (n) informative & calls$same_study else logical(0)
+  n_same <- sum(same)
+  verdict <- if (n < min_n) {
+    "INSUFFICIENT"
+  } else if (concordance >= pass_at) {
+    "PASS"
+  } else if (concordance <= flip_at) {
+    "FLIPPED"
+  } else {
+    "REVIEW"
+  }
+  data.frame(
+    verdict = verdict,
+    n_catalog_snps = if (is.null(calls)) 0L else nrow(calls),
+    n_informative = n,
+    n_concordant = k,
+    concordance = concordance,
+    binom_p = if (n) stats::binom.test(k, n)$p.value else NA_real_,
+    n_same_study = n_same,
+    same_study_concordance = if (n_same) mean(calls$concordant[same]) else NA_real_,
+    study_differs = if (nzchar(accession)) n_same == 0L else NA,
+    stringsAsFactors = FALSE
+  )
+}
