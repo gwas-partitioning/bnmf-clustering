@@ -276,3 +276,166 @@ trait_verdict <- function(calls, accession = "", min_n = 5L, pass_at = 0.8,
     stringsAsFactors = FALSE
   )
 }
+
+AUDIT_COLORS <- c(PASS = "#2f7d4f", REVIEW = "#b26b00", FLIPPED = "#b3261e")
+
+audit_setting <- function(settings, name, default) {
+  if (is.null(settings[[name]])) default else settings[[name]]
+}
+
+concordance_plot_svg <- function(summary) {
+  # Dot plot: one row per trait with informative SNPs, x = share concordant,
+  # dot area grows with the number of informative SNPs.
+  s <- summary[summary$n_informative > 0 & is.finite(summary$concordance), , drop = FALSE]
+  if (!nrow(s)) return("<p class=\"muted\">No trait had informative SNPs to plot.</p>")
+  s <- s[order(s$concordance, s$trait), , drop = FALSE]
+  left <- 240; plot_w <- 480; right <- 60; top <- 16; row_h <- 18
+  width <- left + plot_w + right
+  bottom <- top + nrow(s) * row_h
+  height <- bottom + 40
+  f <- function(v) formatC(v, format = "f", digits = 1)
+  x <- function(v) left + v * plot_w
+  y <- top + (seq_len(nrow(s)) - 0.5) * row_h
+  r <- pmin(8, 2.5 + sqrt(s$n_informative) / 1.5)
+  col <- unname(AUDIT_COLORS[s$verdict])
+  col[is.na(col)] <- "#7a8794"
+  ticks <- c(0, 0.2, 0.5, 0.8, 1)
+  paste(c(
+    sprintf(paste0('<svg viewBox="0 0 %d %s" width="100%%" role="img" ',
+                   'aria-label="Sign concordance by trait" ',
+                   'style="max-width:%dpx;font-size:11px;font-family:inherit">'),
+            width, f(height), width),
+    sprintf('<rect x="%s" y="%d" width="%s" height="%s" fill="#b3261e" fill-opacity="0.08"/>',
+            f(x(0)), top, f(0.2 * plot_w), f(bottom - top)),
+    sprintf('<rect x="%s" y="%d" width="%s" height="%s" fill="#b26b00" fill-opacity="0.07"/>',
+            f(x(0.2)), top, f(0.6 * plot_w), f(bottom - top)),
+    sprintf(paste0('<line x1="%1$s" x2="%1$s" y1="%2$d" y2="%3$s" stroke="#c9ced8"/>',
+                   '<text x="%1$s" y="%4$s" text-anchor="middle" fill="#6a7486">%5$s</text>'),
+            f(x(ticks)), top, f(bottom), f(bottom + 14), format(ticks)),
+    sprintf(paste0('<text x="%s" y="%s" text-anchor="middle" fill="#3b4658">',
+                   'Share of informative SNPs whose matrix sign matches the Catalog</text>'),
+            f(x(0.5)), f(bottom + 32)),
+    sprintf('<text x="%d" y="%s" text-anchor="end" dominant-baseline="middle" fill="#1c2330">%s</text>',
+            left - 8, f(y), qc_html_escape(s$trait)),
+    sprintf('<circle cx="%s" cy="%s" r="%s" fill="%s"><title>%s: %d of %d concordant (%s)</title></circle>',
+            f(x(s$concordance)), f(y), f(r), col, qc_html_escape(s$trait),
+            as.integer(s$n_concordant), as.integer(s$n_informative), s$verdict),
+    sprintf('<text x="%s" y="%s" dominant-baseline="middle" fill="#6a7486">n=%d</text>',
+            f(x(1) + 12), f(y), as.integer(s$n_informative)),
+    "</svg>"
+  ), collapse = "\n")
+}
+
+write_audit_report <- function(summary, comparisons, file, settings = list()) {
+  if (!exists("qc_html_table", mode = "function")) {
+    stop("Source scripts/qc_report.R before writing the audit report.")
+  }
+  min_abs_z <- audit_setting(settings, "min_abs_z", 2)
+  p_threshold <- audit_setting(settings, "p_threshold", AUDIT_GWS_P)
+  summary <- summary[order(match(summary$verdict, AUDIT_VERDICT_ORDER), summary$trait), ,
+                     drop = FALSE]
+  count <- table(factor(summary$verdict, levels = AUDIT_VERDICT_ORDER))
+  traits_with <- function(v) qc_name_list(summary$trait[summary$verdict == v])
+
+  flags <- character(0)
+  if (count[["FLIPPED"]] > 0) flags <- c(flags, sprintf(
+    "%d trait(s) look flipped: the matrix sign disagrees with the Catalog at most informative SNPs (%s). Check which column was used as the effect allele when these GWAS were formatted.",
+    count[["FLIPPED"]], traits_with("FLIPPED")))
+  if (count[["REVIEW"]] > 0) flags <- c(flags, sprintf(
+    "%d trait(s) have mixed agreement (%s). Possible causes: a partial allele mix-up, or an EFO term that pools a differently defined phenotype (for example adjusted and unadjusted). Their SNP tables are open below.",
+    count[["REVIEW"]], traits_with("REVIEW")))
+  if (count[["LOOKUP_ERROR"]] > 0) flags <- c(flags, sprintf(
+    "The Catalog lookup failed for %d trait(s) (%s); rerun to retry.",
+    count[["LOOKUP_ERROR"]], traits_with("LOOKUP_ERROR")))
+  differs <- summary$trait[summary$verdict %in% c("PASS", "REVIEW", "FLIPPED") &
+                             summary$study_differs %in% TRUE]
+  if (length(differs)) flags <- c(flags, sprintf(
+    "No informative Catalog record came from the clustering study for: %s. Their verdicts rest on other studies of the trait.",
+    qc_name_list(differs)))
+
+  check_block <- if (length(flags)) {
+    paste0("<div class=\"checks\"><h2>Things to check</h2><ul>",
+           paste0("<li>", qc_html_escape(flags), "</li>", collapse = ""), "</ul></div>")
+  } else {
+    "<div class=\"checks ok\"><h2>Things to check</h2><p>No flags were raised.</p></div>"
+  }
+
+  summary_cols <- c("trait", "verdict", "n_informative", "n_concordant", "concordance",
+                    "binom_p", "n_catalog_snps", "n_same_study", "same_study_concordance",
+                    "study_differs", "efo_id", "accession", "reported_trait", "note")
+  detail_cols <- c("rsID", "ChrPos", "REF", "ALT", "Risk_Allele", "effect_allele",
+                   "strand_complemented", "catalog_direction", "expected_sign", "matrix_z",
+                   "status", "p_value", "accession", "same_study", "association_id",
+                   "reported_trait")
+  details <- vapply(seq_len(nrow(summary)), function(i) {
+    s <- summary[i, ]
+    rows <- if (is.null(comparisons)) NULL else comparisons[comparisons$trait == s$trait, , drop = FALSE]
+    if (is.null(rows) || !nrow(rows)) return("")
+    sprintf("<details%s><summary><strong>%s</strong> &middot; %s (%d of %d informative SNPs concordant)</summary>%s</details>",
+            if (s$verdict %in% c("FLIPPED", "REVIEW")) " open" else "",
+            qc_html_escape(s$trait), s$verdict, as.integer(s$n_concordant),
+            as.integer(s$n_informative), qc_html_table(rows[detail_cols], max_rows = 500L))
+  }, character(1))
+
+  meta <- sprintf("%s variants &times; %s traits &middot; generated %s",
+                  audit_setting(settings, "n_variants", "?"),
+                  audit_setting(settings, "n_traits", nrow(summary)),
+                  format(Sys.time(), "%Y-%m-%d %H:%M"))
+  counts_line <- paste(sprintf("%s: %d", names(count), as.integer(count)), collapse = " &middot; ")
+  methods <- sprintf(paste(
+    "<p>For each trait, every GWAS Catalog association annotated with the trait's EFO term(s) was taken from any study,",
+    "keeping single-SNP records with P &le; %s and a stated direction (an odds ratio, or a beta described as an increase or decrease).",
+    "Records were matched to matrix variants by rsID. A/T and C/G variants were excluded; an effect allele matching only the",
+    "complement of REF/ALT was read on the opposite strand. Each record's direction was expressed for the T2D risk allele.</p>",
+    "<p>Each variant gets one call: the smallest-P record from the clustering study when its accession is given and present,",
+    "otherwise from any study. When those records disagree in direction the call is a Catalog conflict and is not counted.",
+    "A call is informative when the matrix |z| &ge; %s. Verdicts need at least 5 informative variants: PASS when at least 80%%",
+    "agree in sign, FLIPPED when at most 20%% do, REVIEW in between. The binomial P tests agreement against 50%%.</p>",
+    "<p>Limitations: an EFO term can pool related phenotypes whose directions differ (adjusted versus unadjusted, sex-specific);",
+    "the reported_trait filter narrows a term. Catalog records are curated top hits, so traits with few significant loci among",
+    "these variants may be INSUFFICIENT. Only the sign is checked, not the magnitude.</p>"),
+    format(p_threshold), format(min_abs_z))
+
+  css <- paste(
+    "body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1c2330;}",
+    "main{max-width:1100px;margin:0 auto;padding:24px 16px 64px;}",
+    "h1{font-size:24px;margin:8px 0 4px;} h2{font-size:18px;margin:32px 0 8px;}",
+    "p{line-height:1.5;margin:6px 0;} .muted{color:#6a7486;font-size:13px;}",
+    ".meta{color:#6a7486;font-size:13px;margin-bottom:16px;}",
+    ".checks{background:#fff7e6;border:1px solid #f0c36d;border-radius:8px;padding:4px 16px 12px;}",
+    ".checks.ok{background:#eef8f0;border-color:#9fd3aa;} .checks h2{margin-top:12px;} .checks li{margin:6px 0;line-height:1.45;}",
+    ".tablewrap{overflow-x:auto;background:#fff;border:1px solid #dfe3ea;border-radius:8px;}",
+    "table{border-collapse:collapse;width:100%;font-size:13px;}",
+    "th,td{padding:6px 10px;border-bottom:1px solid #eceff4;text-align:left;white-space:nowrap;}",
+    "th{background:#f0f2f6;font-weight:600;} tr:last-child td{border-bottom:none;}",
+    ".num{text-align:right;font-variant-numeric:tabular-nums;}",
+    "details{margin:8px 0;} summary{cursor:pointer;padding:4px 0;}",
+    ".plot{background:#fff;border:1px solid #dfe3ea;border-radius:8px;padding:12px;}",
+    sep = "\n"
+  )
+  html <- c(
+    "<!DOCTYPE html>",
+    "<html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "<title>Z-score alignment audit</title>",
+    paste0("<style>", css, "</style></head><body><main>"),
+    "<h1>Z-score alignment audit</h1>",
+    paste0("<div class=\"meta\">", meta, "</div>"),
+    check_block,
+    "<h2>Results by trait</h2>",
+    paste0("<p class=\"muted\">", counts_line, "</p>"),
+    qc_html_table(summary[summary_cols], max_rows = 1000L),
+    "<h2>Sign concordance by trait</h2>",
+    paste0("<div class=\"plot\">", concordance_plot_svg(summary), "</div>"),
+    "<p class=\"muted\">Red band: at most 20% agree (FLIPPED). Amber band: 20&ndash;80% (REVIEW).</p>",
+    "<h2>Variant calls by trait</h2>",
+    details[nzchar(details)],
+    "<h2>Method</h2>",
+    methods,
+    "</main></body></html>"
+  )
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  writeLines(html, file, useBytes = TRUE)
+  message(sprintf("Audit report written to %s (%d item(s) to check).", file, length(flags)))
+  invisible(flags)
+}

@@ -241,3 +241,37 @@ test_that("trait_verdict needs enough informative SNPs and reports same-study ag
   calls$same_study <- FALSE
   expect_true(trait_verdict(calls, accession = "GCST000009")$study_differs)
 })
+
+test_that("concordance_plot_svg escapes trait names and skips traits without data", {
+  s <- data.frame(trait = c("A<B", "none"), verdict = c("PASS", "INSUFFICIENT"),
+                  n_informative = c(10L, 0L), n_concordant = c(9L, 0L),
+                  concordance = c(0.9, NA))
+  svg <- concordance_plot_svg(s)
+  expect_match(svg, "A&lt;B", fixed = TRUE)
+  expect_false(grepl(">none<", svg, fixed = TRUE))
+  expect_match(concordance_plot_svg(s[2, ]), "No trait", fixed = TRUE)
+})
+
+test_that("write_audit_report writes a self-contained page with every trait", {
+  fx <- audit_fixture()
+  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
+  traits <- c("good", "flipped", "scrambled")
+  calls <- lapply(traits, function(t) cbind(trait = t, call_snp_trait(d, fx$z[, t])))
+  summary <- do.call(rbind, lapply(seq_along(traits), function(i) {
+    cbind(trait = traits[i], efo_id = "EFO_0000001", accession = "", reported_trait = "",
+          trait_verdict(calls[[i]]), note = "")
+  }))
+  blank <- cbind(trait = "blank", efo_id = "", accession = "", reported_trait = "",
+                 trait_verdict(NULL), note = "No EFO ID given.")
+  blank$verdict <- "NOT_CHECKED"
+  summary <- rbind(summary, blank)
+  f <- file.path(tempfile(), "report.html")
+  flags <- quietly(write_audit_report(summary, do.call(rbind, calls), f,
+                                      settings = list(min_abs_z = 2)))
+  html <- paste(readLines(f), collapse = "\n")
+  for (t in c(traits, "blank")) expect_match(html, paste0(">", t, "<"), fixed = TRUE)
+  expect_match(html, "<svg", fixed = TRUE)
+  expect_match(html, "<details open>", fixed = TRUE)
+  expect_false(grepl("<script", html, fixed = TRUE))
+  expect_true(any(grepl("flipped", flags, fixed = TRUE)))
+})
