@@ -51,6 +51,7 @@ Sample input files are provided in `example_data/` to illustrate the expected fo
 * Optimized bNMF runner: `progressr`, `progress`.
 * Post-hoc analysis: `GenomicRanges`, `IRanges`, `rtracklayer`, `openxlsx`, `Homo.sapiens`, `vroom`, `scales`.
 * Stability analysis: `ggplot2`, `pheatmap`, `clue`.
+* Z-score alignment audit: `data.table` (and the `unzip` command to read the Catalog `.zip`).
 * Tests: `testthat`.
 * Optional helpers: `curl` (rsID map generator); `S4Vectors` (liftover in the formatter); `strex` (one legacy function).
 
@@ -122,7 +123,7 @@ Two P-values are carried for every variant, in separately named columns. There i
 Rscript tests/run_tests.R
 ```
 
-The tests build small synthetic summary statistics files and need no network access or LDlink token (LDlink is replaced by a stand-in that writes the same file format). They cover the effect-allele rule, matching across allele orders and strands, the primary-GWAS filters and their reasons, the trait fetch with one or several workers, the proxy stage, and the QC report.
+The tests build small synthetic summary statistics files and need no network access or LDlink token (LDlink is replaced by a stand-in that writes the same file format). They cover the effect-allele rule, matching across allele orders and strands, the primary-GWAS filters and their reasons, the trait fetch with one or several workers, the proxy stage, the QC report, and the z-score alignment audit.
 
 ### Upgrading a run script written for an earlier version
 
@@ -154,6 +155,9 @@ The tests build small synthetic summary statistics files and need no network acc
 
 #### `qc_report.R` — Per-run QC report
 * **`write_qc_report()`** — Write `QC_report.html`, one self-contained page per run. It opens with a "Things to check" list (assumed effect alleles, low agreement with the primary GWAS, sentinel-level variants removed, traits matched on the opposite strand, sentinels with no trait data, sentinels with no proxy, sentinels that fail the re-check of discovery P, primary-GWAS P and shared risk allele) followed by the tables behind each item. The run script collects the pieces in a list as it goes; sections with no data are left out, so the report can be written part-way through a run and again at the end. The final-variant-set section lists each variant's discovery and primary-GWAS P, and a "Sentinel checks" section re-verifies every sentinel (needs `qc$sentinels` and `qc$main_pvalue_cutoff`). See the header of the script and `main_script_example.R` for the pattern.
+
+#### `audit_zscore_alignment.R` — Allele-alignment audit against the GWAS Catalog
+* Command-line script; see "Checking z-score alignment" below. Checks each trait column of `zmat_preImputed.rds` against genome-wide-significant GWAS Catalog associations, independently of your own summary-statistics files.
 
 #### `run_bNMF_2025.R` — bNMF clustering
 * **`BayesNMF.L2EU()`** — Core L2-Euclidean Bayesian NMF with ARD prior (auto-selects number of clusters K)
@@ -199,6 +203,7 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `input_qc_trait_gwas.txt` | Per trait: effect-allele rule used and how many variants matched as reported, by strand complement, or not at all |
 | `rsID_map.txt` | Final variant set: VAR_ID, rsID (from LDlink; blank when LD pruning is off), whether it is an original sentinel or a proxy, and the sentinel it stands for |
 | `alignment_GWAS_summStats.csv` | Aligned GWAS summary statistics for final variant set |
+| `zscore_audit.html`, `zscore_audit.csv`, `zscore_audit_traits.csv` | Only when you run the alignment audit: per-trait sign agreement with the GWAS Catalog, and every variant comparison behind it |
 
 ### Stability analysis
 
@@ -211,6 +216,30 @@ Rscript scripts/assess_bNMF_stability.R my_trait_v1_results
 The command writes its tables, plots, and consensus matrix to `my_trait_v1_results/stability_analysis/` by default.
 
 ---
+
+### Checking z-score alignment
+
+The most likely place for an allele error is the preprocessing of trait summary statistics (for example, using the wrong column as the effect allele), which flips or scrambles a whole trait. `audit_zscore_alignment.R` checks every trait column of `zmat_preImputed.rds` against the NHGRI-EBI GWAS Catalog, so it does not depend on the files that may contain the error. It needs `data.table`; the rsIDs in `alignment_GWAS_summStats.csv` come from LDlink, so LD pruning must have been on.
+
+1. Download the Catalog's associations file with ontology annotations (about 70 MB, updated weekly): [`gwas-catalog-associations_ontology-annotated-full.zip`](https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest/gwas-catalog-associations_ontology-annotated-full.zip). Keep it zipped (reading the zip needs the `unzip` command) or pass the unzipped `.tsv`.
+
+2. Draft a manifest with suggested ontology terms for each trait:
+
+   ```sh
+   Rscript scripts/audit_zscore_alignment.R --draft --catalog gwas-catalog-associations_ontology-annotated-full.zip \
+     my_results/zmat_preImputed.rds audit_traits.tsv
+   ```
+
+3. Review `audit_traits.tsv`. Check each `efo_id` against the `suggestions` column or the [Catalog trait search](https://www.ebi.ac.uk/gwas/): separate several IDs with `;`, and leave a trait blank to skip it. Names the draft cannot guess (study-specific abbreviations such as `DI` or `XINSG30`) are left blank. Optionally add the `accession` (GCST…) of the study you used, and a `reported_trait` regular expression to narrow a broad term, for example to BMI-adjusted analyses.
+
+4. Run the audit:
+
+   ```sh
+   Rscript scripts/audit_zscore_alignment.R --catalog gwas-catalog-associations_ontology-annotated-full.zip \
+     my_results/zmat_preImputed.rds my_results/alignment_GWAS_summStats.csv audit_traits.tsv my_results/zscore_audit
+   ```
+
+For each trait, the variants with a genome-wide-significant Catalog association (any study; the clustering study is preferred when its accession is given) are compared in sign with the matrix, after orienting the Catalog effect allele to the T2D risk allele. A/T and C/G variants are skipped, and so are variants with matrix |z| < 2 (`--min-abs-z`). A trait is PASS when at least 80% of at least 5 informative variants agree, FLIPPED when at most 20% do, and REVIEW in between. A REVIEW can also mean the ontology term pools a differently defined phenotype; the report's per-trait tables show which variants disagree. The report also flags IDs that are missing from the Catalog file. The Catalog retires and replaces terms, so if a familiar ID is flagged, look the trait up again.
 
 ### Contributors
 * Claire Kim (design and code)
