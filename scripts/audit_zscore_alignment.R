@@ -85,3 +85,71 @@ parse_catalog_associations <- function(associations) {
     stringsAsFactors = FALSE
   )
 }
+
+catalog_get_page <- function(url) {
+  if (!requireNamespace("httr2", quietly = TRUE)) {
+    stop("Install the httr2 package to query the GWAS Catalog.")
+  }
+  httr2::request(url) |>
+    httr2::req_user_agent("bnmf_clustering z-score audit") |>
+    httr2::req_timeout(60) |>
+    httr2::req_retry(max_tries = 4) |>
+    httr2::req_perform() |>
+    httr2::resp_body_json()
+}
+
+catalog_associations_url <- function(efo_id, page, page_size = 500L) {
+  sprintf("%s/associations?efo_id=%s&size=%d&page=%d",
+          CATALOG_API, efo_id, as.integer(page_size), as.integer(page))
+}
+
+catalog_fetch_efo <- function(efo_id, cache_dir = NULL, get_page = catalog_get_page,
+                              page_size = 500L) {
+  # Every Catalog association annotated with one EFO term, cached as RDS.
+  if (!grepl("^[A-Za-z]+_[0-9]+$", efo_id)) stop("Invalid EFO ID: ", efo_id)
+  cache_file <- if (!is.null(cache_dir)) file.path(cache_dir, paste0(efo_id, ".rds"))
+  if (!is.null(cache_file) && file.exists(cache_file)) return(readRDS(cache_file))
+
+  pages <- list()
+  page <- 0L
+  repeat {
+    response <- get_page(catalog_associations_url(efo_id, page, page_size))
+    total <- response$page$totalPages
+    if (is.null(total)) stop("Unexpected GWAS Catalog response for ", efo_id)
+    pages[[length(pages) + 1L]] <-
+      parse_catalog_associations(response[["_embedded"]]$associations)
+    page <- page + 1L
+    if (total > 1L) message(sprintf("  %s: page %d of %d", efo_id, page, total))
+    if (page >= total) break
+  }
+  out <- do.call(rbind, pages)
+  out <- out[!duplicated(out$association_id), , drop = FALSE]
+  rownames(out) <- NULL
+  if (!is.null(cache_file)) {
+    dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+    saveRDS(out, cache_file)
+  }
+  out
+}
+
+catalog_search_efo <- function(query, get_page = catalog_get_page, n = 3L) {
+  # Up to n EFO terms whose label matches query, best first: exact label,
+  # "<query> measurement", labels starting with the query, other
+  # "measurement" terms, then the rest; shorter labels first within a tier.
+  url <- sprintf("%s/efo-traits?trait=%s&size=50", CATALOG_API,
+                 utils::URLencode(query, reserved = TRUE))
+  hits <- get_page(url)[["_embedded"]]$efo_traits
+  if (!length(hits)) {
+    return(data.frame(efo_id = character(0), efo_trait = character(0)))
+  }
+  id <- vapply(hits, function(h) catalog_scalar(h$efo_id, "character"), character(1))
+  label <- vapply(hits, function(h) catalog_scalar(h$efo_trait, "character"), character(1))
+  q <- tolower(query)
+  l <- tolower(label)
+  tier <- ifelse(l == q, 0L,
+          ifelse(l == paste(q, "measurement"), 1L,
+          ifelse(startsWith(l, q), 2L,
+          ifelse(grepl("measurement", l, fixed = TRUE), 3L, 4L))))
+  ord <- order(tier, nchar(label))
+  utils::head(data.frame(efo_id = id[ord], efo_trait = label[ord]), n)
+}

@@ -51,3 +51,63 @@ test_that("parse_catalog_associations handles nulls and empty input", {
   expect_equal(nrow(empty), 0L)
   expect_named(empty, names(d))
 })
+
+fake_api <- function(pages) {
+  env <- new.env()
+  env$calls <- character(0)
+  env$get <- function(url) {
+    env$calls <- c(env$calls, url)
+    if (!url %in% names(pages)) stop("unexpected URL: ", url)
+    pages[[url]]
+  }
+  env
+}
+
+assoc_page <- function(assocs, total) {
+  list(`_embedded` = list(associations = assocs), page = list(totalPages = total))
+}
+
+test_that("catalog_fetch_efo reads every page and caches the result", {
+  api <- fake_api(setNames(
+    list(assoc_page(list(fake_assoc(1, "rs1", "A"), fake_assoc(2, "rs2", "G")), 2),
+         assoc_page(list(fake_assoc(2, "rs2", "G"), fake_assoc(3, "rs3", "C")), 2)),
+    c(catalog_associations_url("EFO_0000001", 0), catalog_associations_url("EFO_0000001", 1))
+  ))
+  cache <- file.path(tempfile(), "cache")
+  d <- quietly(catalog_fetch_efo("EFO_0000001", cache_dir = cache, get_page = api$get))
+  expect_equal(d$association_id, c("1", "2", "3"))
+  expect_length(api$calls, 2L)
+  again <- catalog_fetch_efo("EFO_0000001", cache_dir = cache, get_page = api$get)
+  expect_identical(again, d)
+  expect_length(api$calls, 2L)
+})
+
+test_that("catalog_fetch_efo returns no rows for an unknown term", {
+  api <- fake_api(setNames(list(list(page = list(totalPages = 0))),
+                           catalog_associations_url("EFO_0000002", 0)))
+  expect_equal(nrow(catalog_fetch_efo("EFO_0000002", get_page = api$get)), 0L)
+})
+
+test_that("catalog_fetch_efo rejects malformed IDs and responses", {
+  expect_error(catalog_fetch_efo("EFO 1&x=2", get_page = function(url) stop("no call")),
+               "Invalid EFO ID")
+  api <- fake_api(setNames(list(list(oops = TRUE)), catalog_associations_url("EFO_0000003", 0)))
+  expect_error(catalog_fetch_efo("EFO_0000003", get_page = api$get),
+               "Unexpected GWAS Catalog response")
+})
+
+test_that("catalog_search_efo ranks exact and measurement labels first", {
+  hits <- list(`_embedded` = list(efo_traits = list(
+    list(efo_id = "HP_1", efo_trait = "Decreased HDL concentration"),
+    list(efo_id = "EFO_2", efo_trait = "high density lipoprotein cholesterol measurement"),
+    list(efo_id = "EFO_3", efo_trait = "HDL")
+  )))
+  d <- catalog_search_efo("HDL", get_page = function(url) {
+    expect_match(url, "efo-traits?trait=HDL&", fixed = TRUE)
+    hits
+  })
+  expect_equal(d$efo_id, c("EFO_3", "EFO_2", "HP_1"))
+  none <- catalog_search_efo("zzz", get_page = function(url) list(page = list(totalPages = 0)))
+  expect_equal(nrow(none), 0L)
+  expect_named(none, c("efo_id", "efo_trait"))
+})
