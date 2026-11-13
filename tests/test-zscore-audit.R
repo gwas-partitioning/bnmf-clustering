@@ -314,7 +314,7 @@ test_that("draft_audit_manifest writes suggestions and never overwrites", {
   expect_equal(names(m), c("trait", "efo_id", "accession", "reported_trait", "suggestions"))
   expect_equal(m$efo_id, c("EFO_1", ""))
   expect_equal(m$suggestions[1],
-               "EFO_1 (waist circumference male, n=1); EFO_2 (waist circumference male adjusted, n=1)")
+               "EFO_1 (waist circumference male; 1 Catalog records); EFO_2 (waist circumference male adjusted; 1 Catalog records)")
   expect_error(draft_audit_manifest("x", out, catalog), "already exists")
   expect_equal(nrow(read_audit_manifest(out, c("Waist circumference_male", "XINSG30"))), 2L)
 })

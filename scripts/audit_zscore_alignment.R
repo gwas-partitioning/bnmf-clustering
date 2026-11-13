@@ -578,7 +578,7 @@ draft_audit_manifest <- function(traits, out_file, catalog) {
       trait = trait,
       efo_id = if (found) hits$efo_id[1] else "",
       accession = "", reported_trait = "",
-      suggestions = if (found) paste(sprintf("%s (%s, n=%d)", hits$efo_id, hits$efo_trait, hits$n),
+      suggestions = if (found) paste(sprintf("%s (%s; %d Catalog records)", hits$efo_id, hits$efo_trait, hits$n),
                                      collapse = "; ") else "",
       stringsAsFactors = FALSE
     )
