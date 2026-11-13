@@ -111,3 +111,99 @@ test_that("catalog_search_efo ranks exact and measurement labels first", {
   expect_equal(nrow(none), 0L)
   expect_named(none, c("efo_id", "efo_trait"))
 })
+
+audit_fixture <- function() {
+  # Eight matrix variants. rs7 is A/T (palindromic). Every Catalog record
+  # below implies +1 for the T2D risk allele, reached in different ways.
+  alignment <- data.frame(
+    ChrPos = paste0("1:", 1:8 * 100),
+    rsID = paste0("rs", 1:8),
+    REF = c("A", "C", "A", "G", "A", "C", "A", "G"),
+    ALT = c("G", "T", "C", "T", "G", "A", "T", "A"),
+    Risk_Allele = c("G", "C", "A", "T", "A", "A", "T", "G"),
+    stringsAsFactors = FALSE
+  )
+  records <- list(
+    fake_assoc(1, "rs1", "G"),                                # risk allele, increase
+    fake_assoc(2, "rs2", "T", beta = "0.2 unit decrease"),    # non-risk, decrease
+    fake_assoc(3, "rs3", "T"),                                # complement of risk A
+    fake_assoc(4, "rs4", "T", beta = "-", or = 1.2),          # risk, OR > 1
+    fake_assoc(5, "rs5", "G", beta = "-", or = 0.9),          # non-risk, OR < 1
+    fake_assoc(6, "rs6", "A"),
+    fake_assoc(7, "rs7", "T"),                                # palindromic: dropped
+    fake_assoc(8, "rs8", "G")
+  )
+  z <- cbind(good = rep(5, 8), flipped = rep(-5, 8),
+             scrambled = c(5, -5, 5, -5, 5, -5, 5, -5),
+             lookup = rep(5, 8), blank = rep(5, 8))
+  rownames(z) <- alignment$ChrPos
+  list(alignment = alignment, records = records,
+       catalog = parse_catalog_associations(records), z = z)
+}
+
+test_that("prepare_alignment orders rows like the matrix and flags palindromes", {
+  fx <- audit_fixture()
+  a <- prepare_alignment(fx$alignment[8:1, ], fx$z)
+  expect_equal(a$ChrPos, rownames(fx$z))
+  expect_equal(a$palindromic, c(rep(FALSE, 6), TRUE, FALSE))
+})
+
+test_that("prepare_alignment rejects missing rows, bad risk alleles and absent rsIDs", {
+  fx <- audit_fixture()
+  expect_error(prepare_alignment(fx$alignment[-1, ], fx$z), "no alignment row")
+  bad <- fx$alignment
+  bad$Risk_Allele[1] <- "C"
+  expect_error(prepare_alignment(bad, fx$z), "Risk_Allele")
+  no_rsid <- fx$alignment
+  no_rsid$rsID <- ""
+  expect_error(prepare_alignment(no_rsid, fx$z), "rsID")
+})
+
+test_that("align_catalog_to_matrix orients every record to the T2D risk allele", {
+  fx <- audit_fixture()
+  d <- align_catalog_to_matrix(fx$catalog, prepare_alignment(fx$alignment, fx$z))
+  expect_equal(d$rsID, c("rs1", "rs2", "rs3", "rs4", "rs5", "rs6", "rs8"))
+  expect_true(all(d$expected_sign == 1))
+  expect_equal(d$strand_complemented, c(FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE))
+})
+
+test_that("align_catalog_to_matrix applies the P, allele and reported-trait filters", {
+  fx <- audit_fixture()
+  a <- prepare_alignment(fx$alignment, fx$z)
+  catalog <- parse_catalog_associations(list(
+    fake_assoc(1, "rs1", "G", p = 1e-6),                    # not genome-wide
+    fake_assoc(2, "rs2", "?"),                               # unknown allele
+    fake_assoc(3, "rs3", "AT"),                              # not a single base
+    fake_assoc(4, "rs4", "T", beta = "-"),                   # no direction
+    fake_assoc(5, "rs5", "G", reported = "BMI-adjusted thing"),
+    fake_assoc(6, "rs6", "A", reported = "Unadjusted thing"),
+    fake_assoc(7, "rs99", "A")                               # not in the matrix
+  ))
+  d <- align_catalog_to_matrix(catalog, a, reported_trait = "unadjusted")
+  expect_equal(d$rsID, "rs6")
+  expect_equal(nrow(align_catalog_to_matrix(catalog[0, ], a)), 0L)
+})
+
+test_that("call_snp_trait prefers the clustering study and flags conflicts", {
+  fx <- audit_fixture()
+  a <- prepare_alignment(fx$alignment, fx$z)
+  catalog <- parse_catalog_associations(list(
+    fake_assoc(1, "rs1", "G", p = 1e-30, accession = "GCST000008"),
+    fake_assoc(2, "rs1", "G", p = 1e-9, accession = "GCST000009"),
+    fake_assoc(3, "rs2", "C", p = 1e-12),                    # risk allele: +1
+    fake_assoc(4, "rs2", "T", p = 1e-10),                    # non-risk: -1
+    fake_assoc(5, "rs3", "A", p = 1e-10)
+  ))
+  d <- align_catalog_to_matrix(catalog, a, accession = "GCST000009")
+  z <- setNames(c(5, 5, 1, rep(5, 5)), rownames(fx$z))
+  calls <- call_snp_trait(d, z, min_abs_z = 2)
+  expect_equal(calls$rsID, c("rs1", "rs2", "rs3"))
+  expect_equal(calls$association_id, c("2", "3", "5"))
+  expect_equal(calls$same_study, c(TRUE, FALSE, FALSE))
+  expect_equal(calls$n_catalog_records, c(2L, 2L, 1L))
+  expect_equal(calls$status, c("concordant", "catalog_conflict", "weak_matrix_z"))
+  expect_equal(calls$informative, c(TRUE, FALSE, FALSE))
+  z[3] <- NA
+  expect_equal(call_snp_trait(d, z)$status[3], "missing_in_matrix")
+  expect_null(call_snp_trait(d[0, ], z))
+})

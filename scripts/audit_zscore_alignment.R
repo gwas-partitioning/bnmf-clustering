@@ -153,3 +153,92 @@ catalog_search_efo <- function(query, get_page = catalog_get_page, n = 3L) {
   ord <- order(tier, nchar(label))
   utils::head(data.frame(efo_id = id[ord], efo_trait = label[ord]), n)
 }
+
+prepare_alignment <- function(alignment, z) {
+  # One alignment row per matrix row, in matrix order.
+  needed <- c("ChrPos", "rsID", "REF", "ALT", "Risk_Allele")
+  missing_cols <- setdiff(needed, names(alignment))
+  if (length(missing_cols)) {
+    stop("The alignment file lacks column(s): ", paste(missing_cols, collapse = ", "))
+  }
+  idx <- match(rownames(z), alignment$ChrPos)
+  if (anyNA(idx)) {
+    stop(sum(is.na(idx)), " matrix row(s) have no alignment row (first: ",
+         rownames(z)[is.na(idx)][1], ").")
+  }
+  a <- as.data.frame(alignment, stringsAsFactors = FALSE)[idx, needed]
+  a[] <- lapply(a, as.character)
+  a[c("REF", "ALT", "Risk_Allele")] <- lapply(a[c("REF", "ALT", "Risk_Allele")], toupper)
+  bad_risk <- is.na(a$Risk_Allele) | !(a$Risk_Allele == a$REF | a$Risk_Allele == a$ALT)
+  bad_risk[is.na(bad_risk)] <- TRUE
+  if (any(bad_risk)) {
+    stop(sum(bad_risk), " variant(s) have a Risk_Allele that is neither REF nor ALT (first: ",
+         a$ChrPos[bad_risk][1], ").")
+  }
+  a$rsID[is.na(a$rsID) | !grepl("^rs[0-9]+$", a$rsID)] <- NA_character_
+  if (all(is.na(a$rsID))) {
+    stop("The alignment file has no rsIDs; the audit matches the Catalog by rsID. ",
+         "rsIDs come from LDlink, so they are blank when LD pruning is off.")
+  }
+  a$palindromic <- paste0(a$REF, a$ALT) %in% c("AT", "TA", "CG", "GC")
+  rownames(a) <- NULL
+  a
+}
+
+align_catalog_to_matrix <- function(catalog, alignment, accession = "",
+                                    reported_trait = "", p_threshold = AUDIT_GWS_P) {
+  # Keep usable genome-wide-significant records, match them to matrix rows by
+  # rsID, and express each record's direction for the T2D risk allele.
+  catalog$catalog_direction <- catalog_direction(catalog$beta_text, catalog$or_value)
+  keep <- catalog$single_snp & !is.na(catalog$rsID) & is.finite(catalog$p_value) &
+    catalog$p_value <= p_threshold & !is.na(catalog$catalog_direction)
+  if (nzchar(reported_trait)) {
+    keep <- keep & grepl(reported_trait, catalog$reported_trait, ignore.case = TRUE,
+                         perl = TRUE)
+  }
+  usable <- alignment[!is.na(alignment$rsID) & !alignment$palindromic, , drop = FALSE]
+  d <- merge(usable, catalog[keep, , drop = FALSE], by = "rsID")
+
+  ea <- d$effect_allele
+  base <- !is.na(ea) & ea %in% AUDIT_BASES
+  direct <- base & (ea == d$REF | ea == d$ALT)
+  flipped_strand <- base & !direct &
+    (audit_complement(ea) == d$REF | audit_complement(ea) == d$ALT)
+  matched <- direct | flipped_strand
+  d <- d[matched, , drop = FALSE]
+  d$strand_complemented <- flipped_strand[matched]
+  d$aligned_allele <- ifelse(d$strand_complemented, audit_complement(d$effect_allele),
+                             d$effect_allele)
+  d$expected_sign <- d$catalog_direction * ifelse(d$aligned_allele == d$Risk_Allele, 1, -1)
+  d$same_study <- nzchar(accession) & !is.na(d$accession) & d$accession == accession
+  d <- d[order(match(d$ChrPos, alignment$ChrPos), d$p_value), , drop = FALSE]
+  rownames(d) <- NULL
+  d
+}
+
+call_snp_trait <- function(aligned, z_values, min_abs_z = 2) {
+  # One call per matrix variant: the smallest-P record from the clustering
+  # study when there is one, otherwise from any study. Records in that pool
+  # that disagree in direction make the call a catalog_conflict.
+  if (!nrow(aligned)) return(NULL)
+  rows <- lapply(split(seq_len(nrow(aligned)), aligned$ChrPos), function(i) {
+    g <- aligned[i, , drop = FALSE]
+    pool <- if (any(g$same_study)) g[g$same_study, , drop = FALSE] else g
+    best <- pool[which.min(pool$p_value), , drop = FALSE]
+    best$n_catalog_records <- nrow(g)
+    best$catalog_conflict <- length(unique(pool$expected_sign)) > 1L
+    best
+  })
+  calls <- do.call(rbind, rows)
+  calls <- calls[order(match(calls$ChrPos, names(z_values))), , drop = FALSE]
+  calls$matrix_z <- unname(z_values[calls$ChrPos])
+  calls$status <- ifelse(calls$catalog_conflict, "catalog_conflict",
+                  ifelse(!is.finite(calls$matrix_z), "missing_in_matrix",
+                  ifelse(abs(calls$matrix_z) < min_abs_z, "weak_matrix_z",
+                  ifelse(sign(calls$matrix_z) == calls$expected_sign,
+                         "concordant", "discordant"))))
+  calls$informative <- calls$status %in% c("concordant", "discordant")
+  calls$concordant <- ifelse(calls$informative, calls$status == "concordant", NA)
+  rownames(calls) <- NULL
+  calls
+}
