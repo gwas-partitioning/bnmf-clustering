@@ -4,13 +4,12 @@
 # Post-hoc analysis functions applied after bNMF clustering.
 #
 # Functions:
-#   calculate_cutoff()  — Determine optimal activity weight cutoff (elbow method)
-#   v2g()               — Variant-to-gene mapping using Open Targets V2G scores
-#                         (requires local V2G database files; see v2g_index_dir /
-#                          v2g_scored_dir parameters)
+#   calculate_cutoff()  — Method M W elbow cutoff (top 0.2%, min n = 25)
+#   calculate_h_core_traits() — H core traits: signed loading >= 50% of the cluster's
+#                         largest single loading (scale-invariant; interpretation only)
 #   do_post_analysis()  — Full post-hoc pipeline: load results, annotate nearest
 #                         gene, export Excel workbook, liftover hg19→hg38,
-#                         generate PRS score files, and optionally run V2G
+#                         generate PRS score files
 #
 # Dependencies:
 #   GenomicRanges, Homo.sapiens, openxlsx, rtracklayer (liftover), vroom
@@ -26,188 +25,501 @@ library(Homo.sapiens)
 
 # post-hoc functions
 
-calculate_cutoff <- function(w, h) {
-  
-  w_mat <- data.frame(t(w)) %>%
-    set_colnames(.["variant", ]) %>%
-    subset(!rownames(.) %in% "variant")
-  
-  h_mat <- h
-  
-  # w_mat <- fread("./L2EU.H.mat.8.txt",stringsAsFactors = FALSE,data.table = F)
-  
-  dist_point_line <- function(a, slope, intercept) {
-    b = c(1, intercept+slope)
-    c = c(0, intercept)
-    v1 <- b - c
-    v2 <- a - b
-    m <- cbind(v1,v2)
-    return(abs(det(m))/sqrt(sum(v1*v1)))
-  }
-  
-  # w_mat$cluster = NULL
-  # names(w_mat) = NULL
-  # weight = unlist(w_mat)
-  w_list <- unlist(as.list(w_mat))
-  h_list <- unlist(as.list(h_mat))
-  
-  weight = c(w_list, h_list)
-  
-  
-  weights = as.data.frame(weight)
-  weights$weight = as.numeric(as.character(weights$weight))
-  weights = as.data.frame(weights[order(weights$weight,decreasing = T),])
-  names(weights)[1] = "weight"
-  
-  numWeights <- dim(weights)[1]
-  weights$x = c(1:numWeights)
-  weights$x_scale = weights$x/numWeights
-  weights$w_scale = weights$weight/max(weights$weight)
-  
-  cutoff_test <- quantile(weights$weight, prob=1-1/100)
-  n = ifelse(sum(weights$weight > cutoff_test)>3, 1, 5)
-  m = 80
-  top1 = as.data.frame(weights[weights$weight > quantile(weights$weight, prob=1-n/100),])
-  low80 = as.data.frame(weights[weights$weight <= quantile(weights$weight, prob=m/100),])
-  weights$group = ifelse(weights$x %in% top1$x,paste0("top",n),
-                         ifelse(weights$x %in% low80$x,paste0("bottom",m),"other"))
-  
-  top1line <- lm(w_scale ~ x_scale, data=top1)
-  bottom80line <- lm(w_scale ~ x_scale, data=low80)
-  
-  weights$dist_top1 = rep(0,numWeights)
-  for(i in 1:numWeights){
-    x = weights$x_scale[i]
-    y = weights$w_scale[i]
-    weights$dist_top1[i] = dist_point_line(c(x,y),top1line$coefficients[2],top1line$coefficients[1])
-  }
-  
-  weights$dist_low80 = rep(0,numWeights)
-  for(i in 1:numWeights){
-    x = weights$x_scale[i]
-    y = weights$w_scale[i]
-    weights$dist_low80[i] = dist_point_line(c(x,y),bottom80line$coefficients[2],bottom80line$coefficients[1])
-  }
-  
-  weights$diff = weights$dist_top1 - weights$dist_low80
-  cut = weights[weights$diff > 0,]
-  cutoff = cut$weight[1]
-  cutoff_num = cut$x[1]
-  
-  highlight <- weights %>% filter(x == cutoff_num)
-  
-  
-  ggplot(weights, aes(x=x_scale, y=w_scale, color=group)) +
-    geom_point() + 
-    geom_abline(intercept = top1line$coefficients[1], slope = top1line$coefficients[2], color='blue') + 
-    geom_abline(intercept = bottom80line$coefficients[1], slope = bottom80line$coefficients[2], color='red') +
-    geom_point(data=highlight, aes(x=x_scale,y=w_scale), color='red',size=5)
-  
-  ggsave(file.path(main_dir,"bNMF_cutoff_calc.png"))
-  
-  return(cutoff)
-}
-
-
-v2g <- function(gwas_data, prefix, output_dir,
-                v2g_index_dir  = NULL,
-                v2g_scored_dir = NULL,
-                gene_symbol_file = NULL) {
-  # Map GWAS variants to genes using Open Targets V2G scores.
-  #
-  # Args:
-  #   gwas_data        : Data frame with columns: chromosome, position, rsid
-  #   prefix           : Output filename prefix
-  #   output_dir       : Directory to write output file
-  #   v2g_index_dir    : Directory containing per-chromosome V2G index files
-  #                      (chr{N}.v2g_index.tsv.gz). Download from Open Targets.
-  #   v2g_scored_dir   : Directory containing per-chromosome V2G scored files
-  #                      (chr{N}.v2g_scored.tsv.gz). Download from Open Targets.
-  #   gene_symbol_file : Path to Ensembl gene symbol table (grch38_df.tsv)
-  #                      with columns: ensgene, symbol.
-  #
-  # Returns: writes <prefix>.v2g.tsv.gz to output_dir; returns all_combine invisibly.
-
-  if (is.null(v2g_index_dir) || is.null(v2g_scored_dir) || is.null(gene_symbol_file)) {
-    stop("v2g() requires v2g_index_dir, v2g_scored_dir, and gene_symbol_file to be specified.")
-  }
-
-  # Sanitize prefix for file naming
-  prefix <- gsub("[^a-zA-Z0-9_-]", "_", prefix)
-
-  # Cache: this function re-reads the (large) per-chromosome index/scored
-  # files on every call with no resume logic of its own, so if
-  # <prefix>.v2g.tsv.gz already exists (e.g. from a prior run), reuse it
-  # instead of redoing the full per-chromosome computation.
-  out_file <- file.path(output_dir, paste0(prefix, '.v2g.tsv.gz'))
-  if (file.exists(out_file)) {
-    message("v2g(): ", out_file, " already exists -- reusing cached result instead of recomputing.")
-    return(invisible(vroom(out_file, show_col_types = FALSE)))
-  }
-
-  # Read gene symbols once (not per-chromosome). gene_symbol_file has been
-  # observed to contain literal duplicate gene_id/symbol rows (e.g. SEC16B,
-  # RFLNA, MEF2B), which silently duplicates every variant matched to that
-  # gene through the left_join(..., by = "gene_id") below -- dedupe here so
-  # it can't happen.
-  gene_symbol <- vroom(gene_symbol_file, show_col_types = FALSE) %>%
-    transmute(gene_id = ensgene, gene = symbol) %>%
-    distinct(gene_id, .keep_all = TRUE)
-
-  chrs_present <- sort(unique(gwas_data$chromosome))
-  all_combine <- data.frame()
-  for (chr in chrs_present) {
-    cat('Working on chr', chr, '\n')
-
-    gwas_chr_data <- gwas_data %>% filter(chromosome == chr)
-
-    # Read index; filter to only rsIDs in our variant set
-    our_rsids <- gwas_chr_data$rsid
-    index_file <- file.path(v2g_index_dir, sprintf("chr%d.v2g_index.tsv.gz", chr))
-    index_data <- vroom(index_file, show_col_types = FALSE) %>%
-      dplyr::rename(position_v2g = position, rsid = rs_id) %>%
-      filter(rsid %in% our_rsids)
-
-    # Use matched hg38 positions to filter the 97M-row scored file via shell
-    our_positions <- unique(index_data$position_v2g)
-    scored_file <- file.path(v2g_scored_dir, sprintf("chr%d.v2g_scored.tsv.gz", chr))
-    if (length(our_positions) > 0) {
-      pos_pattern <- paste(our_positions, collapse = "|")
-      scored_data <- vroom(
-        pipe(sprintf("gzip -dc '%s' | awk -F'\\t' 'NR==1 || ($2~/^(%s)$/)'", scored_file, pos_pattern)),
-        show_col_types = FALSE
-      ) %>%
-        dplyr::transmute(chromosome = chr_id, position_hg38 = position, gene_id, overall_score, source_score_list)
-    } else {
-      scored_data <- data.frame(chromosome = integer(), position_hg38 = integer(),
-                                gene_id = character(), overall_score = numeric(),
-                                source_score_list = character())
+calculate_cutoff <- function(w, h = NULL, output_dir = ".",
+                             target = c("W", "H"),
+                             upper_anchor_fraction = 0.002,
+                             min_upper_anchor_n = 25L,
+                             bottom_anchor_fraction = 0.80,
+                             r2_warning = 0.40) {
+  # Method M is used for W/SNP membership. H core traits are selected by
+  # calculate_h_core_traits(), not by applying the W cutoff to H.
+  target <- match.arg(target)
+  if (target == "W") {
+    cluster_cols <- grep("^X[0-9]+$", names(w), value = TRUE)
+    if (!length(cluster_cols)) {
+      stop("No X# cluster columns were found in W.")
     }
-
-    merged_data <- left_join(gwas_chr_data,
-                             index_data %>% dplyr::rename(chromosome = chr_id, position_hg38 = position_v2g),
-                             by = c('chromosome', 'rsid'))
-    merged_data2 <- left_join(merged_data, scored_data, by = c("chromosome", "position_hg38"))
-
-    merged_v2g_data3 <- merged_data2 %>%
-      group_by(rsid) %>%
-      arrange(desc(overall_score)) %>%
-      filter(!duplicated(rsid)) %>%
-      ungroup()
-
-    combine_df <- left_join(merged_v2g_data3, gene_symbol, by = 'gene_id')
-    all_combine <- bind_rows(all_combine, combine_df)
+    factor_matrix <- as.matrix(w[, cluster_cols, drop = FALSE])
+  } else {
+    if (is.null(h)) stop("H must be supplied when target = 'H'.")
+    numeric_cols <- vapply(h, is.numeric, logical(1))
+    if (!any(numeric_cols)) stop("No numeric trait-loading columns were found in H.")
+    factor_matrix <- as.matrix(h[, numeric_cols, drop = FALSE])
   }
-  
-  # Ensure output directory exists
-  # dir.create("output", showWarnings = FALSE, recursive = TRUE)
-  
-  # Write the combined data to a gzipped TSV file
-  new_file = paste0(prefix, '.v2g.tsv.gz')
-  write_tsv(all_combine, file = file.path(output_dir, new_file))
-  print("Done with V2G!")
-  return(invisible(all_combine))
+  storage.mode(factor_matrix) <- "double"
+  if (any(!is.finite(factor_matrix)) || any(factor_matrix < 0)) {
+    stop("Method M requires finite, nonnegative ", target, " values.")
+  }
+
+  weight <- sort(as.numeric(factor_matrix), decreasing = TRUE)
+  n_weights <- length(weight)
+  if (!n_weights || max(weight) <= 0) {
+    stop("Cannot calculate a cutoff from empty or all-zero ", target, " weights.")
+  }
+
+  upper_n_from_fraction <- as.integer(ceiling(
+    upper_anchor_fraction * n_weights
+  ))
+  upper_n <- max(as.integer(min_upper_anchor_n), upper_n_from_fraction)
+  if (upper_n >= n_weights) {
+    stop("Method M upper anchor must be smaller than the pooled W vector.")
+  }
+
+  weights <- tibble(
+    weight = weight,
+    rank = seq_len(n_weights),
+    x_scale = seq_len(n_weights) / n_weights,
+    w_scale = weight / max(weight)
+  )
+
+  top_idx <- seq_len(upper_n)
+  bottom_threshold <- as.numeric(quantile(
+    weight,
+    probs = bottom_anchor_fraction,
+    names = FALSE,
+    type = 7
+  ))
+  bottom_idx <- which(weight <= bottom_threshold)
+  if (length(bottom_idx) < 2L) {
+    stop("Method M bottom anchor contains fewer than two observations.")
+  }
+
+  upper_fit <- lm(w_scale ~ x_scale, data = weights[top_idx, , drop = FALSE])
+  bottom_fit <- lm(w_scale ~ x_scale, data = weights[bottom_idx, , drop = FALSE])
+
+  point_line_distance <- function(x, y, fit) {
+    intercept <- unname(coef(fit)[1])
+    slope <- unname(coef(fit)[2])
+    abs(slope * x - y + intercept) / sqrt(slope^2 + 1)
+  }
+
+  weights$distance_to_upper <- point_line_distance(
+    weights$x_scale, weights$w_scale, upper_fit
+  )
+  weights$distance_to_bottom <- point_line_distance(
+    weights$x_scale, weights$w_scale, bottom_fit
+  )
+  weights$distance_difference <-
+    weights$distance_to_upper - weights$distance_to_bottom
+
+  cutoff_rank <- which(weights$distance_difference > 0)[1]
+  if (is.na(cutoff_rank)) {
+    stop("Method M reference-line distances never cross the observed ", target, " curve.")
+  }
+
+  cutoff <- weights$weight[cutoff_rank]
+  upper_r2 <- summary(upper_fit)$r.squared
+  upper_adjusted_r2 <- summary(upper_fit)$adj.r.squared
+  bottom_r2 <- summary(bottom_fit)$r.squared
+  bottom_adjusted_r2 <- summary(bottom_fit)$adj.r.squared
+
+  diagnostics <- list(
+    method = paste0("M_", tolower(target), "_only_fixed_upper_anchor"),
+    method_label = paste0(
+      "Method M: ", target, "-only elbow, top 0.2% anchor (min 25)"
+    ),
+    matrix_side = target,
+    n_pooled_weights = n_weights,
+    n_pooled_w_weights = if (target == "W") n_weights else NA_integer_,
+    n_pooled_h_weights = if (target == "H") n_weights else NA_integer_,
+    upper_anchor_fraction_requested = upper_anchor_fraction,
+    upper_anchor_n_from_fraction = upper_n_from_fraction,
+    minimum_upper_anchor_n = as.integer(min_upper_anchor_n),
+    upper_anchor_n = upper_n,
+    upper_anchor_floor_applied = upper_n > upper_n_from_fraction,
+    upper_r2 = upper_r2,
+    upper_adjusted_r2 = upper_adjusted_r2,
+    bottom_anchor_fraction = bottom_anchor_fraction,
+    bottom_anchor_n = length(bottom_idx),
+    bottom_r2 = bottom_r2,
+    bottom_adjusted_r2 = bottom_adjusted_r2,
+    cutoff = cutoff,
+    cutoff_rank = cutoff_rank,
+    cutoff_rank_fraction = weights$x_scale[cutoff_rank],
+    normalization = paste0("rank/N and ", target, "/max(", target, ")"),
+    distance_rule = paste(
+      "first ranked", target, "value whose perpendicular distance to the bottom",
+      "reference line is smaller than its distance to the upper reference line"
+    ),
+    upper_intercept = unname(coef(upper_fit)[1]),
+    upper_slope = unname(coef(upper_fit)[2]),
+    bottom_intercept = unname(coef(bottom_fit)[1]),
+    bottom_slope = unname(coef(bottom_fit)[2])
+  )
+
+  if (is.finite(upper_adjusted_r2) && upper_adjusted_r2 < r2_warning) {
+    warning(
+      "Method M ", target, " upper-anchor adjusted R2 = ",
+      signif(upper_adjusted_r2, 3),
+      " is below the diagnostic warning threshold of ",
+      r2_warning,
+      "."
+    )
+  }
+
+  weights$group <- "Middle transition"
+  weights$group[bottom_idx] <- "Bottom 80% anchor"
+  weights$group[top_idx] <- "Top 0.2% anchor"
+  weights$group <- factor(
+    weights$group,
+    levels = c("Top 0.2% anchor", "Middle transition", "Bottom 80% anchor")
+  )
+  highlight <- weights[cutoff_rank, , drop = FALSE]
+
+  cutoff_plot <- ggplot(weights, aes(x_scale, w_scale)) +
+    geom_point(aes(color = group), size = 0.75, alpha = 0.55) +
+    geom_abline(
+      intercept = coef(upper_fit)[1],
+      slope = coef(upper_fit)[2],
+      color = "#0072B2",
+      linewidth = 1.0
+    ) +
+    geom_abline(
+      intercept = coef(bottom_fit)[1],
+      slope = coef(bottom_fit)[2],
+      color = "#009E73",
+      linewidth = 1.0
+    ) +
+    geom_vline(
+      xintercept = max(weights$x_scale[top_idx]),
+      color = "#0072B2",
+      linewidth = 0.55,
+      linetype = "dotted"
+    ) +
+    geom_point(
+      data = highlight,
+      shape = 21,
+      size = 4.5,
+      stroke = 1.0,
+      fill = "#F0E442",
+      color = "black"
+    ) +
+    annotate(
+      "label",
+      x = 0.98,
+      y = 0.98,
+      hjust = 1,
+      vjust = 1,
+      size = 3.4,
+      label = sprintf(
+        paste0(
+          "Top 0.2%% anchor: n = %s\n",
+          "Upper-line R² = %.3f (adjusted %.3f)\n",
+          "Bottom 80%% anchor: n = %s\n",
+          "Bottom-line R² = %.3f (adjusted %.3f)"
+        ),
+        format(upper_n, big.mark = ","),
+        upper_r2,
+        upper_adjusted_r2,
+        format(length(bottom_idx), big.mark = ","),
+        bottom_r2,
+        bottom_adjusted_r2
+      )
+    ) +
+    annotate(
+      "label",
+      x = min(0.96, highlight$x_scale + 0.08),
+      y = min(0.90, highlight$w_scale + 0.08),
+      hjust = 0,
+      size = 3.2,
+      label = sprintf(
+        "Cutoff = %.4f\nrank = %s (%.2f%%)",
+        cutoff,
+        format(cutoff_rank, big.mark = ","),
+        100 * highlight$x_scale
+      )
+    ) +
+    scale_color_manual(values = c(
+      "Top 0.2% anchor" = "#56B4E9",
+      "Middle transition" = "grey55",
+      "Bottom 80% anchor" = "#009E73"
+    )) +
+    coord_fixed(
+      ratio = 1,
+      xlim = c(-0.01, 1.02),
+      ylim = c(-0.01, 1.02),
+      clip = "on"
+    ) +
+    labs(
+      title = paste0("Method M ", target, "-only elbow cutoff"),
+      subtitle = paste0(
+        "Upper reference: top 0.2% of pooled ", target,
+        " weights (minimum n = ",
+        min_upper_anchor_n,
+        "); lower reference: bottom 80%"
+      ),
+      x = paste0("Normalized rank among pooled ", target, " weights"),
+      y = paste0(target, " / maximum ", target),
+      color = NULL,
+      caption = paste(
+        "Yellow point: first observed weight closer to the bottom reference",
+        "line than to the upper reference line. Equal x/y coordinate scaling."
+      )
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      plot.caption = element_text(hjust = 0, size = 9)
+    )
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  figure_stem <- if (target == "W") {
+    "bNMF_cutoff_calc_method_M"
+  } else {
+    "bNMF_cutoff_calc_method_M_H"
+  }
+  diagnostics_stem <- if (target == "W") {
+    "bNMF_cutoff_diagnostics"
+  } else {
+    "bNMF_cutoff_diagnostics_H"
+  }
+  ggsave(
+    file.path(output_dir, paste0(figure_stem, ".png")),
+    cutoff_plot,
+    width = 8.5,
+    height = 8.5,
+    units = "in",
+    dpi = 300,
+    bg = "white"
+  )
+  ggsave(
+    file.path(output_dir, paste0(figure_stem, ".pdf")),
+    cutoff_plot,
+    width = 8.5,
+    height = 8.5,
+    units = "in",
+    bg = "white"
+  )
+
+  # Preserve the historical W-figure filename used by the general HTML report.
+  if (target == "W") {
+    ggsave(
+      file.path(output_dir, "bNMF_cutoff_calc.png"),
+      cutoff_plot,
+      width = 8.5,
+      height = 8.5,
+      units = "in",
+      dpi = 300,
+      bg = "white"
+    )
+  }
+
+  saveRDS(diagnostics, file.path(output_dir, paste0(diagnostics_stem, ".rds")))
+  write.csv(
+    as.data.frame(diagnostics, stringsAsFactors = FALSE),
+    file.path(output_dir, paste0(diagnostics_stem, ".csv")),
+    row.names = FALSE,
+    quote = TRUE
+  )
+
+  cutoff_with_diagnostics <- cutoff
+  attr(cutoff_with_diagnostics, "diagnostics") <- diagnostics
+  cutoff_with_diagnostics
 }
+
+
+calculate_h_core_traits <- function(h, cluster_names,
+                                    relative_max_threshold = 0.50) {
+  # Select descriptive H "core traits" independently within each cluster,
+  # thresholding the ORIGINAL signed H columns (trait_pos / trait_neg / unsigned):
+  #
+  #   1. H_max,k = the largest single loading in cluster k (any one column).
+  #   2. T_k     = relative_max_threshold * H_max,k.
+  #   3. Every column with H_kj >= T_k is selected.
+  #   4. Selected columns are collapsed to base traits only AFTERWARD, for
+  #      counts, PPI, and enrichment. A base trait with both its positive and
+  #      negative column selected is labelled "bidirectional".
+  #
+  # Positive and negative columns are never combined before thresholding, so a
+  # trait is selected only if one of its own loadings reaches T_k.
+  #
+  # The rule is invariant to component-wise NMF rescaling and is intended for
+  # cluster interpretation, PPI, and enrichment, not for SNP/pPS membership.
+  #
+  # Returns:
+  #   all_traits         one row per cluster x base trait (selected or not),
+  #                      including full-H loading_energy (sum of squared
+  #                      loadings) as a diagnostic that is NOT used for selection
+  #   core_traits        the selected rows of all_traits (one row per base trait)
+  #   core_signed_traits one row per selected signed column, for plots that
+  #                      must show both signs of a bidirectional trait
+  #   cluster_summary    per-cluster counts, membership-direction counts, and
+  #                      full-H concentration diagnostics
+
+  if (!is.numeric(relative_max_threshold) ||
+      length(relative_max_threshold) != 1L ||
+      !is.finite(relative_max_threshold) ||
+      relative_max_threshold <= 0 || relative_max_threshold > 1) {
+    stop("relative_max_threshold must be one number in (0, 1].")
+  }
+  if (nrow(h) != length(cluster_names)) {
+    stop(
+      "H has ", nrow(h), " rows but ", length(cluster_names),
+      " cluster names were supplied."
+    )
+  }
+
+  h <- h[, !(names(h) %in% c("cluster", "Cluster")), drop = FALSE]
+  numeric_cols <- vapply(h, is.numeric, logical(1))
+  if (!any(numeric_cols)) stop("No numeric trait-loading columns were found in H.")
+  H <- as.matrix(h[, numeric_cols, drop = FALSE])
+  storage.mode(H) <- "double"
+  if (any(!is.finite(H)) || any(H < 0)) {
+    stop("H core-trait selection requires finite, nonnegative H values.")
+  }
+  if (anyDuplicated(colnames(H))) {
+    stop("H has duplicated trait column names; core-trait selection needs unique names.")
+  }
+
+  signed <- as.data.frame(H, check.names = FALSE) %>%
+    mutate(cluster = cluster_names, .before = 1) %>%
+    pivot_longer(-cluster, names_to = "signed_trait", values_to = "weight") %>%
+    mutate(
+      base_trait_id = stringr::str_remove(signed_trait, "_(pos|neg)$"),
+      base_trait = base_trait_id %>%
+        stringr::str_remove(stringr::fixed("protein..")) %>%
+        stringr::str_remove(stringr::fixed("trait..")),
+      explicit_trait_type = case_when(
+        stringr::str_starts(base_trait_id, stringr::fixed("protein..")) ~ "protein",
+        stringr::str_starts(base_trait_id, stringr::fixed("trait..")) ~ "phenotype",
+        TRUE ~ NA_character_
+      ),
+      direction = case_when(
+        stringr::str_ends(signed_trait, "_neg") ~ "negative",
+        stringr::str_ends(signed_trait, "_pos") ~ "positive",
+        TRUE ~ "unsigned"
+      )
+    ) %>%
+    group_by(cluster) %>%
+    mutate(
+      maximum_loading = max(weight),
+      threshold_loading = relative_max_threshold * maximum_loading,
+      relative_to_maximum = if_else(maximum_loading > 0, weight / maximum_loading, 0),
+      selected = maximum_loading > 0 & weight > 0 & weight >= threshold_loading
+    ) %>%
+    ungroup()
+
+  all_traits <- signed %>%
+    group_by(cluster, base_trait_id, base_trait, explicit_trait_type) %>%
+    summarise(
+      positive_loading = if (any(direction == "positive")) {
+        sum(weight[direction == "positive"])
+      } else {
+        NA_real_
+      },
+      negative_loading = if (any(direction == "negative")) {
+        sum(weight[direction == "negative"])
+      } else {
+        NA_real_
+      },
+      unsigned_loading = if (any(direction == "unsigned")) {
+        sum(weight[direction == "unsigned"])
+      } else {
+        NA_real_
+      },
+      max_signed_loading = max(weight),
+      dominant_signed_trait = signed_trait[which.max(weight)],
+      dominant_direction = direction[which.max(weight)],
+      loading_energy = sum(weight^2),
+      positive_selected = any(selected & direction == "positive"),
+      negative_selected = any(selected & direction == "negative"),
+      unsigned_selected = any(selected & direction == "unsigned"),
+      maximum_loading = dplyr::first(maximum_loading),
+      threshold_loading = dplyr::first(threshold_loading),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      selected = positive_selected | negative_selected | unsigned_selected,
+      membership_direction = case_when(
+        positive_selected & negative_selected ~ "bidirectional",
+        positive_selected ~ "positive",
+        negative_selected ~ "negative",
+        unsigned_selected ~ "unsigned",
+        TRUE ~ NA_character_
+      ),
+      relative_to_maximum = if_else(
+        maximum_loading > 0,
+        max_signed_loading / maximum_loading,
+        0
+      ),
+      relative_max_threshold = relative_max_threshold
+    ) %>%
+    arrange(match(cluster, cluster_names), desc(max_signed_loading), base_trait_id)
+
+  core_signed_traits <- signed %>%
+    filter(selected) %>%
+    left_join(
+      all_traits %>% dplyr::select(cluster, base_trait_id, membership_direction),
+      by = c("cluster", "base_trait_id")
+    ) %>%
+    dplyr::select(
+      cluster, signed_trait, base_trait_id, base_trait, explicit_trait_type,
+      direction, weight, relative_to_maximum, maximum_loading,
+      threshold_loading, membership_direction
+    ) %>%
+    arrange(match(cluster, cluster_names), desc(weight), signed_trait)
+
+  signed_summary <- core_signed_traits %>%
+    group_by(cluster) %>%
+    summarise(
+      core_signed_columns = n(),
+      boundary_loading = min(weight),
+      .groups = "drop"
+    )
+
+  cluster_summary <- all_traits %>%
+    group_by(cluster) %>%
+    summarise(
+      total_base_traits = n(),
+      core_traits = sum(selected),
+      positive_only = sum(membership_direction == "positive", na.rm = TRUE),
+      negative_only = sum(membership_direction == "negative", na.rm = TRUE),
+      bidirectional = sum(membership_direction == "bidirectional", na.rm = TRUE),
+      unsigned = sum(membership_direction == "unsigned", na.rm = TRUE),
+      maximum_loading = dplyr::first(maximum_loading),
+      threshold_loading = dplyr::first(threshold_loading),
+      # Full-H concentration: computed over ALL base traits, independent of
+      # which traits were selected, so a one-trait core set is not by itself
+      # evidence that a single trait drives the cluster.
+      full_h_top_trait_energy_share = if (sum(loading_energy) > 0) {
+        max(loading_energy) / sum(loading_energy)
+      } else {
+        NA_real_
+      },
+      full_h_effective_traits = if (sum(loading_energy) > 0) {
+        sum(loading_energy)^2 / sum(loading_energy^2)
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    left_join(signed_summary, by = "cluster") %>%
+    mutate(core_signed_columns = tidyr::replace_na(core_signed_columns, 0L)) %>%
+    dplyr::select(
+      cluster, total_base_traits, core_traits, core_signed_columns,
+      positive_only, negative_only, bidirectional, unsigned,
+      maximum_loading, threshold_loading, boundary_loading,
+      full_h_top_trait_energy_share, full_h_effective_traits
+    ) %>%
+    arrange(match(cluster, cluster_names))
+
+  list(
+    method = "H_signed_relative_to_cluster_maximum",
+    method_label = paste0(
+      "H core traits: signed loading >= ",
+      scales::percent(relative_max_threshold, accuracy = 1),
+      " of the cluster's largest single loading"
+    ),
+    relative_max_threshold = relative_max_threshold,
+    all_traits = all_traits,
+    core_traits = all_traits %>% filter(selected),
+    core_signed_traits = core_signed_traits,
+    cluster_summary = cluster_summary
+  )
+}
+
 
 do_post_analysis <- function(main_dir,
                             my_chain,
@@ -217,14 +529,9 @@ do_post_analysis <- function(main_dir,
                             loci_file      = "query",
                             make_excel     = TRUE,
                             do_liftover    = TRUE,
-                            do_v2g         = FALSE,
-                            existing_dir   = NULL,
-                            v2g_index_dir  = NULL,
-                            v2g_scored_dir = NULL,
-                            gene_symbol_file = NULL) {
+                            existing_dir   = NULL) {
   # Full post-hoc pipeline: load bNMF outputs, annotate nearest genes,
-  # create Excel workbook, perform hg19→hg38 liftover, write PRS score files,
-  # and optionally run V2G mapping.
+  # create Excel workbook, perform hg19→hg38 liftover, and write PRS score files.
   #
   # Args:
   #   main_dir         : Output directory from summarize_bNMF()
@@ -235,11 +542,7 @@ do_post_analysis <- function(main_dir,
   #   loci_file        : "query" to annotate nearest gene; otherwise path to loci file
   #   make_excel       : Write per-cluster sorted weight Excel workbook
   #   do_liftover      : Perform hg19→hg38 coordinate liftover
-  #   do_v2g           : Run Open Targets V2G mapping (requires v2g_* paths below)
   #   existing_dir     : Optional alternative directory for rsID_map.txt lookup
-  #   v2g_index_dir    : Directory with per-chr V2G index files (for do_v2g=TRUE)
-  #   v2g_scored_dir   : Directory with per-chr V2G scored files (for do_v2g=TRUE)
-  #   gene_symbol_file : Path to Ensembl gene symbol table (for do_v2g=TRUE)
   
   # 1.) load data ---
   
@@ -274,26 +577,57 @@ do_post_analysis <- function(main_dir,
     rename_at(
       vars(starts_with("X2hr")), function(x) {gsub("X","",x) })
   
-  # do cutoff
-  cutoff <- calculate_cutoff(w, h)
-  print(sprintf("Optimal weight cutoff is %.3f!", cutoff))
+  # W defines SNP/pPS membership using Method M.
+  cutoff_w_result <- calculate_cutoff(
+    w, h, output_dir = main_dir, target = "W"
+  )
+  cutoff_diagnostics_w <- attr(cutoff_w_result, "diagnostics")
+  cutoff_w <- as.numeric(cutoff_w_result)
 
-  # 1b.) Run V2G early so gene assignments are available for Excel output
-  v2g_result <- NULL
-  if (do_v2g) {
-    v2g_input <- df_gwas %>%
-      separate(ChrPos, into = c("chromosome", "position"), sep = ":", remove = TRUE) %>%
-      mutate_at(vars(chromosome, position), as.integer) %>%
-      dplyr::select(chromosome, position, rsid = rsID)
-    v2g_result <- v2g(
-      gwas_data        = v2g_input,
-      prefix           = paste(basename(main_dir), "v2g", sep = "_"),
-      output_dir       = main_dir,
-      v2g_index_dir    = v2g_index_dir,
-      v2g_scored_dir   = v2g_scored_dir,
-      gene_symbol_file = gene_symbol_file
-    )
-  }
+  # H is used descriptively for cluster interpretation. Within each cluster the
+  # original signed H columns (trait_pos / trait_neg / unsigned) are selected
+  # when their own loading is at least 50% of that cluster's largest single
+  # loading; selected columns are collapsed to base traits afterward.
+  h_core_result <- calculate_h_core_traits(
+    h = h,
+    cluster_names = cluster_names,
+    relative_max_threshold = 0.50
+  )
+  readr::write_csv(
+    h_core_result$core_traits,
+    file.path(main_dir, "H_core_traits_relative_to_cluster_maximum.csv")
+  )
+  readr::write_csv(
+    h_core_result$core_signed_traits,
+    file.path(main_dir, "H_core_signed_columns_relative_to_cluster_maximum.csv")
+  )
+  readr::write_csv(
+    h_core_result$cluster_summary,
+    file.path(main_dir, "H_core_trait_counts_by_cluster.csv")
+  )
+
+  # Backward-compatible aliases: historical callers interpret `cutoff` and
+  # `cutoff_diagnostics` as the SNP/W threshold.
+  cutoff <- cutoff_w
+  cutoff_diagnostics <- cutoff_diagnostics_w
+  print(sprintf(
+    "Method M optimal W-only weight cutoff is %.4f (upper n=%d; upper R2=%.3f; bottom R2=%.3f).",
+    cutoff_w,
+    cutoff_diagnostics_w$upper_anchor_n,
+    cutoff_diagnostics_w$upper_r2,
+    cutoff_diagnostics_w$bottom_r2
+  ))
+  print(sprintf(
+    paste0(
+      "H interpretation selects signed columns with loading >= %.0f%% of the ",
+      "cluster's largest single loading; core sizes range from %d to %d base ",
+      "traits across clusters (%d bidirectional trait-cluster memberships)."
+    ),
+    100 * h_core_result$relative_max_threshold,
+    min(h_core_result$cluster_summary$core_traits),
+    max(h_core_result$cluster_summary$core_traits),
+    sum(h_core_result$cluster_summary$bidirectional)
+  ))
 
   # 2.) get nearest gene ---
   print("reading rsID map...")
@@ -361,7 +695,7 @@ do_post_analysis <- function(main_dir,
       # ROBUST VARIANT PARSING
       snps <- w$variant
       message(sprintf("Annotating %d variants with nearest gene...", length(snps)))
-      
+
       # SAFE PARSING - handles any format
       ranges_df <- data.frame(
         chr = character(length(snps)),
@@ -488,16 +822,9 @@ do_post_analysis <- function(main_dir,
         mutate(VAR_ID = variant, rsID = variant)
     }
 
-    # Rename nearest gene column; join OpenTargets V2G gene if available
+    # Rename nearest gene column
     w_excel_ready <- w_excel_ready %>%
       dplyr::rename(Nearest_Gene = gene)
-    if (!is.null(v2g_result)) {
-      v2g_genes <- v2g_result %>%
-        dplyr::select(rsID = rsid, OpenTargets_Gene = gene) %>%
-        dplyr::filter(!is.na(OpenTargets_Gene))
-      w_excel_ready <- w_excel_ready %>%
-        left_join(v2g_genes, by = "rsID")
-    }
 
     # Make Excel with improved error handling
     tryCatch({
@@ -508,10 +835,10 @@ do_post_analysis <- function(main_dir,
       
       w.exc <- w_excel_ready %>%
         dplyr::select(-any_of(c('ENTREZID', 'variant'))) %>%
-        relocate(any_of(c("VAR_ID", "rsID", "Nearest_Gene", "OpenTargets_Gene")))
+        relocate(any_of(c("VAR_ID", "rsID", "Nearest_Gene")))
 
       # Determine last ID column safely
-      id_cols <- intersect(c("VAR_ID", "rsID", "Nearest_Gene", "OpenTargets_Gene"), colnames(w.exc))
+      id_cols <- intersect(c("VAR_ID", "rsID", "Nearest_Gene"), colnames(w.exc))
       last_id_col <- length(id_cols)
       
       posStyle <- createStyle(fontColour = "#006100", bgFill = "#C6EFCE")
@@ -538,18 +865,45 @@ do_post_analysis <- function(main_dir,
           conditionalFormatting(wb, cur_sheet,
                                 cols = last_id_col + i, rows = 2:(nrow(w_temp)+1),
                                 rule = sprintf("%s2>=%.7f",
-                                               openxlsx::int2col(last_id_col + i), cutoff),
+                                               openxlsx::int2col(last_id_col + i), cutoff_w),
                                 style = posStyle)
         }
         
         if (start_col2 + i <= ncol(h_temp) + start_col2) {
-          conditionalFormatting(wb, cur_sheet,
-                                cols = start_col2 + i, rows = 2:(nrow(h_temp)+1),
-                                rule = sprintf("%s2>=%.7f",
-                                               openxlsx::int2col(start_col2 + i), cutoff),
-                                style = posStyle)
+          selected_signed_traits <- h_core_result$core_signed_traits %>%
+            filter(cluster == cluster_names[i]) %>%
+            pull(signed_trait)
+          selected_h_rows <- which(h_temp$trait %in% selected_signed_traits) + 1L
+          if (length(selected_h_rows)) {
+            addStyle(
+              wb,
+              sheet = cur_sheet,
+              style = posStyle,
+              rows = selected_h_rows,
+              cols = start_col2 + i,
+              gridExpand = FALSE,
+              stack = TRUE
+            )
+          }
         }
       }
+
+      core_trait_export <- h_core_result$core_traits %>%
+        dplyr::select(
+          cluster, base_trait, explicit_trait_type, membership_direction,
+          positive_loading, negative_loading, max_signed_loading,
+          relative_to_maximum, maximum_loading, threshold_loading
+        )
+      addWorksheet(wb, "H_core_traits")
+      writeData(
+        wb, "H_core_traits", core_trait_export,
+        startCol = 1, startRow = 1, rowNames = FALSE, colNames = TRUE
+      )
+      addWorksheet(wb, "H_core_summary")
+      writeData(
+        wb, "H_core_summary", h_core_result$cluster_summary,
+        startCol = 1, startRow = 1, rowNames = FALSE, colNames = TRUE
+      )
       
       fp <- file.path(main_dir, sprintf("sorted_cluster_weights_K%i_rev.xlsx",k))
       openxlsx::saveWorkbook(wb, fp, overwrite = T)
@@ -626,7 +980,7 @@ do_post_analysis <- function(main_dir,
       w_tmp = cluster_weights[i]
       names(w_tmp) = c("Weight")
       w_tmp$VAR_ID_hg38 = rownames(w_tmp)
-      w_tmp = w_tmp[w_tmp$Weight>=cutoff,]
+      w_tmp = w_tmp[w_tmp$Weight>=cutoff_w,]
       w_tmp$cluster=cluster_names[i]
       cluster_info = rbind(cluster_info,w_tmp)
     }
@@ -678,5 +1032,22 @@ do_post_analysis <- function(main_dir,
   }
   
   
-  return(list(df_run_summary=df_run_summary, k=k, cluster_names=cluster_names, w=w_wLoci, h=h, cutoff=cutoff))
+  return(list(
+    df_run_summary = df_run_summary,
+    k = k,
+    cluster_names = cluster_names,
+    w = w_wLoci,
+    h = h,
+    cutoff = cutoff,
+    cutoff_w = cutoff_w,
+    cutoff_diagnostics = cutoff_diagnostics,
+    cutoff_diagnostics_w = cutoff_diagnostics_w,
+    h_selection_method = h_core_result$method,
+    h_selection_method_label = h_core_result$method_label,
+    h_relative_max_threshold = h_core_result$relative_max_threshold,
+    h_core_traits = h_core_result$core_traits,
+    h_core_signed_traits = h_core_result$core_signed_traits,
+    h_trait_loadings = h_core_result$all_traits,
+    h_core_cluster_summary = h_core_result$cluster_summary
+  ))
 }

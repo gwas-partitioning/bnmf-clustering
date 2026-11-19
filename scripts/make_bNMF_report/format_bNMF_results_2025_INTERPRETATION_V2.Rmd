@@ -1,0 +1,1582 @@
+---
+title: "bNMF clustering: QC and initial interpretation"
+author: "Kirk Smith"
+date: "`r format(Sys.time(), '%A %B %d, %Y at %I:%M %p %Z',tz='US/Eastern')`"
+output: html_document
+params:
+  main_dir: NULL
+  k: NULL
+  previous_main_dir: NULL
+  helper_script: NULL
+  stability_script: NULL
+  domain_fallback: "grep"
+---
+
+<style>
+.main-container {
+    width: 90%;
+    max-width:1200px;
+    margin: 0 auto 10px auto;
+}
+#header { 
+  background: linear-gradient(to right, #2274cc 0%, #26c5d3 36%, #61bf61 100%);
+  color: white;
+  height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Roboto', sans-serif;
+  font-size: 2rem;
+  font-weight: bold;
+  padding: 20px;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+  border-bottom: 2px solid rgba(255,255,255,0.3);
+  text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.3s ease;
+}
+#header:hover {
+  transform: translateY(-3px);
+}
+@media (max-width: 600px) {
+  #header {
+    font-size: 1.5rem;
+    padding: 15px;
+  }
+}
+
+  h1.title {
+    margin: auto;
+  }
+.col2 {
+    columns: 2 300px;         /* number of columns and width in pixels*/
+    -webkit-columns: 2 300px; /* chrome, safari */
+    -moz-columns: 2 300px;    /* firefox */
+  }
+.col3 {
+    columns: 3 100px;
+    -webkit-columns: 3 100px;
+    -moz-columns: 3 100px;
+  }
+  
+.left {
+  text-align: left;
+  float: left;
+  width: 50%;
+  padding-right: 25px;
+  padding-left: 50px;
+}
+
+.right {
+  float: right;
+  text-align: left;
+  width: 50%;
+  padding-right: 50px;
+  padding-left: 25px;
+}
+
+.row {display: flex;}
+.column {flex: 50%;}
+
+.interpretation-card {
+  background: #f7fbff;
+  border-left: 5px solid #2274cc;
+  border-radius: 5px;
+  padding: 14px 18px;
+  margin: 12px 0 18px 0;
+}
+.interpretation-card h4 { margin-top: 0; color: #174f87; }
+.caveat-box {
+  background: #fff8e6;
+  border: 1px solid #e5b84b;
+  border-radius: 5px;
+  padding: 10px 14px;
+  margin: 10px 0;
+}
+
+</style>
+
+<div class="main-container">
+
+```{r setup, include=FALSE}
+# library(knitr)
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r load}
+
+library(dplyr)
+library(data.table)
+library(tibble)
+library(DT)
+library(kableExtra)
+library(ggplot2)
+library(tidyr)
+library(rstudioapi)
+library(strex)
+library(scales)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(patchwork)
+library(gridExtra)
+library(grid)
+library(vroom)
+library(magrittr)
+library(ggrepel)
+library(ggplotify)
+
+helper_candidates <- c(
+  params$helper_script,
+  file.path(dirname(knitr::current_input(dir = TRUE)),
+            "make_cluster_figures_INTERPRETATION_V2.R"),
+  file.path(getwd(), "make_bNMF_report",
+            "make_cluster_figures_INTERPRETATION_V2.R")
+)
+helper_candidates <- unique(helper_candidates[!is.na(helper_candidates) & nzchar(helper_candidates)])
+helper_script <- helper_candidates[file.exists(helper_candidates)][1]
+if (is.na(helper_script)) {
+  stop("Could not locate make_cluster_figures_INTERPRETATION_V2.R. Pass params$helper_script explicitly.")
+}
+source(helper_script)
+
+
+```
+
+
+```{r load_results, results='asis'}
+
+# options(download.file.method = "libcurl")
+
+
+main_dir <- params$main_dir
+k <- params$k
+
+if (is.null(main_dir) || !dir.exists(main_dir)) {
+  stop("params$main_dir must identify an existing bNMF results directory.")
+}
+
+required_files <- c(
+  "run_summary.txt", "df_traits.csv", "cluster_post_hoc.rds",
+  "zmat_preImputed.rds", "zmat_imputed.rds", "rsID_map.txt"
+)
+missing_files <- required_files[!file.exists(file.path(main_dir, required_files))]
+if (length(missing_files)) {
+  stop("Missing required report inputs: ", paste(missing_files, collapse = ", "))
+}
+
+# main_dir = "./molecular_expression_signatures/NAFLD/bNMF/NAFLD_250211_v8_results"
+
+
+# find majority K from run summary
+df_run_summary <- fread(file.path(main_dir,"run_summary.txt"),
+                        stringsAsFactors = F, data.table = F)
+
+
+trait_results <- fread(file.path(main_dir, "df_traits.csv"))
+
+
+k_counts <- df_run_summary %>% dplyr::count(K) %>%
+  mutate(perc = n/nrow(df_run_summary))
+
+run_sum_max <- df_run_summary %>%
+  group_by(K) %>%
+  summarise(convergence = min(evid, na.rm=TRUE)) %>%
+  mutate(K=as.factor(K))
+
+
+cluster_post_hoc <- readRDS(file.path(main_dir, "cluster_post_hoc.rds"))
+zmat_final <- readRDS(file.path(main_dir, "zmat_preImputed.rds"))  %>%
+  data.frame()
+zmat_imputed <- readRDS(file.path(main_dir, "zmat_imputed.rds")) %>%
+  data.frame()
+
+w_mat <- cluster_post_hoc$w
+h_mat <- cluster_post_hoc$h
+cutoff_w <- if (!is.null(cluster_post_hoc$cutoff_w)) {
+  cluster_post_hoc$cutoff_w
+} else {
+  cluster_post_hoc$cutoff
+}
+# Backward-compatible W alias used by older report sections and helpers.
+cutoff <- cutoff_w
+
+# Only results produced by the signed H rule are treated as current. Objects
+# from the earlier combined-pair (sqrt(pos^2 + neg^2)) rule, or from before any
+# H core rule, are flagged as legacy rather than silently presented.
+has_h_core_results <- all(vapply(
+  c("h_core_traits", "h_core_signed_traits", "h_trait_loadings", "h_relative_max_threshold"),
+  function(name) !is.null(cluster_post_hoc[[name]]),
+  logical(1)
+)) && identical(cluster_post_hoc$h_selection_method, "H_signed_relative_to_cluster_maximum")
+h_relative_max_threshold <- if (has_h_core_results) {
+  as.numeric(cluster_post_hoc$h_relative_max_threshold)
+} else {
+  NA_real_
+}
+h_core_traits <- if (has_h_core_results) {
+  as_tibble(cluster_post_hoc$h_core_traits)
+} else {
+  NULL
+}
+h_core_signed_traits <- if (has_h_core_results) {
+  as_tibble(cluster_post_hoc$h_core_signed_traits)
+} else {
+  NULL
+}
+h_trait_loadings <- if (has_h_core_results) {
+  as_tibble(cluster_post_hoc$h_trait_loadings)
+} else {
+  NULL
+}
+h_core_cluster_summary <- if (has_h_core_results &&
+                              !is.null(cluster_post_hoc$h_core_cluster_summary)) {
+  as_tibble(cluster_post_hoc$h_core_cluster_summary)
+} else {
+  NULL
+}
+
+
+if (is.null(k)) {
+  k <- cluster_post_hoc$k
+} else if (!identical(as.integer(k), as.integer(cluster_post_hoc$k))) {
+  stop(sprintf(
+    "Requested K=%s, but cluster_post_hoc.rds contains K=%s. Re-run do_post_analysis() for the requested K or render with k=NULL.",
+    k, cluster_post_hoc$k
+  ))
+}
+cluster_names <- cluster_post_hoc$cluster_names
+
+# Run the stability analysis on demand.  Its input is the saved full set of
+# bNMF repetitions, so no clustering is repeated during report rendering.
+stability_dir <- file.path(main_dir, "stability_analysis")
+stability_summary_path <- file.path(stability_dir, "stability_per_cluster.csv")
+stability_table <- NULL
+stability_note <- NULL
+
+if (file.exists(stability_summary_path)) {
+  stability_table <- read.csv(stability_summary_path, check.names = FALSE)
+} else if (!file.exists(file.path(main_dir, "bnmf_out.rds"))) {
+  stability_note <- "Per-cluster stability was not calculated because bnmf_out.rds is unavailable."
+} else {
+  stability_script <- params$stability_script
+  if (is.null(stability_script) || !nzchar(stability_script) || !file.exists(stability_script)) {
+    stability_script <- file.path(dirname(dirname(normalizePath(helper_script))),
+                                  "assess_bNMF_stability.R")
+  }
+
+  if (!file.exists(stability_script)) {
+    stability_note <- "Per-cluster stability was not calculated because assess_bNMF_stability.R could not be located."
+  } else {
+    stability_output <- tryCatch(
+      system2(
+        file.path(R.home("bin"), "Rscript"),
+        args = c(shQuote(stability_script), shQuote(main_dir)),
+        stdout = TRUE,
+        stderr = TRUE
+      ),
+      error = function(e) e
+    )
+    stability_status <- if (inherits(stability_output, "error")) 1L else {
+      status <- attr(stability_output, "status")
+      if (is.null(status)) 0L else status
+    }
+
+    if (stability_status == 0L && file.exists(stability_summary_path)) {
+      stability_table <- read.csv(stability_summary_path, check.names = FALSE)
+    } else {
+      stability_note <- paste0(
+        "Automatic per-cluster stability analysis did not complete. ",
+        "See the render log for details."
+      )
+      warning(stability_note)
+      if (is.character(stability_output)) message(paste(stability_output, collapse = "\n"))
+    }
+  }
+}
+
+domain_fallback <- match.arg(params$domain_fallback, c("grep", "other"))
+trait_groups_path <- file.path(main_dir, "trait_groups.csv")
+trait_groups <- if (file.exists(trait_groups_path)) {
+  read_csv(trait_groups_path, show_col_types = FALSE)
+} else {
+  NULL
+}
+
+w_mat_long <- w_mat %>%
+  pivot_longer(cols=cluster_names, names_to='cluster',values_to='weight')
+
+has_chr_prefix <- startsWith(w_mat$variant[1],"chr")
+
+df_rsid <- fread(file.path(main_dir,"rsID_map.txt"),
+                        stringsAsFactors = F, data.table = F)  %>%
+  separate(VAR_ID, into=c("CHR","POS","REF","ALT"),sep = "_",remove = F) %>%
+  mutate(variant = if(has_chr_prefix) {
+                     paste0("chr", CHR, ":", POS)
+                   } else {
+                     paste(CHR, POS, sep=":")
+                   }) %>%
+  distinct(variant, .keep_all = TRUE)
+
+
+h_mat_long_raw <- h_mat %>% t() %>% data.frame() %>%
+  set_colnames(cluster_names) %>%
+  rownames_to_column('trait') %>%
+  pivot_longer(cols=cluster_names, names_to='cluster',values_to='weight')
+
+# Current post-processing objects contain one row per SELECTED SIGNED column
+# and cluster. A bidirectional trait therefore contributes both its positive and
+# negative component to directional displays, while make_signed_trait_summary()
+# groups rows by base trait so each trait is counted once. Older objects retain
+# the historical behavior and are clearly flagged in the report.
+if (has_h_core_results) {
+  h_mat_long <- h_core_signed_traits %>%
+    transmute(
+      trait = signed_trait,
+      cluster,
+      weight,
+      base_trait,
+      relative_to_maximum,
+      core_selected = TRUE
+    )
+  w_mat_interpretation <- w_mat_long %>% filter(weight >= cutoff_w)
+  interpretation_cutoff <- 0
+  n_base_traits <- dplyr::n_distinct(h_trait_loadings$base_trait_id)
+} else {
+  h_mat_long <- h_mat_long_raw
+  w_mat_interpretation <- w_mat_long
+  interpretation_cutoff <- cutoff_w
+  n_base_traits <- ncol(h_mat) / 2
+}
+
+w_mat_final <- w_mat_long %>% filter(weight >= cutoff_w)
+
+variant_annotations <- df_rsid %>%
+  distinct(variant, .keep_all = TRUE) %>%
+  dplyr::select(variant, VAR_ID, rsID, REF, ALT)
+
+aligned_path <- file.path(main_dir, "alignment_GWAS_summStats.csv")
+if (file.exists(aligned_path)) {
+  # Older runs used a tab-delimited .csv and did not always include VAR_ID.
+  # fread() detects the delimiter, and the most reliable available identifier
+  # is selected in descending order of specificity.
+  aligned_gwas <- fread(
+    aligned_path,
+    stringsAsFactors = FALSE,
+    data.table = FALSE
+  )
+  alignment_key <- if ("VAR_ID" %in% names(aligned_gwas)) {
+    "VAR_ID"
+  } else if ("rsID" %in% names(aligned_gwas)) {
+    "rsID"
+  } else if ("ChrPos" %in% names(aligned_gwas)) {
+    aligned_gwas <- aligned_gwas %>%
+      mutate(
+        variant = if (has_chr_prefix) {
+          paste0("chr", sub("^chr", "", as.character(ChrPos), ignore.case = TRUE))
+        } else {
+          sub("^chr", "", as.character(ChrPos), ignore.case = TRUE)
+        }
+      )
+    "variant"
+  } else {
+    NA_character_
+  }
+
+  if (is.na(alignment_key)) {
+    warning(
+      "alignment_GWAS_summStats.csv has no VAR_ID, rsID, or ChrPos column; ",
+      "primary-GWAS annotations will be omitted."
+    )
+  } else {
+    aligned_gwas <- aligned_gwas %>%
+      filter(!is.na(.data[[alignment_key]])) %>%
+      distinct(.data[[alignment_key]], .keep_all = TRUE)
+    aligned_keep <- intersect(
+      c(alignment_key, "P_VALUE", "BETA_aligned", "Risk_Allele"),
+      names(aligned_gwas)
+    )
+    variant_annotations <- variant_annotations %>%
+      left_join(
+        aligned_gwas %>% select(all_of(aligned_keep)),
+        by = alignment_key
+      )
+  }
+}
+
+trait_concentration <- if (has_h_core_results) {
+  h_trait_loadings %>%
+    group_by(cluster) %>%
+    summarise(
+      total_energy = sum(loading_energy, na.rm = TRUE),
+      top_trait_share = if_else(
+        total_energy > 0,
+        max(loading_energy, na.rm = TRUE) / total_energy,
+        NA_real_
+      ),
+      effective_traits = if_else(
+        total_energy > 0,
+        total_energy^2 / sum(loading_energy^2, na.rm = TRUE),
+        NA_real_
+      ),
+      .groups = "drop"
+    )
+} else {
+  NULL
+}
+
+cluster_interpretation <- make_cluster_interpretation(
+  w_mat_long = w_mat_interpretation,
+  h_mat_long = h_mat_long,
+  cutoff = interpretation_cutoff,
+  variant_annotations = variant_annotations,
+  top_n = 8,
+  trait_groups = trait_groups,
+  domain_fallback = domain_fallback,
+  trait_concentration = trait_concentration
+)
+cluster_overlap <- make_cluster_overlap_matrix(w_mat_long, cutoff)
+
+
+k_perc <- k_counts$perc[k_counts$K == k]
+if (!length(k_perc)) stop("Selected K is absent from run_summary.txt.")
+  
+cat("\n\n## ", sprintf("Variant x Trait matrix = %i SNPs x %i Traits\n", nrow(w_mat), n_base_traits), "\n")
+cat("\n\n## ", sprintf("bNMF converged to %i clusters in %.0f%% of iterations\n", k, k_perc*100), "\n")
+```
+
+```{r run_metadata, echo=FALSE, results='asis'}
+meta_df <- data.frame(
+  Field = c("Results directory", "Selected K", "K frequency",
+            "SNPs", "Traits", "W/SNP cutoff", "H interpretation rule",
+            "Report generated"),
+  Value = c(
+    basename(main_dir),
+    k,
+    sprintf("%.0f%% of iterations", k_perc * 100),
+    nrow(w_mat),
+    n_base_traits,
+    round(cutoff_w, 4),
+    if (has_h_core_results) {
+      sprintf("Signed loading >= %.0f%% of cluster maximum loading",
+              100 * h_relative_max_threshold)
+    } else {
+      sprintf("Legacy shared W/H cutoff = %.4f", cutoff_w)
+    },
+    format(Sys.time(), "%Y-%m-%d %H:%M %Z", tz = "US/Eastern")
+  ),
+  stringsAsFactors = FALSE
+)
+kable(meta_df, col.names = c("", "")) %>%
+  kable_styling(bootstrap_options = c("condensed"), full_width = FALSE, font_size = 13)
+```
+
+## Initial cluster interpretation
+
+These labels are deterministic summaries of the strongest trait domains, not definitive biological subtype names. Positive and negative directions refer to trait effects aligned to the risk-increasing allele from the primary GWAS. “Effective” counts decrease when one component dominates the total weight.
+
+```{r interpretation_overview, echo=FALSE, results='asis'}
+overview_display <- cluster_interpretation$overview %>%
+  mutate(
+    effective_loci = round(effective_loci, 1),
+    effective_traits = round(effective_traits, 1),
+    shared_loci_percent = round(shared_loci_percent, 1),
+    top_locus_share_percent = round(top_locus_share_percent, 1),
+    top_trait_share_percent = round(top_trait_share_percent, 1)
+  ) %>%
+  rename(
+    Cluster = cluster,
+    `Provisional signature` = provisional_label,
+    Loci = n_loci,
+    Traits = n_traits,
+    `Effective loci` = effective_loci,
+    `Effective traits` = effective_traits,
+    `Shared loci (%)` = shared_loci_percent,
+    `Top locus share (%)` = top_locus_share_percent,
+    `Top trait energy share (%)` = top_trait_share_percent,
+    Flags = interpretation_flag
+  )
+
+kable(overview_display, caption = "Cluster-level interpretation and concentration checks") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 11)
+```
+
+```{r per_cluster_stability, echo=FALSE, results='asis'}
+if (is.null(stability_table)) {
+  cat("<div class='caveat-box'>", htmltools::htmlEscape(stability_note), "</div>\n")
+} else {
+  stability_display <- stability_table %>%
+    transmute(
+      Cluster = paste0("X", cluster),
+      `Recovery >= 0.80` = scales::percent(recovery_rate_joint_ge_0_80, accuracy = 1),
+      `Recovery >= 0.90` = scales::percent(recovery_rate_joint_ge_0_90, accuracy = 1),
+      `Mean joint cosine` = round(mean_joint_cosine, 3),
+      `5th percentile` = round(p05_joint_cosine, 3),
+      `Within-cluster consensus` = round(mean_within_consensus, 3),
+      `Stability flag` = stability_flag
+    )
+
+  cat("### Per-cluster reproducibility\n\n")
+  cat("Clusters are aligned to the final solution using combined W/H cosine similarity across all saved bNMF repetitions.\n\n")
+  print(
+    kable(stability_display, caption = "Recovery and consensus of final clusters") %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = TRUE, font_size = 11)
+  )
+}
+```
+
+<div class="row">
+<div class="column">
+```{r cluster_overlap_plot, echo=FALSE, fig.width=7, fig.height=6}
+plot_cluster_overlap(cluster_overlap)
+```
+</div>
+<div class="column">
+```{r trait_domain_plot, echo=FALSE, fig.width=7, fig.height=6}
+domain_plot_df <- bind_rows(cluster_interpretation$domains) %>%
+  filter(domain != "Other")
+
+if (nrow(domain_plot_df)) {
+  ggplot(domain_plot_df,
+         aes(x = cluster, y = weight_fraction, fill = domain)) +
+    geom_col() +
+    scale_y_continuous(labels = scales::percent_format()) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = NULL, y = "Fraction of selected trait weight",
+         fill = "Trait domain", title = "Trait-domain composition")
+} else {
+  ggplot() + theme_void() + labs(title = "No classified selected trait domains")
+}
+```
+
+</div>
+</div>
+
+```{r previous_run_comparison, echo=FALSE, results='asis'}
+previous_main_dir <- params$previous_main_dir
+if (!is.null(previous_main_dir) && nzchar(previous_main_dir)) {
+  previous_posthoc_file <- file.path(previous_main_dir, "cluster_post_hoc.rds")
+  if (!file.exists(previous_posthoc_file)) {
+    cat("<div class='caveat-box'>Previous-run comparison requested, but cluster_post_hoc.rds was not found.</div>\n")
+  } else {
+    previous_posthoc <- readRDS(previous_posthoc_file)
+    previous_h_long <- previous_posthoc$h %>%
+      t() %>%
+      data.frame() %>%
+      set_colnames(previous_posthoc$cluster_names) %>%
+      rownames_to_column("trait") %>%
+      pivot_longer(cols = all_of(previous_posthoc$cluster_names),
+                   names_to = "cluster", values_to = "weight")
+
+    previous_matches <- compare_cluster_trait_profiles(h_mat_long_raw, previous_h_long) %>%
+      mutate(cosine_similarity = round(cosine_similarity, 3)) %>%
+      rename(
+        `Current cluster` = current_cluster,
+        `Best previous match` = previous_cluster,
+        `Signed-trait cosine similarity` = cosine_similarity
+      )
+
+    cat("### Comparison with previous run\n\n")
+    cat(sprintf("Previous results: `%s`\n\n", basename(previous_main_dir)))
+    print(
+      kable(previous_matches,
+            caption = "Best previous cluster match by signed trait profile") %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"),
+                      full_width = FALSE)
+    )
+    cat("\n<p><em>These are best matches, not one-to-one assignments; the same previous cluster may match more than one current cluster.</em></p>\n")
+  }
+}
+```
+
+## bNMF Algorithm Parameters
+
+```{r hyperparams, echo = FALSE, results='asis'}
+
+library(dplyr)
+
+# Extract and display bNMF hyperparameters
+cat("This section reports the hyperparameters used in the Bayesian Non-negative Matrix Factorization (bNMF) clustering.\n\n")
+
+# Try to load the saved bNMF settings
+bnmf_settings_file <- file.path(main_dir, "bnmf_settings.rds")
+if (file.exists(bnmf_settings_file)) {
+  my_bNMF_settings <- readRDS(bnmf_settings_file)
+  params_source <- "pipeline settings"
+} else {
+  # Fallback: try to infer from results
+  my_bNMF_settings <- list(
+    n_reps = ifelse(exists("df_run_summary"), nrow(df_run_summary), "Unknown"),
+    K = ifelse(exists("k"), k, "Unknown"),
+    K0 = "Unknown",
+    tolerance = "Unknown", 
+    phi = "Unknown"
+  )
+  params_source <- "inferred from results"
+  cat("<p style='color: orange; font-weight: bold;'>Note: bNMF settings file not found. Showing inferred values.</p>\n\n")
+}
+
+# Parameter descriptions
+param_descriptions <- list(
+  n_reps = "Number of bNMF repetitions/iterations",
+  K = "Maximum number of clusters",
+  K0 = "Prior number of expected active clusters", 
+  tolerance = "Convergence tolerance threshold",
+  phi = "Regularization parameter (noise precision)"
+)
+
+# Build the parameters table
+params_df <- data.frame(
+  Parameter = names(my_bNMF_settings),
+  Value = sapply(my_bNMF_settings, function(x) {
+    if (is.numeric(x)) {
+      if (x < 0.01) sprintf("%.2e", x) else sprintf("%.3g", x)
+    } else as.character(x)
+  }),
+  Description = sapply(names(my_bNMF_settings), function(p) {
+    ifelse(p %in% names(param_descriptions), param_descriptions[[p]], "Algorithm parameter")
+  }),
+  stringsAsFactors = FALSE
+)
+
+# Display the table
+kable(params_df, 
+      caption = paste("bNMF Algorithm Hyperparameters (", params_source, ")"),
+      col.names = c("Parameter", "Value", "Description")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 14)
+
+# Add a note about the final chosen K
+if (exists("k")) {
+  cat(sprintf("\n<p style='font-size: 14px; color: #2E86AB;'><strong>Final selected K:</strong> %d clusters (from %s repetitions)</p>\n", 
+              k, 
+              ifelse("n_reps" %in% names(my_bNMF_settings), my_bNMF_settings$n_reps, "multiple")))
+}
+
+```
+
+## Trait summary 
+
+<div class="row">
+<div class="column">
+```{r trait_summary, echo = FALSE, results='asis'}
+
+trait_results %>%
+  dplyr::count(result) %>%
+  ggplot(aes(x = result, y = n, fill = as.factor(result))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual("legend",
+                    values = c("trait kept" = "#00AFBB",
+                               "removed (correlation)" = "#FC4E07",
+                               "removed (low N)" = "#7C7C7C",
+                               "removed (low signal)" = "magenta",
+                               "removed (p-value)" = "#E7B800"))+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  geom_text(aes(label = n), vjust = -0.5) +
+  coord_cartesian(clip = "off") +
+  labs(title="Trait filtering results")
+
+```
+</div>
+<div class="column">
+```{r trait_table, echo = FALSE, results='asis'}
+
+
+trait_results %>% data.table() %>%
+  # column_to_rownames('trait') %>%
+  DT::datatable(selection = 'none', filter = 'none',extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = T,
+                               scrollX = F, pageLength=10,
+                               fixedColumns = list(leftColumns = 1)),
+    caption = htmltools::tags$caption( style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Trait filtering results')) %>%
+    formatStyle('trait','result', backgroundColor = styleEqual(c('trait kept'), c('lightgreen'))) %>%
+    formatStyle(c(0),backgroundColor='lightgray')
+
+
+```
+</div>
+</div>
+
+```{r trait_type_breakdown, echo=FALSE, fig.width=8, fig.height=4}
+brain_idp_pattern <- "^IDP_|^volume_|^DKTatlas_|^a2009s_|^NODEamps|^aparc|^aseg_|^AmygNuclei_|^wg_|^HippSubfields_|^ThalamNuclei_"
+trait_results_typed <- trait_results %>%
+  mutate(trait_type = ifelse(grepl(brain_idp_pattern, trait), "Brain IDP", "Cardiometabolic"))
+
+trait_results_typed %>%
+  dplyr::count(result, trait_type) %>%
+  ggplot(aes(x = result, y = n, fill = trait_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3.5, color = "white", fontface = "bold") +
+  scale_fill_manual(values = c("Brain IDP" = "#5B8DB8", "Cardiometabolic" = "#E07B39")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Trait filtering by type", x = NULL, y = "Count", fill = "Trait type")
+```
+
+## SNP Processing Summary
+
+This section shows how we arrived at the final number of SNPs in the z-score matrix, tracking the filtering and proxy selection process.
+
+```{r snp_processing_summary, echo = FALSE, results='asis'}
+
+# Try to load the various intermediate files that track SNP processing
+# Initialize tracking data frame
+snp_tracking <- data.frame(
+  Step = character(),
+  Count = integer(),
+  Description = character(),
+  stringsAsFactors = FALSE
+)
+
+# Check if we can get proxy information from saved files or objects in workspace
+total_pruned <- NA
+total_needing_proxies <- NA  
+total_proxies_found <- NA
+variants_no_proxy <- NA
+
+# 1. Try to load comprehensive summary first (most reliable)
+snp_summary_file <- file.path(main_dir, "snp_tracking_summary.rds")
+if (file.exists(snp_summary_file)) {
+  snp_summary <- readRDS(snp_summary_file)
+  
+  snp_tracking <- rbind(snp_tracking, data.frame(
+    Step = "Initial Pruned SNPs",
+    Count = snp_summary$total_pruned,
+    Description = "SNPs after LD pruning and initial filtering"
+  ))
+  
+  snp_tracking <- rbind(snp_tracking, data.frame(
+    Step = "SNPs Needing Proxies",
+    Count = snp_summary$total_needing_proxies,
+    Description = "SNPs requiring proxy variants (missing data or other issues)"
+  ))
+  
+  if (snp_summary$total_proxies_found > 0) {
+    snp_tracking <- rbind(snp_tracking, data.frame(
+      Step = "Proxies Found",
+      Count = snp_summary$total_proxies_found,
+      Description = "Suitable proxy variants identified"
+    ))
+    
+    # Add population breakdown if available
+    if ("proxy_results_by_pop" %in% names(snp_summary)) {
+      for (i in 1:nrow(snp_summary$proxy_results_by_pop)) {
+        pop_row <- snp_summary$proxy_results_by_pop[i, ]
+        if (pop_row$Proxies_found > 0) {
+          snp_tracking <- rbind(snp_tracking, data.frame(
+            Step = paste("  -", pop_row$Population, "population"),
+            Count = pop_row$Proxies_found,
+            Description = paste(pop_row$Proxies_found, "proxies found for", pop_row$Population)
+          ))
+        }
+      }
+    }
+  }
+  
+  if (snp_summary$variants_no_proxy > 0) {
+    snp_tracking <- rbind(snp_tracking, data.frame(
+      Step = "SNPs Excluded (No Proxy)",
+      Count = snp_summary$variants_no_proxy,
+      Description = "SNPs excluded due to lack of suitable proxy"
+    ))
+  }
+  
+  tracking_source <- "comprehensive summary"
+  
+} else {
+  # 2. Try to get data from individual files or workspace variables
+  tracking_source <- "individual files/workspace"
+  
+  # Try to get counts from environment if available (from pipeline run)
+  if (exists("pruned_vars")) {
+    total_pruned <- nrow(pruned_vars)
+    snp_tracking <- rbind(snp_tracking, data.frame(
+      Step = "Initial Pruned SNPs",
+      Count = total_pruned,
+      Description = "SNPs after LD pruning and initial filtering"
+    ))
+  } else {
+    # Try to load from file
+    pruned_vars_file <- file.path(main_dir, "pruned_variants.rds")
+    if (file.exists(pruned_vars_file)) {
+      pruned_vars_loaded <- readRDS(pruned_vars_file)
+      total_pruned <- nrow(pruned_vars_loaded)
+      snp_tracking <- rbind(snp_tracking, data.frame(
+        Step = "Initial Pruned SNPs",
+        Count = total_pruned,
+        Description = "SNPs after LD pruning and initial filtering"
+      ))
+    }
+  }
+  
+  # Try to get proxies needed info
+  if (exists("proxies_needed")) {
+    total_needing_proxies <- nrow(proxies_needed)
+    snp_tracking <- rbind(snp_tracking, data.frame(
+      Step = "SNPs Needing Proxies",
+      Count = total_needing_proxies,
+      Description = "SNPs requiring proxy variants (missing data or other issues)"
+    ))
+    
+    # If proxies_needed has a 'reason' column, break down by reason
+    if ("reason" %in% colnames(proxies_needed)) {
+      proxy_reasons <- table(proxies_needed$reason)
+      for (reason in names(proxy_reasons)) {
+        snp_tracking <- rbind(snp_tracking, data.frame(
+          Step = paste("  -", reason),
+          Count = as.integer(proxy_reasons[reason]),
+          Description = paste("SNPs needing proxy due to", reason)
+        ))
+      }
+    }
+  } else {
+    # Try to load from file
+    proxies_needed_file <- file.path(main_dir, "proxies_needed.rds")
+    if (file.exists(proxies_needed_file)) {
+      proxies_needed_loaded <- readRDS(proxies_needed_file)
+      total_needing_proxies <- nrow(proxies_needed_loaded)
+      snp_tracking <- rbind(snp_tracking, data.frame(
+        Step = "SNPs Needing Proxies",
+        Count = total_needing_proxies,
+        Description = "SNPs requiring proxy variants"
+      ))
+    }
+  }
+  
+  # Try to get proxy results
+  if (exists("proxy_results_by_pop")) {
+    total_proxies_found <- sum(proxy_results_by_pop$Proxies_found, na.rm = TRUE)
+    snp_tracking <- rbind(snp_tracking, data.frame(
+      Step = "Proxies Found",
+      Count = total_proxies_found,
+      Description = "Suitable proxy variants identified"
+    ))
+    
+    # Add population breakdown
+    for (i in 1:nrow(proxy_results_by_pop)) {
+      pop_row <- proxy_results_by_pop[i, ]
+      if (pop_row$Proxies_found > 0) {
+        snp_tracking <- rbind(snp_tracking, data.frame(
+          Step = paste("  -", pop_row$Population, "population"),
+          Count = pop_row$Proxies_found,
+          Description = paste(pop_row$Proxies_found, "proxies found for", pop_row$Population)
+        ))
+      }
+    }
+  } else {
+    # Try to load from file
+    proxy_results_file <- file.path(main_dir, "proxy_results_summary.rds")
+    if (file.exists(proxy_results_file)) {
+      proxy_results_loaded <- readRDS(proxy_results_file)
+      total_proxies_found <- sum(proxy_results_loaded$Proxies_found, na.rm = TRUE)
+      snp_tracking <- rbind(snp_tracking, data.frame(
+        Step = "Proxies Found",
+        Count = total_proxies_found,
+        Description = "Suitable proxy variants identified"
+      ))
+    }
+  }
+  
+  # Calculate variants excluded
+  if (!is.na(total_needing_proxies) && !is.na(total_proxies_found)) {
+    variants_no_proxy <- total_needing_proxies - total_proxies_found
+    if (variants_no_proxy > 0) {
+      snp_tracking <- rbind(snp_tracking, data.frame(
+        Step = "SNPs Excluded (No Proxy)",
+        Count = variants_no_proxy,
+        Description = "SNPs excluded due to lack of suitable proxy"
+      ))
+    }
+  }
+}
+
+# Final count from actual matrix
+final_count <- nrow(w_mat)
+snp_tracking <- rbind(snp_tracking, data.frame(
+  Step = "Final SNP Count",
+  Count = final_count,
+  Description = "SNPs in final z-score matrix for clustering"
+))
+
+# If we don't have detailed tracking info, provide basic info
+if (nrow(snp_tracking) == 1) {
+  snp_tracking <- data.frame(
+    Step = c("SNPs in Z-Score Matrix", "Final SNP Count"),
+    Count = c(final_count, final_count),
+    Description = c("SNPs available in the final z-score matrix", 
+                   "SNPs used for bNMF clustering")
+  )
+  cat("<p style='color: orange; font-weight: bold;'>Note: Detailed SNP tracking information not available. Showing final counts only.</p>\n\n")
+  tracking_source <- "final matrix only"
+} else {
+  cat(sprintf("<p style='color: green; font-size: 12px;'><em>Data source: %s</em></p>\n\n", tracking_source))
+}
+
+# Display as a formatted table
+kable(snp_tracking, 
+      caption = "SNP Processing Pipeline Summary",
+      col.names = c("Processing Step", "SNP Count", "Description")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 14) %>%
+  row_spec(nrow(snp_tracking), bold = TRUE, background = "#E8F4FD")
+
+```
+
+<div class="row">
+<div class="column">
+```{r snp_flow_plot, echo = FALSE, fig.width=8, fig.height=6}
+
+# Create a flow visualization
+if (nrow(snp_tracking) > 2) {
+  # Filter to main steps (not sub-categories starting with "  -")
+  main_steps <- snp_tracking[!grepl("^  -", snp_tracking$Step), ]
+  
+  # Create a simple bar plot showing the SNP count progression
+  main_steps$Step_Factor <- factor(main_steps$Step, levels = main_steps$Step)
+  
+  ggplot(main_steps, aes(x = Step_Factor, y = Count, fill = Step_Factor)) +
+    geom_bar(stat = "identity", alpha = 0.7) +
+    geom_text(aes(label = Count), vjust = -0.5, size = 3.5) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none",
+          plot.title = element_text(size = 14, face = "bold")) +
+    labs(title = "SNP Count Through Processing Pipeline",
+         x = "Processing Step",
+         y = "Number of SNPs") +
+    scale_fill_brewer(palette = "Blues")
+} else {
+  # If we don't have detailed steps, just show a simple summary
+  ggplot(data.frame(x = 1, y = final_count), aes(x, y)) +
+    geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7, width = 0.5) +
+    geom_text(aes(label = paste(final_count, "SNPs")), vjust = -0.5, size = 5) +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          plot.title = element_text(size = 14, face = "bold")) +
+    labs(title = "Final SNP Count in bNMF Analysis",
+         x = "", y = "Number of SNPs") +
+    xlim(0.5, 1.5)
+}
+
+```
+</div>
+<div class="column">
+```{r snp_summary_stats, echo = FALSE}
+
+# Create cleaner summary statistics
+summary_stats <- data.frame(
+  Metric = c("Total SNPs", 
+             "Total Traits", 
+             "Data Completeness",
+             "Missing Data Points"),
+  Value = c(format(nrow(w_mat), big.mark = ","),
+            ncol(zmat_final),
+            paste0(round(100 * sum(!is.na(zmat_final)) / (nrow(zmat_final) * ncol(zmat_final)), 1), "%"),
+            format(sum(is.na(zmat_final)), big.mark = ","))
+)
+
+kable(summary_stats, 
+      caption = "Final Analysis Matrix Summary",
+      col.names = c("Matrix Property", "Value")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 14)
+
+```
+</div>
+</div>
+
+## Pipeline QC Report
+
+```{r qc_report, echo=FALSE, results='asis'}
+qc_file <- file.path(main_dir, "quality_control_report.txt")
+if (file.exists(qc_file)) {
+  qc_lines <- readLines(qc_file)
+  # Colour PASS green, FAIL red
+  qc_html <- sapply(qc_lines, function(l) {
+    if (grepl("PASS", l, fixed = TRUE)) {
+      sprintf("<p style='margin:2px 0; font-family:monospace;'><span style='color:#006600; font-weight:bold;'>&#10004;</span> %s</p>", htmltools::htmlEscape(l))
+    } else if (grepl("FAIL", l, fixed = TRUE)) {
+      sprintf("<p style='margin:2px 0; font-family:monospace;'><span style='color:#cc0000; font-weight:bold;'>&#10008;</span> %s</p>", htmltools::htmlEscape(l))
+    } else if (nchar(trimws(l)) == 0) {
+      "<br>"
+    } else {
+      sprintf("<p style='margin:2px 0; font-family:monospace; color:#444;'>%s</p>", htmltools::htmlEscape(l))
+    }
+  })
+  cat("<div style='background:#f8f8f8; border:1px solid #ddd; border-radius:5px; padding:15px; margin-bottom:15px;'>\n")
+  cat(paste(qc_html, collapse = "\n"))
+  cat("\n</div>\n")
+} else {
+  cat("<p style='color:orange; font-weight:bold;'>quality_control_report.txt not found in results directory.</p>\n")
+}
+```
+
+## Variant Quality Control
+
+This section checks for ambiguous and multi-allelic SNPs in the final variant set.
+
+```{r variant_qc, echo = FALSE, results='asis'}
+
+# Extract allele information from the variant matrix
+# Check if we have rsID mapping with allele info
+if (exists("df_rsid") && all(c("REF", "ALT") %in% colnames(df_rsid))) {
+  
+  # Get allele combinations for variants in the final matrix
+  final_variants <- w_mat %>%
+    left_join(df_rsid[, c("variant", "VAR_ID", "REF", "ALT")], by = "variant") %>%
+    mutate(allele_combo = paste(REF, ALT, sep = "_"))
+
+  mapped_variants <- final_variants %>% filter(!is.na(REF), !is.na(ALT))
+  mapping_coverage <- nrow(mapped_variants) / nrow(final_variants)
+  cat(sprintf("<p><strong>Allele-map coverage:</strong> %d/%d variants (%.1f%%)</p>\n",
+              nrow(mapped_variants), nrow(final_variants), 100 * mapping_coverage))
+  if (mapping_coverage < 1) {
+    cat("<div class='caveat-box'><strong>Incomplete QC coverage:</strong> variants without allele-map records cannot be classified as ambiguous or multiallelic. A clean result below applies only to mapped variants.</div>\n")
+  }
+  
+  # Count each allele combination
+  allele_counts <- table(mapped_variants$allele_combo)
+  allele_summary <- data.frame(
+    Allele_Combination = names(allele_counts),
+    Count = as.numeric(allele_counts)
+  ) %>%
+    arrange(desc(Count))
+  
+  # Check for ambiguous SNPs (A/T or C/G)
+  ambiguous_combos <- c("A_T", "T_A", "C_G", "G_C")
+  ambiguous_snps <- mapped_variants[mapped_variants$allele_combo %in% ambiguous_combos, ]
+  
+  # Check for multi-allelic SNPs (comma in ALT allele)
+  multiallelic_snps <- mapped_variants[grepl(",", mapped_variants$ALT), ]
+  
+  # Display results
+  cat("### Allele Combination Summary\n\n")
+  
+  # Print allele combination table
+  kable(allele_summary, 
+        caption = "Count of Each Allele Combination in Final Variant Set",
+        col.names = c("Allele Combination (REF_ALT)", "Count")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                  full_width = FALSE, font_size = 12) %>%
+    print()
+  
+  cat("\n\n")
+  
+
+  # Check for ambiguous SNPs
+  if (nrow(ambiguous_snps) > 0) {
+    cat("<div style='background-color: #ffcccc; border: 2px solid #ff0000; padding: 15px; margin: 10px 0; border-radius: 5px;'>\n")
+    cat("<h4 style='color: #cc0000; margin-top: 0;'>&#9888; WARNING: AMBIGUOUS SNPs DETECTED!</h4>\n")  # ⚠️
+    cat(sprintf("<p><strong>%d ambiguous SNPs found</strong> (A/T or C/G combinations)</p>\n", nrow(ambiguous_snps)))
+    cat("<p>These SNPs may cause strand ambiguity issues in downstream analyses.</p>\n")
+    cat("</div>\n\n")
+  } else {
+    cat("<div style='background-color: #ccffcc; border: 2px solid #00cc00; padding: 15px; margin: 10px 0; border-radius: 5px;'>\n")
+    cat("<h4 style='color: #006600; margin-top: 0;'>&#10004; No ambiguous SNPs detected among mapped variants</h4>\n")
+    cat("<p>No A/T or C/G SNP combinations were found among variants with allele annotations.</p>\n")
+    cat("</div>\n\n")
+  }
+  
+  # Check for multi-allelic SNPs
+  if (nrow(multiallelic_snps) > 0) {
+    cat("<div style='background-color: #ffcccc; border: 2px solid #ff0000; padding: 15px; margin: 10px 0; border-radius: 5px;'>\n")
+    cat("<h4 style='color: #cc0000; margin-top: 0;'>&#9888; WARNING: MULTI-ALLELIC SNPs DETECTED!</h4>\n")  # ⚠️
+    cat(sprintf("<p><strong>%d multi-allelic SNPs found</strong> (comma in ALT allele)</p>\n", nrow(multiallelic_snps)))
+    cat("<p>These SNPs may cause issues with allele alignment in downstream analyses.</p>\n")
+    cat("</div>\n\n")
+  } else {
+    cat("<div style='background-color: #ccffcc; border: 2px solid #00cc00; padding: 15px; margin: 10px 0; border-radius: 5px;'>\n")
+    cat("<h4 style='color: #006600; margin-top: 0;'>&#10004; No multi-allelic SNPs detected among mapped variants</h4>\n")
+    cat("<p>No multi-allelic SNPs were found among variants with allele annotations.</p>\n")
+    cat("</div>\n\n")
+  }
+  
+} else {
+  cat("<p style='color: orange; font-weight: bold;'>Note: Allele information not available for variant quality control check.</p>\n\n")
+}
+
+```
+
+<br>
+
+## Variant-Trait missingness 
+
+```{r trait_missingness1, echo = FALSE, results='asis', out.width=c('50%', '50%'), fig.show='hold'}
+
+library(dplyr)
+
+cat("### Imputation Quality Assessment\n\n")
+
+# Compare distributions of observed vs imputed values
+observed_values <- zmat_final[!is.na(zmat_final)]
+imputed_positions <- is.na(zmat_final)
+imputed_values <- zmat_imputed[imputed_positions]
+
+trait_missingness <- tibble(
+  trait = colnames(zmat_final),
+  missing_fraction = colMeans(is.na(zmat_final))
+) %>% arrange(desc(missing_fraction))
+
+variant_missingness <- tibble(
+  variant = rownames(zmat_final),
+  missing_fraction = rowMeans(is.na(zmat_final))
+) %>% arrange(desc(missing_fraction))
+
+missingness_summary <- tibble(
+  Metric = c("Overall imputed cells", "Maximum trait missingness",
+             "Median trait missingness", "Maximum variant missingness"),
+  Value = scales::percent(c(
+    mean(imputed_positions),
+    max(trait_missingness$missing_fraction),
+    median(trait_missingness$missing_fraction),
+    max(variant_missingness$missing_fraction)
+  ), accuracy = 0.1)
+)
+
+print(
+  kable(missingness_summary, caption = "Missingness before imputation") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"),
+                  full_width = FALSE, font_size = 12)
+)
+
+cat("\n\n")
+
+top_missing_traits <- trait_missingness %>%
+  mutate(missing_fraction = scales::percent(missing_fraction, accuracy = 0.1)) %>%
+  slice_head(n = 10) %>%
+  rename(Trait = trait, `Missing before imputation` = missing_fraction)
+
+print(
+  kable(top_missing_traits, caption = "Traits with the most missing variant associations") %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"),
+                  full_width = FALSE, font_size = 12)
+)
+
+if (!length(imputed_values)) {
+  cat("\n<div class='interpretation-card'><strong>No imputation was required.</strong> All variant-trait cells were observed.</div>\n")
+} else {
+  observed_deciles <- quantile(observed_values, probs = seq(0, 1, 0.1), na.rm = TRUE)
+  imputed_deciles <- quantile(imputed_values, probs = seq(0, 1, 0.1), na.rm = TRUE)
+
+  decile_comparison <- data.frame(
+    Decile = paste0(seq(0, 90, 10), "-", seq(10, 100, 10), "%"),
+    Observed_Range = paste0("[", round(observed_deciles[-11], 2), ", ", round(observed_deciles[-1], 2), "]"),
+    Imputed_Range = paste0("[", round(imputed_deciles[-11], 2), ", ", round(imputed_deciles[-1], 2), "]")
+  )
+
+  print(
+    kable(decile_comparison,
+          caption = "Distribution comparison: observed vs imputed z-scores",
+          col.names = c("Decile", "Observed values", "Imputed values")) %>%
+      kable_styling(bootstrap_options = c("striped", "condensed"),
+                    full_width = FALSE, font_size = 12)
+  )
+
+  extreme_imputed <- mean(abs(imputed_values) > 5)
+  if (extreme_imputed > 0.05) {
+    cat(sprintf("\n<p style='color: orange; font-weight: bold;'>%.1f%% of imputed values are extreme (|z| > 5); review imputation parameters.</p>\n", extreme_imputed * 100))
+  } else {
+    cat("\n<p style='color: green;'>Imputed values show no excessive burden of |z| &gt; 5 values.</p>\n")
+  }
+
+  set.seed(123)
+  density_df <- bind_rows(
+    data.frame(value = sample(observed_values, min(50000, length(observed_values))), type = "Observed"),
+    data.frame(value = sample(imputed_values, min(50000, length(imputed_values))), type = "Imputed")
+  )
+  print(
+    ggplot(density_df, aes(x = value, fill = type)) +
+      geom_density(alpha = 0.5) +
+      scale_fill_manual(values = c("Observed" = "steelblue", "Imputed" = "tomato")) +
+      coord_cartesian(xlim = c(-10, 10)) +
+      theme_minimal() +
+      labs(x = "Z-score", y = "Density",
+           title = "Observed vs imputed z-score distributions", fill = NULL)
+  )
+}
+```
+
+## Convergence results
+```{r convergence_results, echo = FALSE, results='asis', out.width=c('50%', '50%'), fig.show='hold'}
+
+k_plot <- k_counts %>% mutate(K = factor(K)) %>%
+  ggplot(aes(K, n, fill = K)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%d (%.0f%%)", n, 100 * perc)), vjust = -0.4) +
+  scale_fill_brewer(palette = "Spectral") +
+  expand_limits(y = max(k_counts$n) * 1.12) +
+  theme_minimal() +
+  labs(x = "Inferred K", y = "Number of repetitions",
+       title = sprintf("K distribution across %d repetitions", nrow(df_run_summary)))
+
+evidence_plot <- df_run_summary %>%
+  mutate(K = factor(K)) %>%
+  ggplot(aes(K, evid, fill = K)) +
+  geom_boxplot(outlier.shape = NA, show.legend = FALSE) +
+  geom_jitter(width = 0.15, alpha = 0.45, size = 1.5, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Spectral") +
+  theme_minimal() +
+  labs(x = "Inferred K", y = "Final evidence objective",
+       title = "Between-run evidence distribution")
+
+print(k_plot + evidence_plot)
+  
+```
+<br>
+
+### SNP membership and trait interpretation
+
+The two factor matrices serve different downstream purposes and therefore use separate selection rules.
+
+**SNP membership (W).** Method M pools all variant-by-cluster weights, normalizes rank and weight to the unit interval, fits an upper reference line to the top 0.2% (minimum 25 observations), and fits a lower reference line to the bottom 80%. The cutoff is the first observed weight closer to the lower line than to the upper line. This W cutoff defines cluster SNP membership and score weights.
+
+**Trait interpretation (H).** Within each cluster, the original signed H columns (`trait_pos`, `trait_neg`, or unsigned) are each compared with 50% of that cluster's largest single loading, and every column at or above that threshold is selected. Selected columns are collapsed to base traits afterward; a trait with both its positive and negative column selected is labelled bidirectional. Positive and negative columns are never combined before thresholding. This scale-invariant rule is used for descriptive trait membership, domain summaries, circle plots, and filtered Z-matrix displays; it does not alter SNP score weights. Concentration flags (single-trait dominated) are computed from the full H loading profile, not from the size of the selected set.
+
+<p style="font-size:14pt; font-weight:bold; color:red;">
+    Method M W cutoff: `r round(cutoff_w, 4)`<br>
+    H core threshold: `r if (has_h_core_results) paste0(round(100 * h_relative_max_threshold), "% of the cluster's largest single loading") else "legacy results object—signed H core traits unavailable"`
+</p><br>
+
+```{r h_selection_status, echo=FALSE, results='asis'}
+if (!has_h_core_results) {
+  cat(paste0(
+    "<div class='caveat-box'><strong>Legacy H behavior.</strong> ",
+    "This cluster_post_hoc.rds predates the signed relative-to-maximum H rule ",
+    "(it has no signed core-trait table, or was produced by the earlier combined-pair rule). ",
+    "Trait sections therefore use the historical shared W/H cutoff. Re-run ",
+    "the updated do_post_analysis() to generate H core-trait results.</div>\n"
+  ))
+}
+```
+
+
+<div class = "row">
+<div class = "column">
+```{r weightCutoff, echo=FALSE}
+
+cutoff_figure_candidates <- file.path(
+  main_dir,
+  c("bNMF_cutoff_calc_method_M.png", "bNMF_cutoff_calc.png")
+)
+cutoff_figure <- cutoff_figure_candidates[file.exists(cutoff_figure_candidates)][1]
+if (is.na(cutoff_figure)) {
+  cat("<div class='caveat-box'>No W cutoff diagnostic figure was found.</div>\n")
+} else {
+  knitr::include_graphics(cutoff_figure)
+}
+
+```
+
+</div>
+<div class = "column">
+
+```{r variant_cluster_counts, echo=FALSE}
+
+
+cluster_counts <- w_mat_long %>% group_by(variant) %>% summarise(num_cluster=sum(weight >= cutoff))
+
+# Create a frequency table for the number of SNPs with 0, 1, 2, ... clusters
+freq_table <- cluster_counts %>% 
+  count(num_cluster) %>% 
+  arrange(num_cluster) %>%
+  mutate(perc = n/nrow(w_mat)) %>%
+  dplyr::rename("Number of Clusters" = num_cluster,
+         "SNP Count" = n,
+         "Percentage" = perc)
+
+# Print a nicely formatted table; adjust font_size as desired (e.g., font_size = 12)
+kable(freq_table, caption = "Number of SNPs in N Clusters") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 20)
+
+```
+</div>
+</div>
+
+```{r trait_core_membership, echo=FALSE, results='asis', fig.width=10, fig.height=5}
+if (has_h_core_results) {
+  trait_membership <- h_trait_loadings %>%
+    group_by(base_trait_id) %>%
+    summarise(`Number of Clusters` = sum(selected), .groups = "drop") %>%
+    count(`Number of Clusters`, name = "Trait Count") %>%
+    arrange(`Number of Clusters`) %>%
+    mutate(Percentage = `Trait Count` / sum(`Trait Count`))
+
+  print(
+    kable(trait_membership, caption = "Base traits core in N clusters", digits = c(0, 0, 3)) %>%
+      kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                    full_width = FALSE, font_size = 13)
+  )
+
+  if (!is.null(h_core_cluster_summary)) {
+    print(
+      h_core_cluster_summary %>%
+        mutate(cluster = factor(cluster, levels = cluster_names)) %>%
+        ggplot(aes(cluster, core_traits)) +
+        geom_col(fill = "#6A3D9A", alpha = 0.88) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        labs(
+          title = "H core-trait set size by cluster",
+          subtitle = sprintf("Signed loading >= %.0f%% of each cluster's largest loading",
+                             100 * h_relative_max_threshold),
+          x = NULL,
+          y = "Core base traits"
+        )
+    )
+  }
+}
+```
+
+<br>
+
+```{r tbl_snps, echo = FALSE}
+tbl_snps_data <- w_mat %>%
+  left_join(df_rsid, by = 'variant') %>%
+  dplyr::rename(Nearest_Gene = gene) %>%
+  dplyr::select(VAR_ID, rsID, Nearest_Gene, all_of(cluster_names))
+
+fixed_left <- 3
+
+tbl_snps_data %>%
+  DT::datatable(selection = 'none', filter = 'none', extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = TRUE,
+                               scrollX = F, pageLength = 10,
+                               fixedColumns = list(leftColumns = fixed_left)),
+    caption = htmltools::tags$caption(style = 'caption-side: top; text-align: center; color:black; font-size:150% ;','Variant Weights')) %>%
+    DT::formatSignif(columns = cluster_names, digits = 4) %>%
+    formatStyle(cluster_names, backgroundColor = styleInterval(c(cutoff), c('white', 'springgreen'))) %>%
+    formatStyle(c(0), backgroundColor = 'lightgray')
+```
+
+  <br>
+  
+```{r tbl_traits, echo = FALSE}
+# unloadNamespace("biomaRt")
+
+raw_h_table <- h_mat %>%
+  t() %>%
+  set_rownames(gsub("_"," ",rownames(.))) %>%
+  set_colnames(cluster_names) %>%
+  DT::datatable(selection = 'none', filter = 'none',extensions = "FixedColumns",
+                options = list(paging = T, searching = TRUE,
+                               info = T, sort = T,
+                               scrollX = F, pageLength=10,
+                               fixedColumns = list(leftColumns = 1)),
+    caption = htmltools::tags$caption(
+      style = 'caption-side: top; text-align: center; color:black; font-size:150% ;',
+      'Raw Signed Trait Weights')) %>%
+    DT::formatSignif(columns = cluster_names, digits=4) %>%
+    formatStyle(c(0),backgroundColor='lightgray')
+
+if (!has_h_core_results) {
+  raw_h_table <- raw_h_table %>%
+    formatStyle(cluster_names,
+                backgroundColor=styleInterval(c(cutoff_w), c('white', 'springgreen')))
+}
+
+if (has_h_core_results) {
+  core_h_table <- h_core_traits %>%
+    transmute(
+      Cluster = cluster,
+      Trait = base_trait,
+      Direction = stringr::str_to_title(membership_direction),
+      `Positive loading` = positive_loading,
+      `Negative loading` = negative_loading,
+      `Largest signed loading` = max_signed_loading,
+      `Relative to cluster maximum` = relative_to_maximum
+    ) %>%
+    DT::datatable(
+      selection = "none",
+      filter = "none",
+      options = list(pageLength = 10, scrollX = TRUE),
+      caption = htmltools::tags$caption(
+        style = 'caption-side: top; text-align: center; color:black; font-size:150% ;',
+        'Selected H Core Traits'
+      )
+    ) %>%
+    DT::formatSignif(columns = c("Positive loading", "Negative loading", "Largest signed loading"), digits = 4) %>%
+    DT::formatPercentage(columns = "Relative to cluster maximum", digits = 1)
+  htmltools::tagList(raw_h_table, htmltools::tags$br(), core_h_table)
+} else {
+  raw_h_table
+}
+
+```
+  <br>
+
+```{r post_hoc_analyses, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Gene labels are the nearest gene computed by do_post_analysis() (column `gene`).
+w_mat_genes <- w_mat_final
+
+# 1.) make circle plots
+my_circle_plots <- make_circle_plots(
+                                     w_mat_long_wGene = w_mat_genes %>% dplyr::mutate(variant=gene),
+                                     h_mat_long = h_mat_long,
+                                     output_dir = main_dir,
+                                     cutoff = interpretation_cutoff)
+
+# 2.) make filtered zmats
+library(forcats)
+
+my_zmats <- make_filtered_zmat(zmat_imputed = zmat_imputed,
+                               zmat_final = zmat_final,
+                               w_mat_long = w_mat_genes,
+                               h_mat_long = h_mat_long,
+                               cutoff = interpretation_cutoff)
+# 3.) cluster info
+n_snps <- list()
+n_traits <- list()
+for (cluster_name in cluster_names) {
+  n_snps[[cluster_name]] <- w_mat_long %>% filter(cluster == cluster_name, weight >= cutoff) %>% nrow()
+  n_traits[[cluster_name]] <- if (has_h_core_results) {
+    h_core_traits %>% filter(cluster == cluster_name) %>% nrow()
+  } else {
+    cluster_interpretation$signed_traits %>%
+      filter(cluster == cluster_name, magnitude >= cutoff_w) %>% nrow()
+  }
+
+}
+
+
+```
+
+## Cluster summary
+
+Each section begins with the evidence used for the provisional interpretation: the defining signed traits, the defining loci with their soft-membership specificity, and the trait-domain composition, followed by the circular weight plot and the z-score heatmap for the cluster. Gene labels are the nearest gene to each variant.
+
+
+```{r print_plots_refactored, echo=FALSE, results='asis', fig.width=16, fig.height=14, fig.show='asis', fig.keep='all'}
+library(patchwork)
+library(purrr)
+
+# Define a single function to get a plot, handling potential NULL or non-ggplot objects
+get_plot <- function(plot_list, cluster_name) {
+  p <- plot_list[[cluster_name]]
+  if (is.null(p)) {
+    return(NULL)
+  }
+  if (!inherits(p, "ggplot")) {
+    p <- as.ggplot(p)
+  }
+  return(p)
+}
+
+# Loop through each cluster
+for (cluster in cluster_names) {
+  # HTML heading and info
+  overview_row <- cluster_interpretation$overview %>% filter(cluster == !!cluster)
+  provisional_label <- overview_row$provisional_label[1]
+  narrative <- cluster_interpretation$narratives[[cluster]]
+
+  cat(sprintf("<h3 style='margin:20px 0;'>Cluster %s: %s</h3>\n",
+              htmltools::htmlEscape(cluster),
+              htmltools::htmlEscape(provisional_label)))
+  cat(sprintf("<p style='margin: 10px 0; font-weight: bold; font-size: 16px;'>%i SNPs and %i traits</p>\n", 
+              n_snps[[cluster]], 
+              n_traits[[cluster]]))
+
+  cat("<div class='interpretation-card'>\n")
+  cat("<h4>Initial interpretation</h4>\n")
+  cat(sprintf("<p>%s</p>\n", htmltools::htmlEscape(narrative)))
+  cat(sprintf(
+    "<p><strong>Concentration:</strong> top locus %.1f%% of selected locus weight; top trait %.1f%% of total H loading energy; effective counts %.1f loci and %.1f traits.</p>\n",
+    overview_row$top_locus_share_percent,
+    overview_row$top_trait_share_percent,
+    overview_row$effective_loci,
+    overview_row$effective_traits
+  ))
+  cat("</div>\n\n")
+
+  traits_display <- cluster_interpretation$top_traits[[cluster]] %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4)))
+  if (nrow(traits_display)) {
+    cat("<h4>Defining signed traits</h4>\n")
+    print(
+      kable(traits_display,
+            caption = "Positive/negative components are aligned to the primary-GWAS risk allele") %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"),
+                      full_width = FALSE, font_size = 11)
+    )
+    cat("\n")
+  }
+
+  loci_display <- cluster_interpretation$top_loci[[cluster]]
+  if (nrow(loci_display)) {
+    if ("specificity" %in% names(loci_display)) {
+      loci_display <- loci_display %>%
+        mutate(specificity = scales::percent(specificity, accuracy = 0.1))
+    }
+    if ("weight" %in% names(loci_display)) loci_display$weight <- round(loci_display$weight, 4)
+    if ("P_VALUE" %in% names(loci_display)) loci_display$P_VALUE <- signif(loci_display$P_VALUE, 3)
+    cat("<h4>Defining loci and soft-membership specificity</h4>\n")
+    print(
+      kable(loci_display,
+            caption = "Specificity is this cluster's weight divided by the locus's total weight across clusters") %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"),
+                      full_width = TRUE, font_size = 10)
+    )
+    cat("\n")
+  }
+
+  domain_display <- cluster_interpretation$domains[[cluster]] %>%
+    mutate(
+      domain_weight = round(domain_weight, 4),
+      weight_fraction = scales::percent(weight_fraction, accuracy = 0.1)
+    ) %>%
+    rename(Domain = domain, `Trait count` = n_traits,
+           `Domain weight` = domain_weight, `Weight fraction` = weight_fraction) %>%
+    select(-cluster)
+  if (nrow(domain_display)) {
+    cat("<h4>Trait-domain composition</h4>\n")
+    print(
+      kable(domain_display) %>%
+        kable_styling(bootstrap_options = c("striped", "condensed"),
+                      full_width = FALSE, font_size = 11)
+    )
+    cat("\n")
+  }
+  
+  plots_to_display <- list(
+    Circle = get_plot(my_circle_plots, cluster),
+    Zmatrix = get_plot(my_zmats, cluster)
+  )
+  plots_to_display <- purrr::compact(plots_to_display)
+
+  if (length(plots_to_display) > 0) {
+    combined_plot <- patchwork::wrap_plots(plots_to_display, ncol = 2)
+    print(combined_plot)
+  } else {
+    cat("<p style='color: red;'>No valid plots available for this cluster</p>\n")
+  }
+
+  cat("\n\n")
+}
+```
+
+## Reproducibility record
+
+```{r reproducibility_record, echo=FALSE, results='asis'}
+provenance <- tibble(
+  Item = c("Report template", "Figure/interpretation helper", "Results directory"),
+  Value = c(
+    basename(knitr::current_input()),
+    basename(helper_script),
+    normalizePath(main_dir)
+  )
+)
+
+kable(provenance) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+
+cat("\n<details><summary>R session information</summary><pre>\n")
+cat(htmltools::htmlEscape(paste(capture.output(sessionInfo()), collapse = "\n")))
+cat("\n</pre></details>\n")
+```

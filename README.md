@@ -164,9 +164,16 @@ The tests build small synthetic summary statistics files and need no network acc
 * **`run_bNMF_parallel_checkpointed()`** — Optimized, deterministic parallel runner with atomic per-repetition checkpoints and resume support
 
 #### `post_bNMF_2025.R` — Post-hoc analysis
-* **`calculate_cutoff()`** — Determine optimal cluster activity weight cutoff (elbow method)
-* **`v2g()`** — Variant-to-gene mapping using Open Targets V2G scores (requires local V2G database files)
-* **`do_post_analysis()`** — Full post-hoc pipeline: nearest-gene annotation, Excel workbook export, hg19→hg38 liftover, PRS score file generation, and optional V2G mapping
+* **`calculate_cutoff()`** — Weight cutoff for cluster membership, using the "Method M" elbow on the W (variant-weight) values only; H is not used. All W values are pooled and sorted, and a line is fitted to the top 0.2% of them (at least 25 values) and another to the lowest 80%. The cutoff is the first weight that lies closer to the bottom line than to the upper line. Diagnostics are written to `bNMF_cutoff_diagnostics.csv` and `bNMF_cutoff_calc_method_M.png`.
+* **`calculate_h_core_traits()`** — Core traits for each cluster from the H matrix: signed loading at least 50% of the cluster's largest single loading. Used for interpretation only, not for variant membership.
+* **`do_post_analysis()`** — Full post-hoc pipeline: nearest-gene annotation, Excel workbook export, hg19→hg38 liftover and PRS score file generation
+
+#### `make_bNMF_report/` — Interpretation report
+An HTML report built from a run's results directory, with no web requests. It shows the K choice and convergence, the cutoff and variant membership, trait core membership and, for each cluster, its defining traits and loci, trait-domain composition, a circular weight plot and a z-score heatmap. Run it after `do_post_analysis()`:
+```
+Rscript scripts/make_bNMF_report/render_bNMF_report_INTERPRETATION_V2.R /path/to/results [/path/to/previous_results]
+```
+See `scripts/make_bNMF_report/INTERPRETATION_V2_NOTES.md`.
 
 #### `assess_bNMF_stability.R` — Stability analysis
 Command-line script; see "Stability analysis" below.
